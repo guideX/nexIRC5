@@ -1,0 +1,200 @@
+using System.ComponentModel;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using nexIRC.Application;
+using nexIRC.Core.Networking;
+
+namespace nexIRC.Desktop;
+
+public partial class MainWindow : Window
+{
+    private bool _closing;
+
+    public MainWindow(IIrcTransportFactory transportFactory)
+    {
+        InitializeComponent();
+        ViewModel = new MainWindowViewModel(transportFactory, Dispatcher);
+        DataContext = ViewModel;
+        ViewModel.NewConnectionRequested += ShowNewConnectionAsync;
+        ViewModel.ExitRequested += Close;
+        AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(OnPreviewRightClick), true);
+    }
+
+    public MainWindowViewModel ViewModel { get; }
+
+    private async Task ShowNewConnectionAsync()
+    {
+        var dialog = new NewConnectionWindow { Owner = this };
+        if (dialog.ShowDialog() != true || dialog.Options is null)
+        {
+            return;
+        }
+
+        var workspace = ViewModel.Sessions.Add(dialog.Options);
+        ViewModel.SelectView(workspace.StatusView);
+        await ViewModel.Sessions.ConnectAsync(workspace.Id).ConfigureAwait(true);
+        ViewModel.StatusText = $"Connecting to {dialog.Options.Endpoint}.";
+    }
+
+    private void OnTreeSelectionChanged(object sender, RoutedPropertyChangedEventArgs<object> e) => ViewModel.SelectView(e.NewValue);
+
+    private async void OnSendClick(object sender, RoutedEventArgs e) => await SubmitInputAsync();
+
+    private async void OnInputKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Enter || Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
+        {
+            return;
+        }
+
+        e.Handled = true;
+        await SubmitInputAsync();
+    }
+
+    private async Task SubmitInputAsync()
+    {
+        await ViewModel.SubmitInputAsync();
+        InputBox.Focus();
+    }
+
+    private void OnServerStatusClick(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.Sessions.ActiveNetwork is { } network)
+        {
+            ViewModel.SelectView(network.StatusView);
+        }
+    }
+
+    private void OnNicknameClick(object sender, RoutedEventArgs e)
+    {
+        ViewModel.PrepareInput("/nick ");
+        InputBox.Focus();
+    }
+
+    private void OnRawCommandClick(object sender, RoutedEventArgs e)
+    {
+        ViewModel.PrepareInput("/raw ");
+        InputBox.Focus();
+    }
+
+    private void OnWhoisClick(object sender, RoutedEventArgs e)
+    {
+        ViewModel.PrepareInput("/whois ");
+        InputBox.Focus();
+    }
+
+    private void OnPreviewRightClick(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ChangedButton != MouseButton.Right)
+        {
+            return;
+        }
+
+        var source = e.OriginalSource as DependencyObject;
+        var treeItem = FindAncestor<TreeViewItem>(source);
+        if (treeItem?.DataContext is NetworkWorkspace network)
+        {
+            treeItem.IsSelected = true;
+            ViewModel.SelectView(network.StatusView);
+            OpenContextMenu(treeItem, [
+                ("Connect", new Func<Task>(() => ViewModel.Sessions.ConnectAsync(network.Id).AsTask())),
+                ("Disconnect", new Func<Task>(() => ViewModel.Sessions.DisconnectAsync(network.Id).AsTask())),
+                ("Reconnect", new Func<Task>(() => ViewModel.Sessions.ReconnectAsync(network.Id).AsTask())),
+                ("Open Status", () => { ViewModel.SelectView(network.StatusView); return Task.CompletedTask; }),
+                ("Remove", new Func<Task>(() => ViewModel.Sessions.RemoveAsync(network.Id).AsTask()))
+            ]);
+            e.Handled = true;
+            return;
+        }
+
+        if (treeItem?.DataContext is WorkspaceView view)
+        {
+            treeItem.IsSelected = true;
+            ViewModel.SelectView(view);
+            var actions = new List<(string, Func<Task>)>
+            {
+                ("Activate", () => { ViewModel.SelectView(view); return Task.CompletedTask; })
+            };
+            if (view is ChannelView channel)
+            {
+                actions.Add(("Part", () => ViewModel.ExecuteInputAsync($"/part {channel.Channel}")));
+                actions.Add(("Rejoin", () => ViewModel.ExecuteInputAsync($"/join {channel.Channel}")));
+            }
+
+            OpenContextMenu(treeItem, actions);
+            e.Handled = true;
+            return;
+        }
+
+        var memberItem = FindAncestor<ListBoxItem>(source);
+        if (memberItem?.DataContext is ChannelMemberView member)
+        {
+            var channel = FindAncestor<ListBox>(memberItem)?.DataContext as ChannelView;
+            if (channel is not null)
+            {
+                ViewModel.SelectView(channel);
+                OpenContextMenu(memberItem, [
+                    ("Query", () => ViewModel.ExecuteInputAsync($"/query {member.Nickname}")),
+                    ("WHOIS", () => ViewModel.ExecuteInputAsync($"/whois {member.Nickname}"))
+                ]);
+                e.Handled = true;
+            }
+        }
+    }
+
+    private void OpenContextMenu(FrameworkElement target, IEnumerable<(string Header, Func<Task> Action)> actions)
+    {
+        var menu = new ContextMenu { PlacementTarget = target };
+        foreach (var (header, action) in actions)
+        {
+            var item = new MenuItem { Header = header, Tag = action };
+            item.Click += OnGeneratedContextMenuClick;
+            menu.Items.Add(item);
+        }
+
+        menu.IsOpen = true;
+    }
+
+    private static async void OnGeneratedContextMenuClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is MenuItem { Tag: Func<Task> action })
+        {
+            await action();
+        }
+    }
+
+    private static T? FindAncestor<T>(DependencyObject? source)
+        where T : DependencyObject
+    {
+        var current = source;
+        while (current is not null)
+        {
+            if (current is T match)
+            {
+                return match;
+            }
+
+            current = VisualTreeHelper.GetParent(current);
+        }
+
+        return null;
+    }
+
+    private void OnAboutClick(object sender, RoutedEventArgs e) =>
+        MessageBox.Show(this, "nexIRC 5\nA reconnect-aware, multi-network IRC client shell.", "About nexIRC", MessageBoxButton.OK, MessageBoxImage.Information);
+
+    private async void OnClosing(object? sender, CancelEventArgs e)
+    {
+        if (_closing)
+        {
+            return;
+        }
+
+        e.Cancel = true;
+        _closing = true;
+        await ViewModel.ShutdownAsync();
+        Close();
+    }
+}

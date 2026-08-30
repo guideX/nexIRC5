@@ -1,0 +1,74 @@
+<Window x:Class="nexIRC.Desktop.NewConnectionWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="New Connection"
+        Width="470"
+        Height="610"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner">
+    <DockPanel Margin="18">
+        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+            <Button Content="Cancel" IsCancel="True" Padding="16,6" Margin="0,0,8,0" />
+            <Button Content="Connect" IsDefault="True" Padding="16,6" Click="OnConnectClick" />
+        </StackPanel>
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <TextBlock Text="New Connection" FontSize="22" FontWeight="SemiBold" Foreground="#172033" Margin="0,0,0,14" />
+                <TextBlock Grid.Row="1" Text="Network name" Foreground="#475569" />
+                <TextBox x:Name="DisplayNameBox" Grid.Row="2" Text="New network" Margin="0,3,0,8" />
+                <TextBlock Grid.Row="3" Text="Hostname" Foreground="#475569" />
+                <TextBox x:Name="HostBox" Grid.Row="4" Text="irc.libera.chat" Margin="0,3,0,8" />
+                <StackPanel Grid.Row="5" Orientation="Horizontal">
+                    <StackPanel Width="155">
+                        <TextBlock Text="Port" Foreground="#475569" />
+                        <TextBox x:Name="PortBox" Text="6697" Margin="0,3,10,8" />
+                    </StackPanel>
+                    <CheckBox x:Name="TlsBox" Content="Use TLS" IsChecked="True" VerticalAlignment="Center" Margin="8,12,0,0" />
+                </StackPanel>
+                <TextBlock Grid.Row="6" Text="Nickname" Foreground="#475569" />
+                <TextBox x:Name="NicknameBox" Grid.Row="7" Text="nexIRC5" Margin="0,3,0,8" />
+                <TextBlock Grid.Row="8" Text="Username" Foreground="#475569" />
+                <TextBox x:Name="UsernameBox" Grid.Row="9" Text="nexirc" Margin="0,3,0,8" />
+                <TextBlock Grid.Row="10" Text="Real name" Foreground="#475569" />
+                <TextBox x:Name="RealNameBox" Grid.Row="11" Text="nexIRC 5" Margin="0,3,0,8" />
+                <TextBlock Grid.Row="12" Text="Initial channels (optional, space separated)" Foreground="#475569" />
+                <TextBox x:Name="ChannelsBox" Grid.Row="13" Margin="0,3,0,8" />
+                <GroupBox Grid.Row="14" Header="SASL (credentials are memory-only)" Margin="0,8,0,0">
+                    <Grid Margin="10">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <TextBlock Text="Policy" Foreground="#475569" />
+                        <ComboBox x:Name="SaslPolicyBox" Grid.Row="1" Margin="0,3,0,7" />
+                        <TextBlock Grid.Row="2" Text="SASL username" Foreground="#475569" />
+                        <TextBox x:Name="SaslUsernameBox" Grid.Row="3" Margin="0,3,0,7" />
+                        <TextBlock Grid.Row="4" Text="SASL password" Foreground="#475569" />
+                        <PasswordBox x:Name="SaslPasswordBox" Grid.Row="5" Margin="0,3,0,0" />
+                    </Grid>
+                </GroupBox>
+            </Grid>
+        </ScrollViewer>
+    </DockPanel>
+</Window>

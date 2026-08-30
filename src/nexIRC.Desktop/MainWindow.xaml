@@ -1,0 +1,184 @@
+<Window x:Class="nexIRC.Desktop.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:app="clr-namespace:nexIRC.Application;assembly=nexIRC.Application"
+        xmlns:local="clr-namespace:nexIRC.Desktop"
+        Title="nexIRC 5"
+        Width="1280"
+        Height="780"
+        MinWidth="900"
+        MinHeight="560"
+        WindowStartupLocation="CenterScreen"
+        Background="#F5F6F8"
+        Closing="OnClosing">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BooleanToVisibility" />
+        <Style x:Key="PaneHeader" TargetType="TextBlock">
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Foreground" Value="#334155" />
+            <Setter Property="Margin" Value="10,8,10,6" />
+        </Style>
+        <DataTemplate x:Key="TranscriptEntryTemplate">
+            <DockPanel LastChildFill="True" Margin="2,1">
+                <TextBlock DockPanel.Dock="Left" Text="{Binding DisplayTime}" Width="62" Foreground="#94A3B8" />
+                <TextBlock Text="{Binding DisplayLine}" TextWrapping="Wrap" Foreground="#1E293B" />
+            </DockPanel>
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type app:ServerStatusView}">
+            <TextBlock Text="{Binding DisplayLabel}" Margin="4,2" />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type app:ChannelView}">
+            <TextBlock Text="{Binding DisplayLabel}" Margin="4,2" />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type app:QueryView}">
+            <TextBlock Text="{Binding DisplayLabel}" Margin="4,2" />
+        </DataTemplate>
+        <HierarchicalDataTemplate DataType="{x:Type app:NetworkWorkspace}" ItemsSource="{Binding Views}">
+            <TextBlock Text="{Binding DisplayLabel}" Margin="4,2" FontWeight="SemiBold" />
+        </HierarchicalDataTemplate>
+        <DataTemplate DataType="{x:Type app:ServerStatusView}" x:Key="StatusContentTemplate">
+            <Grid Margin="12">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <StackPanel>
+                    <TextBlock Text="Server status" FontSize="20" FontWeight="SemiBold" Foreground="#172033" />
+                    <TextBlock Text="{Binding EndpointText}" Foreground="#64748B" Margin="0,4,0,10" />
+                    <TextBlock Text="{Binding StateText}" FontWeight="SemiBold" Foreground="#2563EB" />
+                </StackPanel>
+                <ListBox Grid.Row="1" ItemsSource="{Binding Entries}" ItemTemplate="{StaticResource TranscriptEntryTemplate}" Margin="0,14,0,0" BorderThickness="0" Background="Transparent" FontFamily="Cascadia Mono" />
+            </Grid>
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type app:ChannelView}" x:Key="ChannelContentTemplate">
+            <Grid Margin="12">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <Border Background="#E2E8F0" CornerRadius="4" Padding="10,7" Margin="0,0,0,8">
+                    <StackPanel>
+                        <TextBlock Text="{Binding Channel}" FontSize="19" FontWeight="SemiBold" Foreground="#172033" />
+                        <TextBlock Text="{Binding TopicText}" Foreground="#475569" TextTrimming="CharacterEllipsis" />
+                        <TextBlock Text="{Binding SynchronizationText, StringFormat=State: {0}}" Foreground="#64748B" FontSize="11" />
+                    </StackPanel>
+                </Border>
+                <Grid Grid.Row="1">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <ListBox ItemsSource="{Binding Entries}" ItemTemplate="{StaticResource TranscriptEntryTemplate}" BorderThickness="0" Background="White" FontFamily="Cascadia Mono" />
+                    <Border Grid.Column="1" Width="205" Margin="10,0,0,0" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="1" Visibility="{Binding DataContext.IsMemberListVisible, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource BooleanToVisibility}}">
+                        <DockPanel>
+                            <TextBlock DockPanel.Dock="Top" Text="Members" Style="{StaticResource PaneHeader}" />
+                            <ListBox ItemsSource="{Binding Members}" DisplayMemberPath="DisplayText" BorderThickness="0" Padding="8,0" />
+                        </DockPanel>
+                    </Border>
+                </Grid>
+            </Grid>
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type app:QueryView}" x:Key="QueryContentTemplate">
+            <Grid Margin="12">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <StackPanel Margin="0,0,0,8">
+                    <TextBlock Text="{Binding Nickname}" FontSize="19" FontWeight="SemiBold" Foreground="#172033" />
+                    <TextBlock Text="Private conversation" Foreground="#64748B" />
+                </StackPanel>
+                <ListBox Grid.Row="1" ItemsSource="{Binding Entries}" ItemTemplate="{StaticResource TranscriptEntryTemplate}" BorderThickness="0" Background="White" FontFamily="Cascadia Mono" />
+            </Grid>
+        </DataTemplate>
+        <local:WorkspaceContentTemplateSelector x:Key="WorkspaceContentSelector" />
+    </Window.Resources>
+
+    <DockPanel>
+        <Menu DockPanel.Dock="Top" IsMainMenu="True">
+            <MenuItem Header="_File">
+                <MenuItem Header="_New Connection…" Command="{Binding NewConnectionCommand}" />
+                <Separator />
+                <MenuItem Header="_Disconnect" Command="{Binding DisconnectCommand}" />
+                <MenuItem Header="_Reconnect" Command="{Binding ReconnectCommand}" />
+                <Separator />
+                <MenuItem Header="E_xit" Command="{Binding ExitCommand}" />
+            </MenuItem>
+            <MenuItem Header="_View">
+                <MenuItem Header="Network Tree" IsCheckable="True" IsChecked="{Binding IsNetworkTreeVisible, Mode=TwoWay}" />
+                <MenuItem Header="Member List" IsCheckable="True" IsChecked="{Binding IsMemberListVisible, Mode=TwoWay}" />
+                <MenuItem Header="Toolbar" IsCheckable="True" IsChecked="{Binding IsToolbarVisible, Mode=TwoWay}" />
+                <MenuItem Header="Status Bar" IsCheckable="True" IsChecked="{Binding IsStatusBarVisible, Mode=TwoWay}" />
+                <Separator />
+                <MenuItem Header="Server Status" Click="OnServerStatusClick" />
+            </MenuItem>
+            <MenuItem Header="_IRC / Server">
+                <MenuItem Header="_Join Channel" Command="{Binding JoinCommand}" />
+                <MenuItem Header="_Part Channel" Command="{Binding PartCommand}" />
+                <MenuItem Header="Change _Nickname" Click="OnNicknameClick" />
+                <MenuItem Header="_WHOIS" Click="OnWhoisClick" />
+                <MenuItem Header="Channel _List" IsEnabled="False" />
+                <MenuItem Header="_Raw Command" Click="OnRawCommandClick" ToolTip="Type /raw in the command line." />
+            </MenuItem>
+            <MenuItem Header="_Tools">
+                <MenuItem Header="Preferences" IsEnabled="False" />
+            </MenuItem>
+            <MenuItem Header="_Window">
+                <MenuItem Header="_Next View" Command="{Binding NextViewCommand}" />
+                <MenuItem Header="_Previous View" Command="{Binding PreviousViewCommand}" />
+            </MenuItem>
+            <MenuItem Header="_Help">
+                <MenuItem Header="About nexIRC" Click="OnAboutClick" />
+            </MenuItem>
+        </Menu>
+
+        <ToolBarTray DockPanel.Dock="Top" Visibility="{Binding IsToolbarVisible, Converter={StaticResource BooleanToVisibility}}">
+            <ToolBar Background="#FFFFFF">
+                <Button Content="Connect" Command="{Binding NewConnectionCommand}" Padding="10,3" />
+                <Button Content="Disconnect" Command="{Binding DisconnectCommand}" Padding="10,3" />
+                <Button Content="Reconnect" Command="{Binding ReconnectCommand}" Padding="10,3" />
+                <Separator />
+                <Button Content="Join" Command="{Binding JoinCommand}" Padding="10,3" />
+                <Button Content="Part" Command="{Binding PartCommand}" Padding="10,3" />
+                <Button Content="Query" Command="{Binding QueryCommand}" Padding="10,3" />
+            </ToolBar>
+        </ToolBarTray>
+
+        <StatusBar DockPanel.Dock="Bottom" Visibility="{Binding IsStatusBarVisible, Converter={StaticResource BooleanToVisibility}}">
+            <StatusBarItem Content="{Binding StatusText}" />
+            <Separator />
+            <StatusBarItem Content="nexIRC 5 · Phase 1C" />
+        </StatusBar>
+
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="260" />
+                <ColumnDefinition Width="5" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Border Grid.Column="0" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="0,0,1,0" Visibility="{Binding IsNetworkTreeVisible, Converter={StaticResource BooleanToVisibility}}">
+                <DockPanel>
+                    <TextBlock DockPanel.Dock="Top" Text="NETWORKS &amp; WINDOWS" Style="{StaticResource PaneHeader}" />
+                    <TreeView x:Name="WorkspaceTree" ItemsSource="{Binding Networks}" SelectedItemChanged="OnTreeSelectionChanged" Margin="5,0,5,8" />
+                </DockPanel>
+            </Border>
+            <GridSplitter Grid.Column="1" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" Background="#CBD5E1" Visibility="{Binding IsNetworkTreeVisible, Converter={StaticResource BooleanToVisibility}}" />
+            <Grid Grid.Column="2" Background="#F8FAFC">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <Grid>
+                    <ContentControl Content="{Binding ActiveView}" ContentTemplateSelector="{StaticResource WorkspaceContentSelector}" />
+                    <TextBlock Text="Add a connection to start using nexIRC" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="#64748B" FontSize="16" Visibility="{Binding ActiveView, Converter={StaticResource NullToVisibility}}" />
+                </Grid>
+                <Border Grid.Row="1" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="0,1,0,0" Padding="10,8">
+                    <DockPanel>
+                        <Button DockPanel.Dock="Right" Content="Send" Click="OnSendClick" Padding="18,5" Margin="8,0,0,0" IsDefault="True" />
+                        <TextBox x:Name="InputBox" Text="{Binding InputText, UpdateSourceTrigger=PropertyChanged}" MinHeight="28" VerticalContentAlignment="Center" KeyDown="OnInputKeyDown" ToolTip="Type a message or /command" />
+                    </DockPanel>
+                </Border>
+            </Grid>
+        </Grid>
+    </DockPanel>
+</Window>

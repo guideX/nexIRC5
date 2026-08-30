@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>nexIRC.Application</AssemblyName>
+    <RootNamespace>nexIRC.Application</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\nexIRC.Core\nexIRC.Core.csproj" />
+  </ItemGroup>
+</Project>
