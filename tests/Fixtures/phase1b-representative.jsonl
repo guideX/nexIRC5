@@ -1,0 +1,12 @@
+{"Timestamp":"2026-08-30T00:00:00+00:00","Direction":"Inbound","RawLine":":srv CAP * LS :message-tags","RawBytesBase64":"OnNydiBDQVAgKiBMUyA6bWVzc2FnZS10YWdzDQo=","ConnectionGeneration":1}
+{"Timestamp":"2026-08-30T00:00:01+00:00","Direction":"Inbound","RawLine":":srv CAP * ACK :message-tags","RawBytesBase64":"OnNydiBDQVAgKiBBQ0sgOm1lc3NhZ2UtdGFncw0K","ConnectionGeneration":1}
+{"Timestamp":"2026-08-30T00:00:02+00:00","Direction":"Outbound","RawLine":"CAP REQ :message-tags","RawBytesBase64":"Q0FQIFJFUSA6bWVzc2FnZS10YWdzDQo=","ConnectionGeneration":1}
+{"Timestamp":"2026-08-30T00:00:03+00:00","Direction":"Inbound","RawLine":":srv 005 me NETWORK=Example CASEMAPPING=rfc1459 PREFIX=(ov)@+ CHANMODES=b,k,l,imnpst :supported","RawBytesBase64":"OnNydiAwMDUgbWUgTkVUV09SSz1FeGFtcGxlIENBU0VNQVBQSU5HPXJmYzE0NTkgUFJFRklYPShvdilAKyBDSEFOTU9ERVM9YixrLGwsaW1ucHN0IDpzdXBwb3J0ZWQNCg==","ConnectionGeneration":1}
+{"Timestamp":"2026-08-30T00:00:04+00:00","Direction":"Outbound","RawLine":"NICK me","RawBytesBase64":"TklDSyBtZQ0K","ConnectionGeneration":1}
+{"Timestamp":"2026-08-30T00:00:05+00:00","Direction":"Inbound","RawLine":":srv 001 me :Welcome","RawBytesBase64":"OnNydiAwMDEgbWUgOldlbGNvbWUNCg==","ConnectionGeneration":1}
+{"Timestamp":"2026-08-30T00:00:06+00:00","Direction":"Outbound","RawLine":"JOIN #alpha","RawBytesBase64":"Sk9JTiAjYWxwaGENCg==","ConnectionGeneration":1}
+{"Timestamp":"2026-08-30T00:00:07+00:00","Direction":"Inbound","RawLine":":me!u@h JOIN #alpha","RawBytesBase64":"Om1lIXVAaCBKT0lOICNhbHBoYQ0K","ConnectionGeneration":1}
+{"Timestamp":"2026-08-30T00:00:08+00:00","Direction":"Inbound","RawLine":":srv TOPIC #alpha :Phase 1B topic","RawBytesBase64":"OnNydiBUT1BJQyAjYWxwaGEgOlBoYXNlIDFCIHRvcGljDQo=","ConnectionGeneration":1}
+{"Timestamp":"2026-08-30T00:00:09+00:00","Direction":"Inbound","RawLine":":srv MODE #alpha +nt","RawBytesBase64":"OnNydiBNT0RFICNhbHBoYSArbnQNCg==","ConnectionGeneration":1}
+{"Timestamp":"2026-08-30T00:00:10+00:00","Direction":"Inbound","RawLine":":srv 353 me = #alpha :@me bob","RawBytesBase64":"OnNydiAzNTMgbWUgPSAjYWxwaGEgOkBtZSBib2INCg==","ConnectionGeneration":1}
+{"Timestamp":"2026-08-30T00:00:11+00:00","Direction":"Inbound","RawLine":":srv 366 me #alpha :End of NAMES","RawBytesBase64":"OnNydiAzNjYgbWUgI2FscGhhIDpFbmQgb2YgTkFNRVMNCg==","ConnectionGeneration":1}

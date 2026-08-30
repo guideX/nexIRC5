@@ -68,31 +68,36 @@ internal static class Program
         }
 
         var framer = new IrcLineFramer();
-        var bytes = await File.ReadAllBytesAsync(path).ConfigureAwait(false);
-        IReadOnlyList<IrcLineFrame> frames;
+        var summary = new TranscriptReplaySummary();
         try
         {
-            frames = framer.Push(bytes);
+            var firstContent = (await File.ReadAllTextAsync(path).ConfigureAwait(false)).TrimStart();
+            if (firstContent.StartsWith('{'))
+            {
+                var entries = await IrcTranscriptFile.ReadAllAsync(path).ConfigureAwait(false);
+                foreach (var entry in entries)
+                {
+                    summary.Apply(entry);
+                    if (entry.Direction == IrcTranscriptDirection.Inbound)
+                    {
+                        PrintFrames(framer.Push(EnsureLineEnding(entry.RawBytes.Span).Span));
+                    }
+                }
+            }
+            else
+            {
+                PrintFrames(framer.Push(await File.ReadAllBytesAsync(path).ConfigureAwait(false)));
+            }
         }
         catch (IrcLineTooLongException exception)
         {
             Console.Error.WriteLine($"TRANSCRIPT-ERROR {exception.Message}");
             return 1;
         }
-
-        foreach (var frame in frames)
+        catch (FormatException exception)
         {
-            var parsed = IrcMessageParser.Parse(frame.Text);
-            Console.WriteLine($"RAW  {frame.Text}");
-            if (parsed.Success)
-            {
-                var message = parsed.Message!;
-                Console.WriteLine($"PARSED command={message.Command} numeric={message.NumericCommand?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "-"} params={message.Parameters.Count}");
-            }
-            else
-            {
-                Console.WriteLine($"PARSE-ERROR {parsed.Error}");
-            }
+            Console.Error.WriteLine($"TRANSCRIPT-ERROR {exception.Message}");
+            return 1;
         }
 
         var incomplete = framer.Disconnect();
@@ -101,7 +106,43 @@ internal static class Program
             Console.WriteLine($"INCOMPLETE {incomplete.IncompleteText}");
         }
 
+        Console.WriteLine("--- replay summary ---");
+        Console.WriteLine(summary.Format());
+
         return 0;
+
+        static ReadOnlyMemory<byte> EnsureLineEnding(ReadOnlySpan<byte> bytes)
+        {
+            if (bytes.Length >= 2 && bytes[^2] == '\r' && bytes[^1] == '\n')
+            {
+                return bytes.ToArray();
+            }
+
+            var framed = new byte[bytes.Length + 2];
+            bytes.CopyTo(framed);
+            framed[^2] = (byte)'\r';
+            framed[^1] = (byte)'\n';
+            return framed;
+        }
+
+        void PrintFrames(IReadOnlyList<IrcLineFrame> frames)
+        {
+            foreach (var frame in frames)
+            {
+                var parsed = IrcMessageParser.Parse(frame.Text);
+                Console.WriteLine($"RAW  {IrcSensitiveData.RedactLine(frame.Text)}");
+                if (parsed.Success)
+                {
+                    var message = parsed.Message!;
+                    summary.ApplyInbound(message);
+                    Console.WriteLine($"PARSED command={message.Command} numeric={message.NumericCommand?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "-"} params={message.Parameters.Count}");
+                }
+                else
+                {
+                    Console.WriteLine($"PARSE-ERROR {parsed.Error}");
+                }
+            }
+        }
     }
 
     private static async Task PrintRawAsync(ServerSession session, CancellationToken cancellationToken)

@@ -53,7 +53,39 @@ public sealed class ServerSessionTests
 
         Assert.Contains("PASS :secret", transport.OutboundLines);
         Assert.Equal("available", session.Snapshot.Nickname);
+        Assert.Equal("taken", session.Snapshot.DesiredNickname);
 
+        await session.DisconnectAsync();
+        await run;
+    }
+
+    [Fact]
+    public async Task OrderedNicknameFallbacksAreTriedWithoutRandomPolicyInsideTheParser()
+    {
+        var endpoint = new IrcEndpoint("test.example", 6667, false);
+        var transport = new FakeIrcTransport(endpoint);
+        var factory = new FakeIrcTransportFactory();
+        factory.Add(transport);
+        await using var session = new ServerSession(new ServerSessionOptions
+        {
+            Endpoint = endpoint,
+            Nickname = "Merlin",
+            NicknameFallbacks = ["Merlin_", "Merlin__"],
+            Reconnect = new ReconnectPolicy(Enabled: false)
+        }, factory);
+        var run = session.RunAsync();
+        await WaitForAsync(() => transport.ConnectCount == 1);
+        transport.EnqueueInboundLine(":srv CAP * LS :");
+        await WaitForAsync(() => transport.OutboundLines.Contains("NICK Merlin"));
+        transport.EnqueueInboundLine(":srv 433 * Merlin :taken");
+        await WaitForAsync(() => transport.OutboundLines.Contains("NICK Merlin_"));
+        transport.EnqueueInboundLine(":srv 433 * Merlin_ :taken");
+        await WaitForAsync(() => transport.OutboundLines.Contains("NICK Merlin__"));
+        transport.EnqueueInboundLine(":srv 001 Merlin__ :Welcome");
+        await WaitForAsync(() => session.Snapshot.Registration == RegistrationState.Registered);
+
+        Assert.Equal("Merlin__", session.Snapshot.Nickname);
+        Assert.Equal("Merlin", session.Snapshot.DesiredNickname);
         await session.DisconnectAsync();
         await run;
     }

@@ -67,6 +67,7 @@ public enum CapNegotiationState
     NotStarted,
     Listing,
     Requesting,
+    AwaitingCompletion,
     Ended
 }
 
@@ -93,15 +94,23 @@ public sealed class IrcCapabilityNegotiator
     private readonly HashSet<string> _enabled = new(StringComparer.Ordinal);
     private readonly List<string> _rawAdvertisedTokens = [];
     private readonly List<string> _requestedTokens;
+    private readonly HashSet<string> _completionGateCapabilities;
     private CapNegotiationState _state;
 
-    public IrcCapabilityNegotiator(IEnumerable<string>? requestedCapabilities = null, int maximumOutboundLineBytes = IrcCommandBuilder.DefaultMaximumLineBytes)
+    public IrcCapabilityNegotiator(
+        IEnumerable<string>? requestedCapabilities = null,
+        int maximumOutboundLineBytes = IrcCommandBuilder.DefaultMaximumLineBytes,
+        IEnumerable<string>? completionGateCapabilities = null)
     {
         _requestedTokens = (requestedCapabilities ?? Array.Empty<string>())
             .Where(static value => !string.IsNullOrWhiteSpace(value))
             .Select(CapabilitySnapshot.Normalize)
             .Distinct(StringComparer.Ordinal)
             .ToList();
+        _completionGateCapabilities = (completionGateCapabilities ?? Array.Empty<string>())
+            .Where(static value => !string.IsNullOrWhiteSpace(value))
+            .Select(CapabilitySnapshot.Normalize)
+            .ToHashSet(StringComparer.Ordinal);
         _commandBuilder = new IrcCommandBuilder(maximumOutboundLineBytes);
     }
 
@@ -160,8 +169,13 @@ public sealed class IrcCapabilityNegotiator
                 ApplyAcknowledgement(tokens);
                 if (_state == CapNegotiationState.Requesting)
                 {
-                    _state = CapNegotiationState.Ended;
-                    return Result(_commandBuilder.Build("CAP", ["END"]));
+                    if (_completionGateCapabilities.Any(_enabled.Contains))
+                    {
+                        _state = CapNegotiationState.AwaitingCompletion;
+                        return Result();
+                    }
+
+                    return EndNegotiation();
                 }
 
                 return Result();
@@ -169,8 +183,7 @@ public sealed class IrcCapabilityNegotiator
             case "NAK":
                 if (_state == CapNegotiationState.Requesting)
                 {
-                    _state = CapNegotiationState.Ended;
-                    return Result(_commandBuilder.Build("CAP", ["END"]));
+                    return EndNegotiation();
                 }
 
                 return Result();
@@ -206,6 +219,20 @@ public sealed class IrcCapabilityNegotiator
         _enabled.Clear();
         _rawAdvertisedTokens.Clear();
         _state = CapNegotiationState.NotStarted;
+    }
+
+    /// <summary>
+    /// Completes a capability negotiation held open by a completion gate such
+    /// as SASL. The caller can refuse registration before sending CAP END.
+    /// </summary>
+    public CapNegotiationResult Complete()
+    {
+        if (_state is CapNegotiationState.AwaitingCompletion or CapNegotiationState.Requesting)
+        {
+            return EndNegotiation();
+        }
+
+        return Result();
     }
 
     private static int FindSubcommand(IrcMessage message)
@@ -283,6 +310,12 @@ public sealed class IrcCapabilityNegotiator
 
     private CapNegotiationResult Result(params IrcOutboundMessage[] commands) => new(CreateSnapshot(), commands);
 
+    private CapNegotiationResult EndNegotiation()
+    {
+        _state = CapNegotiationState.Ended;
+        return Result(_commandBuilder.Build("CAP", ["END"]));
+    }
+
     private CapabilitySnapshot CreateSnapshot() => new(
         new ReadOnlyDictionary<string, IrcCapability>(new Dictionary<string, IrcCapability>(_available, StringComparer.Ordinal)),
         new HashSet<string>(_enabled, StringComparer.Ordinal),
@@ -296,7 +329,15 @@ public sealed record IrcPrefixGrammar(
     IReadOnlyList<char> Modes,
     IReadOnlyList<char> Prefixes,
     IReadOnlyDictionary<char, char> ModeToPrefix,
-    IReadOnlyDictionary<char, char> PrefixToMode);
+    IReadOnlyDictionary<char, char> PrefixToMode)
+{
+    public static IrcPrefixGrammar Default { get; } = new(
+        "(ov)@+",
+        ['o', 'v'],
+        ['@', '+'],
+        new Dictionary<char, char> { ['o'] = '@', ['v'] = '+' },
+        new Dictionary<char, char> { ['@'] = 'o', ['+'] = 'v' });
+}
 
 public sealed record IrcChannelModeGrammar(
     string RawValue,
@@ -310,6 +351,13 @@ public sealed record IrcChannelModeGrammar(
         .Concat(ParameterWhenSetModes)
         .Concat(NoParameterModes)
         .ToHashSet();
+
+    public static IrcChannelModeGrammar Default { get; } = new(
+        "b,k,l,imnpst",
+        new HashSet<char>(['b', 'e', 'I']),
+        new HashSet<char>(['k']),
+        new HashSet<char>(['l']),
+        new HashSet<char>(['i', 'm', 'n', 'p', 's', 't']));
 }
 
 public sealed record IrcISupportToken(
@@ -394,6 +442,20 @@ public sealed class ISupportSnapshot
 
     public bool Utf8Only { get; }
 
+    public int? Modes { get; init; }
+
+    public int? NickLength { get; init; }
+
+    public int? ChannelLength { get; init; }
+
+    public int? TopicLength { get; init; }
+
+    public int? KickLength { get; init; }
+
+    public int? AwayLength { get; init; }
+
+    public bool SupportsMonitor { get; init; }
+
     public bool Contains(string name) => Tokens.ContainsKey(name.ToUpperInvariant()) && !RemovedTokens.Contains(name.ToUpperInvariant());
 
     public static ISupportSnapshot Empty { get; } = new(
@@ -422,6 +484,83 @@ public enum IrcCaseMapping
     StrictRfc1459,
     Ascii,
     Unknown
+}
+
+/// <summary>
+/// Central IRC identity folding rules. IRC casemapping is not equivalent to
+/// .NET ordinal-ignore-case comparison: RFC1459 also folds selected ASCII
+/// punctuation, while strict-rfc1459 deliberately does not fold ^ and ~.
+/// </summary>
+public static class IrcCaseMappingComparer
+{
+    public static StringComparer For(IrcCaseMapping mapping) =>
+        new IrcStringComparer(mapping);
+
+    public static bool Equals(string? left, string? right, IrcCaseMapping mapping) =>
+        left is not null && right is not null && string.Equals(Fold(left, mapping), Fold(right, mapping), StringComparison.Ordinal);
+
+    public static string Fold(string value, IrcCaseMapping mapping)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        Span<char> folded = value.Length <= 256 ? stackalloc char[value.Length] : new char[value.Length];
+        for (var index = 0; index < value.Length; index++)
+        {
+            var character = value[index];
+            if (character is >= 'A' and <= 'Z')
+            {
+                character = (char)(character + ('a' - 'A'));
+            }
+
+            switch (mapping)
+            {
+                case IrcCaseMapping.Rfc1459:
+                    character = character switch
+                    {
+                        '[' or '{' => '{',
+                        ']' or '}' => '}',
+                        '\\' or '|' => '|',
+                        '^' or '~' => '~',
+                        _ => character
+                    };
+                    break;
+                case IrcCaseMapping.StrictRfc1459:
+                    character = character switch
+                    {
+                        '[' or '{' => '{',
+                        ']' or '}' => '}',
+                        '\\' or '|' => '|',
+                        _ => character
+                    };
+                    break;
+                case IrcCaseMapping.Unknown:
+                    // Unknown server values fall back conservatively to the
+                    // historical IRC mapping until a known value is received.
+                    character = character switch
+                    {
+                        '[' or '{' => '{',
+                        ']' or '}' => '}',
+                        '\\' or '|' => '|',
+                        '^' or '~' => '~',
+                        _ => character
+                    };
+                    break;
+            }
+
+            folded[index] = character;
+        }
+
+        return new string(folded);
+    }
+
+    private sealed class IrcStringComparer(IrcCaseMapping mapping) : StringComparer
+    {
+        public override int Compare(string? x, string? y) =>
+            StringComparer.Ordinal.Compare(x is null ? null : Fold(x, mapping), y is null ? null : Fold(y, mapping));
+
+        public override bool Equals(string? x, string? y) => IrcCaseMappingComparer.Equals(x, y, mapping);
+
+        public override int GetHashCode(string obj) => StringComparer.Ordinal.GetHashCode(Fold(obj, mapping));
+    }
 }
 
 public sealed class ISupportState
@@ -518,7 +657,16 @@ public sealed class ISupportState
             ParseInt(PositiveValue("LINELEN")),
             ParseMaxList(PositiveValue("MAXLIST")),
             ParseTargetMax(PositiveValue("TARGMAX")),
-            HasPositive("UTF8ONLY"));
+            HasPositive("UTF8ONLY"))
+        {
+            Modes = ParseInt(PositiveValue("MODES")),
+            NickLength = ParseInt(PositiveValue("NICKLEN")),
+            ChannelLength = ParseInt(PositiveValue("CHANNELLEN")),
+            TopicLength = ParseInt(PositiveValue("TOPICLEN")),
+            KickLength = ParseInt(PositiveValue("KICKLEN")),
+            AwayLength = ParseInt(PositiveValue("AWAYLEN")),
+            SupportsMonitor = HasPositive("MONITOR")
+        };
     }
 
     private string? PositiveValue(string name)
@@ -689,7 +837,7 @@ public sealed class ServerFeatureSet
         RuntimeISupport = runtimeISupport;
         Profiles = profiles;
         Identity = identity;
-        NetworkName = runtimeISupport.NetworkName ?? profiles?.Network?.Name;
+        NetworkName = runtimeISupport.NetworkName ?? profiles?.Network?.Name ?? identity.NetworkName;
         CaseMapping = runtimeISupport.HasCaseMapping ? runtimeISupport.CaseMapping : IrcCaseMapping.Rfc1459;
         ChannelTypes = runtimeISupport.HasChannelTypes
             ? runtimeISupport.ChannelTypes

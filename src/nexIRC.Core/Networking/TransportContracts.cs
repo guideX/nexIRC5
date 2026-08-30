@@ -85,3 +85,21 @@ public interface IIrcTransportFactory
 {
     ValueTask<IIrcTransport> CreateAsync(IrcEndpoint endpoint, CancellationToken cancellationToken);
 }
+
+/// <summary>
+/// Optional push notifications for transports that expose callbacks in
+/// addition to the pull-based read contract. ServerSession binds these to the
+/// connection epoch so late notifications cannot affect a newer connection.
+/// </summary>
+public abstract record IrcTransportCallback;
+
+public sealed record IrcTransportInboundLineCallback(string Line) : IrcTransportCallback;
+
+public sealed record IrcTransportFailureCallback(ConnectionFailure Failure) : IrcTransportCallback;
+
+public sealed record IrcTransportDisconnectedCallback(ConnectionFailure? Failure = null) : IrcTransportCallback;
+
+public interface IIrcTransportCallbackSource
+{
+    event Func<IrcTransportCallback, ValueTask>? CallbackReceived;
+}

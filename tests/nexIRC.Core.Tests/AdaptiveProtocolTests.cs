@@ -52,6 +52,31 @@ public sealed class AdaptiveProtocolTests
     }
 
     [Fact]
+    public void CapTracksAvailableRequestedAndEnabledIndependentlyAndResets()
+    {
+        var negotiator = new IrcCapabilityNegotiator(["message-tags", "future-cap"]);
+        negotiator.Start();
+        var listing = negotiator.Handle(Parse(":srv CAP * LS * :message-tags=1 future-cap"));
+        var completeListing = negotiator.Handle(Parse(":srv CAP * LS :account-notify")).Snapshot;
+        var acknowledgement = negotiator.Handle(Parse(":srv CAP * ACK :message-tags")).Snapshot;
+        var newCapability = negotiator.Handle(Parse(":srv CAP * NEW :echo-message=1")).Snapshot;
+        var removed = negotiator.Handle(Parse(":srv CAP * DEL :message-tags")).Snapshot;
+
+        Assert.Equal(["message-tags", "future-cap"], listing.Snapshot.RequestedTokens);
+        Assert.True(completeListing.IsAvailable("account-notify"));
+        Assert.True(acknowledgement.IsEnabled("message-tags"));
+        Assert.True(newCapability.IsAvailable("echo-message"));
+        Assert.False(removed.IsAvailable("message-tags"));
+        Assert.False(removed.IsEnabled("message-tags"));
+
+        negotiator.Reset();
+        Assert.Empty(negotiator.Snapshot.Available);
+        Assert.Empty(negotiator.Snapshot.Enabled);
+        Assert.Equal(CapNegotiationState.NotStarted, negotiator.Snapshot.NegotiationState);
+        Assert.Equal(["message-tags", "future-cap"], negotiator.Snapshot.RequestedTokens);
+    }
+
+    [Fact]
     public void ParsesTypedISupportAndPreservesUnknownTokensAndRemoval()
     {
         var state = new ISupportState();

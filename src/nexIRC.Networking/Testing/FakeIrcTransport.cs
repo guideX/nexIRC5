@@ -15,7 +15,7 @@ public sealed record FakeInboundDisconnect(TimeSpan Delay = default);
 /// <summary>
 /// Deterministic transport for protocol tests: chunks, delays, failures, disconnects, and outbound capture are explicit.
 /// </summary>
-public sealed class FakeIrcTransport : IIrcTransport
+public sealed class FakeIrcTransport : IIrcTransport, IIrcTransportCallbackSource
 {
     private readonly Channel<object> _inbound = Channel.CreateUnbounded<object>();
     private readonly ConcurrentQueue<byte[]> _outbound = new();
@@ -43,6 +43,8 @@ public sealed class FakeIrcTransport : IIrcTransport
     public int DisconnectCount { get; private set; }
 
     public ConnectionFailure? ConnectFailure { get; set; }
+
+    public event Func<IrcTransportCallback, ValueTask>? CallbackReceived;
 
     public IReadOnlyList<byte[]> OutboundBytes => _outbound.ToArray();
 
@@ -154,6 +156,12 @@ public sealed class FakeIrcTransport : IIrcTransport
 
     public void EnqueueRemoteDisconnect(TimeSpan delay = default) =>
         _inbound.Writer.TryWrite(new FakeInboundDisconnect(delay));
+
+    public ValueTask EmitCallbackAsync(IrcTransportCallback callback)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        return CallbackReceived is { } handler ? handler(callback) : ValueTask.CompletedTask;
+    }
 
     public void EnqueueScript(IEnumerable<object> steps)
     {

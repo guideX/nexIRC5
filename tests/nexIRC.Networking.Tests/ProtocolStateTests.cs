@@ -22,6 +22,8 @@ public sealed class ProtocolStateTests
             RealName = "Test user",
             Reconnect = new ReconnectPolicy(Enabled: false)
         }, factory);
+        var sawQuit = false;
+        session.SemanticEventReceived += (_, item) => sawQuit |= item.Event is IrcQuitEvent quit && quit.Nickname == "robert";
         var run = session.RunAsync();
         while (transport.ConnectCount == 0)
         {
@@ -32,7 +34,8 @@ public sealed class ProtocolStateTests
         transport.EnqueueInboundBytes(Encoding.UTF8.GetBytes("\r\n:srv 005 alice PREFIX=(qaohv)~&@%+ CHANTYPES=# :supported\r\n:srv 001 alice :welcome\r\n"));
         transport.EnqueueInboundBytes(Encoding.UTF8.GetBytes(":alice!u@host JOIN #room\r\n:bob!b@host JOIN #room\r\n:srv 353 alice = #room :@alice +bob\r\n:srv 332 alice #room :Topic text\r\n:bob!b@host PRIVMSG alice :hello\r\n:bob!b@host NICK robert\r\n:robert!b@host QUIT :gone\r\n"));
 
-        await WaitForAsync(() => session.Snapshot.Queries.Count == 1
+        await WaitForAsync(() => sawQuit
+            && session.Snapshot.Queries.Count == 1
             && session.Snapshot.Channels.Count == 1
             && !session.Snapshot.Channels[0].Members.ContainsKey("robert"));
         var snapshot = session.Snapshot;
