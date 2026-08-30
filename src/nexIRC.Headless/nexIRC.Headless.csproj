@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>nexIRC.Headless</AssemblyName>
+    <RootNamespace>nexIRC.Headless</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\nexIRC.Core\nexIRC.Core.csproj" />
+    <ProjectReference Include="..\nexIRC.Networking\nexIRC.Networking.csproj" />
+  </ItemGroup>
+</Project>

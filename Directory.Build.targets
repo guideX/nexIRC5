@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CA1707;CA1716;CA1720;CA1822;CA1848;CA2007;CA2016;CA2208;CA2254;CA1510;CA1512;CA1515;CA1861</NoWarn>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>nexIRC.Core</AssemblyName>
+    <RootNamespace>nexIRC.Core</RootNamespace>
+  </PropertyGroup>
+</Project>
