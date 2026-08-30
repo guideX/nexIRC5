@@ -8,9 +8,9 @@ public static class IrcEventPresentation
         semanticEvent switch
         {
             IrcWelcomeEvent welcome => Entry(TranscriptEntryKind.Connection, null, welcome.NetworkName is null ? "Connected; server identity is not known yet." : $"Connected to {welcome.NetworkName}."),
-            IrcRegistrationStateEvent registration => Entry(TranscriptEntryKind.Connection, null, $"Registration: {registration.Previous} → {registration.Current}."),
-            IrcCapabilityChangedEvent capability => Entry(TranscriptEntryKind.System, null, $"CAP {capability.Kind}: {string.Join(' ', capability.Capabilities)}"),
-            IrcSaslStateChangedEvent sasl => Entry(sasl.Current == SaslAuthenticationState.Failed ? TranscriptEntryKind.Error : TranscriptEntryKind.System, null, $"SASL: {sasl.Current}{FormatDetail(sasl.Detail)}"),
+            IrcRegistrationStateEvent registration => Entry(TranscriptEntryKind.Registration, null, $"Registration: {registration.Previous} → {registration.Current}."),
+            IrcCapabilityChangedEvent capability => Entry(TranscriptEntryKind.Capability, null, $"CAP {capability.Kind}: {string.Join(' ', capability.Capabilities)}"),
+            IrcSaslStateChangedEvent sasl => Entry(sasl.Current == SaslAuthenticationState.Failed ? TranscriptEntryKind.Error : TranscriptEntryKind.Authentication, null, $"SASL: {sasl.Current}{FormatDetail(sasl.Detail)}"),
             IrcServerErrorEvent error => Entry(TranscriptEntryKind.Error, null, error.Text),
             IrcJoinEvent join => Entry(TranscriptEntryKind.Join, join.Nickname, $"joined {join.Channel}"),
             IrcPartEvent part => Entry(TranscriptEntryKind.Part, part.Nickname, $"left {part.Channel}"),
@@ -23,32 +23,41 @@ public static class IrcEventPresentation
             IrcQueryMessageEvent query => Entry(TranscriptEntryKind.Message, query.Nickname, query.Text),
             IrcTopicEvent topic => Entry(TranscriptEntryKind.Topic, topic.Message.Prefix?.Name, $"set topic in {topic.Channel}: {topic.Topic}"),
             IrcTopicUnsetEvent topic => Entry(TranscriptEntryKind.Topic, topic.Message.Prefix?.Name, $"cleared the topic in {topic.Channel}"),
-            IrcNamesEvent names => Entry(TranscriptEntryKind.System, null, $"NAMES {names.Channel}: {names.Nicknames.Count} member(s) observed."),
-            IrcNamesCompleteEvent names => Entry(TranscriptEntryKind.System, null, $"Member list synchronized for {names.Channel}."),
+            IrcNamesEvent names => Entry(TranscriptEntryKind.Informational, null, $"NAMES {names.Channel}: {names.Nicknames.Count} member(s) observed."),
+            IrcNamesCompleteEvent names => Entry(TranscriptEntryKind.Informational, null, $"Member list synchronized for {names.Channel}."),
             IrcModeEvent mode => Entry(TranscriptEntryKind.Mode, mode.Message.Prefix?.Name, $"changed modes in {mode.Channel}: {FormatModes(mode.Changes)}"),
-            IrcChannelSynchronizationEvent synchronization => Entry(TranscriptEntryKind.System, null, $"{synchronization.Channel}: {synchronization.State}."),
+            IrcChannelSynchronizationEvent synchronization => Entry(TranscriptEntryKind.Informational, null, $"{synchronization.Channel}: {synchronization.State}."),
             IrcMotdEvent motd => Entry(TranscriptEntryKind.Motd, null, motd.Kind == IrcMotdEventKind.Line ? motd.Text : $"MOTD {motd.Kind.ToString().ToLowerInvariant()}: {motd.Text}"),
-            IrcListStartEvent => Entry(TranscriptEntryKind.System, null, "Channel list started."),
-            IrcListItemEvent item => Entry(TranscriptEntryKind.System, null, $"LIST {item.Channel}: {item.VisibleUsers} user(s), {item.Topic}"),
-            IrcListEndEvent => Entry(TranscriptEntryKind.System, null, "Channel list complete."),
-            IrcWhoEvent who => Entry(TranscriptEntryKind.System, null, $"WHO {who.Channel}: {who.Nickname} ({who.Username}@{who.Host})"),
-            IrcWhoEndEvent who => Entry(TranscriptEntryKind.System, null, $"WHO {who.Target}: {who.Text}"),
-            IrcWhoisEvent whois => Entry(TranscriptEntryKind.System, null, $"WHOIS {whois.Nickname} ({whois.Numeric}): {whois.Text ?? string.Join(' ', whois.Parameters)}"),
+            IrcListStartEvent => Entry(TranscriptEntryKind.List, null, "Channel list started."),
+            IrcListItemEvent item => Entry(TranscriptEntryKind.List, null, $"LIST {item.Channel}: {item.VisibleUsers} user(s), {item.Topic}"),
+            IrcListEndEvent => Entry(TranscriptEntryKind.List, null, "Channel list complete."),
+            IrcWhoEvent who => Entry(TranscriptEntryKind.Informational, null, $"WHO {who.Channel}: {who.Nickname} ({who.Username}@{who.Host})"),
+            IrcWhoEndEvent who => Entry(TranscriptEntryKind.Informational, null, $"WHO {who.Target}: {who.Text}"),
+            IrcWhoisEvent whois => Entry(TranscriptEntryKind.Whois, null, $"WHOIS {whois.Nickname} ({whois.Numeric}): {whois.Text ?? string.Join(' ', whois.Parameters)}"),
             IrcUnknownNumericEvent unknown => Entry(TranscriptEntryKind.Numeric, null, $"Unknown server numeric {unknown.Numeric}: {MessageText(unknown.Message)}"),
             IrcUnknownCommandEvent unknown => Entry(TranscriptEntryKind.Numeric, null, $"Unknown server command {unknown.Message.Command}: {MessageText(unknown.Message)}"),
             IrcNumericEvent numeric when numeric.Numeric is 332 or 331 or 324 or 353 or 366 or 375 or 372 or 376 or 422 => null,
-            IrcNumericEvent numeric => Entry(TranscriptEntryKind.Numeric, null, $"Server reply {numeric.Numeric}: {MessageText(numeric.Message)}"),
+            IrcNumericEvent numeric => Entry(TranscriptEntryKind.Informational, null, $"Server reply {numeric.Numeric}: {MessageText(numeric.Message)}"),
             IrcPingEvent => null,
             _ => Entry(TranscriptEntryKind.System, null, semanticEvent.Message.Command)
         };
 
     public static TranscriptEntry CreateLocalMessage(string sender, string text, bool isAction = false) =>
-        Entry(isAction ? TranscriptEntryKind.Action : TranscriptEntryKind.Message, sender, isAction ? $"* {sender} {text}" : text);
+        CreateLocalMessage(sender, text, isAction ? OutgoingMessageKind.Action : OutgoingMessageKind.ChannelMessage);
+
+    public static TranscriptEntry CreateLocalMessage(string sender, string text, OutgoingMessageKind kind) =>
+        Entry(kind switch
+        {
+            OutgoingMessageKind.PrivateMessage => TranscriptEntryKind.OutgoingPrivateMessage,
+            OutgoingMessageKind.Action => TranscriptEntryKind.OutgoingAction,
+            OutgoingMessageKind.Notice => TranscriptEntryKind.OutgoingNotice,
+            _ => TranscriptEntryKind.OutgoingMessage
+        }, sender, text);
 
     public static TranscriptEntry CreateLocalCommand(string text) => Entry(TranscriptEntryKind.System, null, text);
 
     private static TranscriptEntry Entry(TranscriptEntryKind kind, string? sender, string text, string? metadata = null) =>
-        new(DateTimeOffset.Now, kind, sender, text, metadata);
+        new(DateTimeOffset.UtcNow, kind, sender, text, metadata);
 
     private static string FormatDetail(string? detail) => string.IsNullOrWhiteSpace(detail) ? string.Empty : $": {detail}";
 
@@ -58,4 +67,12 @@ public static class IrcEventPresentation
     private static string MessageText(nexIRC.Core.Protocol.IrcMessage message) => message.HasTrailingParameter
         ? message.TrailingParameter ?? string.Empty
         : string.Join(' ', message.Parameters);
+}
+
+public enum OutgoingMessageKind
+{
+    ChannelMessage,
+    PrivateMessage,
+    Action,
+    Notice
 }

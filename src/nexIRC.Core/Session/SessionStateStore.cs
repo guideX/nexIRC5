@@ -214,6 +214,14 @@ internal sealed class SessionStateStore
             case "318":
             case "319":
             case "330":
+            case "301":
+            case "307":
+            case "310":
+            case "335":
+            case "338":
+            case "378":
+            case "379":
+            case "671":
                 ApplyWhois(message, events);
                 break;
             case "001":

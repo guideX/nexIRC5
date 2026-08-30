@@ -44,6 +44,21 @@ public partial class MainWindow : Window
 
     private async void OnInputKeyDown(object sender, KeyEventArgs e)
     {
+        if (Keyboard.Modifiers == ModifierKeys.None && e.Key is Key.Up or Key.Down)
+        {
+            ViewModel.NavigateInputHistory(e.Key == Key.Up ? InputHistoryDirection.Older : InputHistoryDirection.Newer);
+            InputBox.CaretIndex = InputBox.Text.Length;
+            e.Handled = true;
+            return;
+        }
+
+        if (Keyboard.Modifiers == ModifierKeys.None && e.Key == Key.Tab)
+        {
+            InputBox.CaretIndex = ViewModel.CompleteInput(InputBox.CaretIndex);
+            e.Handled = true;
+            return;
+        }
+
         if (e.Key != Key.Enter || Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
         {
             return;
@@ -83,6 +98,20 @@ public partial class MainWindow : Window
     {
         ViewModel.PrepareInput("/whois ");
         InputBox.Focus();
+    }
+
+    private void OnListClick(object sender, RoutedEventArgs e)
+    {
+        ViewModel.PrepareInput("/list ");
+        InputBox.Focus();
+    }
+
+    private async void OnChannelListDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is ListBox list && list.SelectedItem is ChannelListRow row)
+        {
+            await ViewModel.ExecuteInputAsync($"/join {row.Channel}");
+        }
     }
 
     private void OnPreviewRightClick(object sender, MouseButtonEventArgs e)

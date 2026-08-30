@@ -11,7 +11,9 @@ public enum WorkspaceViewKind
 {
     ServerStatus,
     Channel,
-    Query
+    Query,
+    Whois,
+    ChannelList
 }
 
 public enum WorkspaceActivity
@@ -26,6 +28,17 @@ public enum TranscriptEntryKind
     Message,
     Notice,
     Action,
+    OutgoingMessage,
+    OutgoingPrivateMessage,
+    OutgoingAction,
+    OutgoingNotice,
+    Capability,
+    Authentication,
+    Registration,
+    Informational,
+    List,
+    Whois,
+    Reconnect,
     Join,
     Part,
     Quit,
@@ -82,11 +95,23 @@ public sealed record TranscriptEntry(
 {
     public string DisplayTime => Timestamp.ToLocalTime().ToString("HH:mm:ss", System.Globalization.CultureInfo.CurrentCulture);
 
+    public bool IsOutgoing => Kind is TranscriptEntryKind.OutgoingMessage
+        or TranscriptEntryKind.OutgoingPrivateMessage
+        or TranscriptEntryKind.OutgoingAction
+        or TranscriptEntryKind.OutgoingNotice;
+
+    public bool IsHighlight => string.Equals(Metadata, "highlight", StringComparison.Ordinal);
+
     public string DisplaySender => string.IsNullOrWhiteSpace(Sender) ? string.Empty : $"<{Sender}>";
 
-    public string DisplayLine => string.IsNullOrWhiteSpace(Sender)
-        ? Text
-        : $"<{Sender}> {Text}";
+    public string DisplayLine => Kind switch
+    {
+        TranscriptEntryKind.OutgoingAction => $"* {Sender} {Text}",
+        TranscriptEntryKind.OutgoingPrivateMessage => $"→ {Sender}: {Text}",
+        TranscriptEntryKind.OutgoingNotice => $"→ -{Sender}- {Text}",
+        TranscriptEntryKind.OutgoingMessage => $"→ {Text}",
+        _ => string.IsNullOrWhiteSpace(Sender) ? Text : $"<{Sender}> {Text}"
+    };
 }
 
 public sealed record NetworkConnectionOptions
@@ -223,7 +248,7 @@ public abstract class WorkspaceView : ObservableObject
         }
     }
 
-    internal void Append(TranscriptEntry entry, bool markActivity = true)
+    internal void Append(TranscriptEntry entry, bool markActivity = true, WorkspaceActivity? activity = null)
     {
         lock (_entriesGate)
         {
@@ -236,9 +261,9 @@ public abstract class WorkspaceView : ObservableObject
 
         if (markActivity && !IsActive)
         {
-            MarkActivity(entry.Kind is TranscriptEntryKind.Error or TranscriptEntryKind.Notice
+            MarkActivity(activity ?? (entry.Kind is TranscriptEntryKind.Error or TranscriptEntryKind.Notice
                 ? WorkspaceActivity.Important
-                : WorkspaceActivity.Unread);
+                : WorkspaceActivity.Unread));
         }
     }
 
@@ -618,6 +643,10 @@ public sealed class NetworkWorkspace : ObservableObject
 
     public ObservableCollection<QueryView> Queries { get; } = [];
 
+    public ObservableCollection<WhoisView> WhoisViews { get; } = [];
+
+    public ObservableCollection<ChannelListView> ChannelListViews { get; } = [];
+
     public WorkspaceView? ActiveView
     {
         get => _activeView;
@@ -686,6 +715,58 @@ public sealed class NetworkWorkspace : ObservableObject
         return view;
     }
 
+    internal WhoisView EnsureWhois(string nickname, bool beginRequest = false)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
+        var existing = WhoisViews.FirstOrDefault(item => IrcCaseMappingComparer.Equals(item.RequestedNickname, nickname, _snapshot.Features.CaseMapping));
+        if (existing is not null)
+        {
+            if (beginRequest)
+            {
+                existing.BeginRequest();
+            }
+
+            return existing;
+        }
+
+        var view = new WhoisView(Id, Guid.NewGuid(), nickname);
+        WhoisViews.Add(view);
+        InsertView(view);
+        if (beginRequest)
+        {
+            view.BeginRequest();
+        }
+
+        return view;
+    }
+
+    internal ChannelListView EnsureChannelList(bool beginRequest = false)
+    {
+        var existing = ChannelListViews.FirstOrDefault();
+        if (existing is not null)
+        {
+            if (beginRequest)
+            {
+                existing.BeginRequest();
+            }
+
+            return existing;
+        }
+
+        var view = new ChannelListView(Id, Guid.NewGuid(), "Channel List");
+        ChannelListViews.Add(view);
+        InsertView(view);
+        if (beginRequest)
+        {
+            view.BeginRequest();
+        }
+
+        return view;
+    }
+
+    internal WhoisView? FindWhois(string nickname) =>
+        WhoisViews.LastOrDefault(item => IrcCaseMappingComparer.Equals(item.RequestedNickname, nickname, _snapshot.Features.CaseMapping));
+
     internal void Activate(WorkspaceView view)
     {
         foreach (var item in Views)
@@ -705,13 +786,14 @@ public sealed class NetworkWorkspace : ObservableObject
 
     private void InsertView(WorkspaceView view)
     {
-        var channelIndex = Views.TakeWhile(item => item.Kind == WorkspaceViewKind.ServerStatus || item.Kind == WorkspaceViewKind.Channel).Count();
-        if (view.Kind == WorkspaceViewKind.Query)
+        if (view.Kind is WorkspaceViewKind.Query or WorkspaceViewKind.Whois or WorkspaceViewKind.ChannelList)
         {
-            Views.Add(view);
+            var insertIndex = Views.TakeWhile(item => item.Kind is not WorkspaceViewKind.Query).Count();
+            Views.Insert(insertIndex, view);
         }
         else
         {
+            var channelIndex = Views.TakeWhile(item => item.Kind is WorkspaceViewKind.ServerStatus or WorkspaceViewKind.Channel).Count();
             Views.Insert(Math.Max(1, channelIndex), view);
         }
     }

@@ -16,6 +16,12 @@ public sealed record CommandDispatchResult(bool Succeeded, string Message, Works
 /// </summary>
 public sealed class IrcCommandDispatcher
 {
+    public static IReadOnlyList<string> SupportedCommands { get; } =
+    [
+        "server", "join", "part", "msg", "query", "q", "nick", "me", "quit",
+        "disconnect", "whois", "list", "raw", "quote"
+    ];
+
     private readonly NetworkSessionManager _sessions;
 
     public IrcCommandDispatcher(NetworkSessionManager sessions)
@@ -51,7 +57,10 @@ public sealed class IrcCommandDispatcher
             try
             {
                 await network.Session.SendCommandAsync("PRIVMSG", [target], input, cancellationToken).ConfigureAwait(false);
-                _sessions.AppendLocal(activeView, IrcEventPresentation.CreateLocalMessage(network.Session.Snapshot.Nickname, input));
+                _sessions.AppendLocal(activeView, IrcEventPresentation.CreateLocalMessage(
+                    network.Session.Snapshot.Nickname,
+                    input,
+                    activeView is QueryView ? OutgoingMessageKind.PrivateMessage : OutgoingMessageKind.ChannelMessage));
                 return CommandDispatchResult.Success($"Message sent to {target}.", activeView);
             }
             catch (InvalidOperationException exception)
@@ -90,6 +99,8 @@ public sealed class IrcCommandDispatcher
                     return await NickAsync(network, parts, cancellationToken).ConfigureAwait(false);
                 case "WHOIS":
                     return await WhoisAsync(network, parts, cancellationToken).ConfigureAwait(false);
+                case "LIST":
+                    return await ListAsync(network, parts, cancellationToken).ConfigureAwait(false);
                 case "ME":
                     return await ActionAsync(network, activeView, arguments, cancellationToken).ConfigureAwait(false);
                 case "QUIT":
@@ -191,7 +202,7 @@ public sealed class IrcCommandDispatcher
         var view = _sessions.EnsureQuery(network.Id, target);
         _sessions.ActivateView(view.Id);
         await network.Session.SendCommandAsync("PRIVMSG", [target], text, cancellationToken).ConfigureAwait(false);
-        _sessions.AppendLocal(view, IrcEventPresentation.CreateLocalMessage(network.Session.Snapshot.Nickname, text));
+        _sessions.AppendLocal(view, IrcEventPresentation.CreateLocalMessage(network.Session.Snapshot.Nickname, text, OutgoingMessageKind.PrivateMessage));
         return CommandDispatchResult.Success($"Message sent to {target}.", view);
     }
 
@@ -225,8 +236,30 @@ public sealed class IrcCommandDispatcher
             return CommandDispatchResult.Failure("Usage: /whois <nickname>", network.StatusView);
         }
 
-        await network.Session.SendCommandAsync("WHOIS", [parts[0]], cancellationToken: cancellationToken).ConfigureAwait(false);
-        return CommandDispatchResult.Success($"WHOIS requested for {parts[0]}.", network.StatusView);
+        var view = _sessions.BeginWhois(network.Id, parts[0]);
+        try
+        {
+            await network.Session.SendCommandAsync("WHOIS", [parts[0]], cancellationToken: cancellationToken).ConfigureAwait(false);
+            return CommandDispatchResult.Success($"WHOIS requested for {parts[0]}.", view);
+        }
+        catch (InvalidOperationException exception)
+        {
+            return CommandDispatchResult.Failure(exception.Message, view);
+        }
+    }
+
+    private async ValueTask<CommandDispatchResult> ListAsync(NetworkWorkspace network, string[] parts, CancellationToken cancellationToken)
+    {
+        var view = _sessions.BeginChannelList(network.Id);
+        try
+        {
+            await network.Session.SendCommandAsync("LIST", parts, cancellationToken: cancellationToken).ConfigureAwait(false);
+            return CommandDispatchResult.Success("Channel list requested.", view);
+        }
+        catch (InvalidOperationException exception)
+        {
+            return CommandDispatchResult.Failure(exception.Message, view);
+        }
     }
 
     private async ValueTask<CommandDispatchResult> ActionAsync(

@@ -30,7 +30,7 @@ public sealed class DemoScenario
     public async Task SeedAsync(NetworkSessionManager sessions)
     {
         var alpha = sessions.Add(Options("AlphaNet", _alpha.Endpoint, "nexAlpha", "#alpha", "#lounge"));
-        var beta = sessions.Add(Options("BetaNet", _beta.Endpoint, "nexBeta", "#beta"));
+        var beta = sessions.Add(Options("BetaNet", _beta.Endpoint, "nexBeta", "#lounge"));
         await sessions.ConnectAsync(alpha.Id).ConfigureAwait(true);
         await sessions.ConnectAsync(beta.Id).ConfigureAwait(true);
         await WaitForAsync(() => _alpha.ConnectCount == 1 && _beta.ConnectCount == 1).ConfigureAwait(true);
@@ -46,15 +46,40 @@ public sealed class DemoScenario
         _alpha.EnqueueInboundLine(":alpha.server MODE #alpha +nt");
         _alpha.EnqueueInboundLine(":Mira!m@alpha PRIVMSG #alpha :Welcome to the Alpha network.");
         _alpha.EnqueueInboundLine(":Rook!r@alpha PRIVMSG #alpha :Try /join, /me, or /query in the command line.");
+        _alpha.EnqueueInboundLine(":Mira!m@alpha PRIVMSG #alpha :nexAlpha, this is an important highlight.");
         _alpha.EnqueueInboundLine(":Mira!m@alpha PRIVMSG nexAlpha :This private query is intentionally highlighted.");
         _alpha.EnqueueInboundLine(":Rook!r@alpha NICK RookAway");
+        _alpha.EnqueueInboundLine(":alpha.server 311 nexAlpha Mira mira alpha.example * :Mira Demo User");
+        _alpha.EnqueueInboundLine(":alpha.server 312 nexAlpha Mira alpha.server :AlphaNet IRC services");
+        _alpha.EnqueueInboundLine(":alpha.server 313 nexAlpha Mira :is an IRC operator");
+        _alpha.EnqueueInboundLine(":alpha.server 317 nexAlpha Mira 42 1735689600 :seconds idle, signon time");
+        _alpha.EnqueueInboundLine(":alpha.server 319 nexAlpha Mira :@#alpha +#lounge");
+        _alpha.EnqueueInboundLine(":alpha.server 330 nexAlpha Mira mira-account :is logged in as");
+        _alpha.EnqueueInboundLine(":alpha.server 338 nexAlpha Mira :is using a secure connection");
+        _alpha.EnqueueInboundLine(":alpha.server 318 nexAlpha Mira :End of WHOIS list");
+        _alpha.EnqueueInboundLine(":alpha.server 321 nexAlpha Channel :Users Name");
+        _alpha.EnqueueInboundLine(":alpha.server 322 nexAlpha #alpha 12 :A calm place for testing");
+        _alpha.EnqueueInboundLine(":alpha.server 322 nexAlpha #lounge 7 :Shared channel name on AlphaNet");
+        _alpha.EnqueueInboundLine(":alpha.server 322 nexAlpha #random 0 :");
+        _alpha.EnqueueInboundLine(":alpha.server 323 nexAlpha :End of LIST");
 
-        _beta.EnqueueInboundLine(":nexBeta!demo@beta JOIN #beta");
-        _beta.EnqueueInboundLine(":beta.server 353 nexBeta = #beta :@nexBeta +Sable");
-        _beta.EnqueueInboundLine(":beta.server 366 nexBeta #beta :End of names");
-        _beta.EnqueueInboundLine(":beta.server 332 nexBeta #beta :Beta network topic");
-        _beta.EnqueueInboundLine(":Sable!s@beta PRIVMSG #beta :Events from BetaNet stay in BetaNet.");
+        _beta.EnqueueInboundLine(":nexBeta!demo@beta JOIN #lounge");
+        _beta.EnqueueInboundLine(":beta.server 353 nexBeta = #lounge :@nexBeta +Mira");
+        _beta.EnqueueInboundLine(":beta.server 366 nexBeta #lounge :End of names");
+        _beta.EnqueueInboundLine(":beta.server 332 nexBeta #lounge :Beta network topic");
+        _beta.EnqueueInboundLine(":Mira!m@beta PRIVMSG #lounge :Events from BetaNet stay in BetaNet.");
         _beta.EnqueueInboundLine(":beta.server NOTICE nexBeta :Status notices are rendered in the server view.");
+
+        await WaitForAsync(() => alpha.State == NetworkDisplayState.Registered
+            && beta.State == NetworkDisplayState.Registered
+            && alpha.Channels.Any(channel => channel.Channel == "#alpha")
+            && beta.Channels.Any(channel => channel.Channel == "#lounge")).ConfigureAwait(true);
+
+        var dispatcher = new IrcCommandDispatcher(sessions);
+        var alphaChannel = alpha.Channels.First(channel => channel.Channel == "#alpha");
+        await dispatcher.DispatchAsync(alpha, alphaChannel, "Local AlphaNet message").ConfigureAwait(true);
+        await dispatcher.DispatchAsync(alpha, alphaChannel, "/me demonstrates a local action").ConfigureAwait(true);
+        await dispatcher.DispatchAsync(alpha, alphaChannel, "/msg Mira A local private message").ConfigureAwait(true);
 
         sessions.ActivateView(alpha.StatusView.Id);
     }

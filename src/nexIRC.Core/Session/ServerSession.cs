@@ -13,8 +13,9 @@ public sealed class ServerSession : IAsyncDisposable
 {
     private static readonly HashSet<int> KnownNumerics =
     [
-        1, 4, 5, 311, 312, 313, 315, 317, 318, 319, 321, 322, 323, 324,
-        331, 332, 353, 366, 367, 368, 369, 372, 375, 376, 422, 900, 903, 904, 905, 906, 907, 908
+        1, 4, 5, 301, 307, 310, 311, 312, 313, 315, 317, 318, 319, 321, 322, 323, 324,
+        330, 335, 338, 352, 353, 366, 367, 368, 369, 372, 375, 376, 378, 379, 422,
+        671, 900, 903, 904, 905, 906, 907, 908
     ];
     private static readonly HashSet<int> NicknameFailureNumerics = [433, 436, 437];
     private static readonly HashSet<string> KnownCommands =

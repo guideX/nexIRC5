@@ -11,14 +11,20 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private readonly Dictionary<Guid, SessionEntry> _entries = [];
     private readonly object _pendingGate = new();
     private readonly HashSet<Task> _pendingDispatches = [];
+    private readonly bool _ownsNotifications;
     private bool _disposed;
 
     public NetworkSessionManager(
         nexIRC.Core.Networking.IIrcTransportFactory transportFactory,
-        IWorkspaceDispatcher? dispatcher = null)
+        IWorkspaceDispatcher? dispatcher = null,
+        IIrcNotificationService? notifications = null,
+        HighlightActivityPolicy? highlightPolicy = null)
     {
         _transportFactory = transportFactory ?? throw new ArgumentNullException(nameof(transportFactory));
         _dispatcher = dispatcher ?? new ImmediateWorkspaceDispatcher();
+        Notifications = notifications ?? new NotificationSubscriptionService();
+        _ownsNotifications = notifications is null;
+        HighlightPolicy = highlightPolicy ?? new HighlightActivityPolicy();
     }
 
     public ObservableCollection<NetworkWorkspace> Networks { get; } = [];
@@ -26,6 +32,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     public NetworkWorkspace? ActiveNetwork { get; private set; }
 
     public WorkspaceView? ActiveView { get; private set; }
+
+    public IIrcNotificationService Notifications { get; }
+
+    public HighlightActivityPolicy HighlightPolicy { get; }
 
     public event EventHandler<WorkspaceActivityEventArgs>? ActivityRaised;
 
@@ -90,6 +100,22 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     {
         var workspace = GetWorkspace(networkId);
         return workspace.EnsureQuery(nickname);
+    }
+
+    public WhoisView BeginWhois(Guid networkId, string nickname)
+    {
+        var workspace = GetWorkspace(networkId);
+        var view = workspace.EnsureWhois(nickname, beginRequest: true);
+        ActivateView(view.Id);
+        return view;
+    }
+
+    public ChannelListView BeginChannelList(Guid networkId)
+    {
+        var workspace = GetWorkspace(networkId);
+        var view = workspace.EnsureChannelList(beginRequest: true);
+        ActivateView(view.Id);
+        return view;
     }
 
     public void ActivateView(Guid viewId)
@@ -197,6 +223,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         await Task.WhenAll(pending).ConfigureAwait(false);
+
+        if (_ownsNotifications)
+        {
+            Notifications.Dispose();
+        }
     }
 
     internal void AppendLocal(WorkspaceView view, TranscriptEntry entry) => view.Append(entry, markActivity: false);
@@ -281,8 +312,13 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
             var snapshot = session.Snapshot;
             entry.Workspace.ApplySnapshot(snapshot);
-            var kind = change.Current == ServerSessionState.Failed ? TranscriptEntryKind.Error : TranscriptEntryKind.Connection;
-            var text = $"{change.Previous} → {change.Current}";
+            var kind = change.Current == ServerSessionState.Failed
+                ? TranscriptEntryKind.Error
+                : change.Current is ServerSessionState.ReconnectWaiting or ServerSessionState.Connecting
+                    && change.Previous is ServerSessionState.ReconnectWaiting or ServerSessionState.Failed
+                    ? TranscriptEntryKind.Reconnect
+                    : TranscriptEntryKind.Connection;
+            var text = FormatStateTransition(change, snapshot);
             if (snapshot.LastFailure is not null)
             {
                 text += $": {snapshot.LastFailure.Message}";
@@ -319,6 +355,13 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             case IrcPrivmsgEvent message when snapshot.Features.ChannelTypes.Contains(message.Target.FirstOrDefault()):
                 AppendRendered(workspace.EnsureChannel(message.Target), semanticEvent, snapshot);
                 break;
+            case IrcPrivmsgEvent message when message.IsNotice && message.Message.Prefix?.User is null:
+                AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                break;
+            case IrcPrivmsgEvent:
+                // A direct message is rendered by the corresponding query
+                // event below; do not duplicate it in server status.
+                break;
             case IrcQueryMessageEvent query:
                 AppendRendered(workspace.EnsureQuery(query.Nickname), semanticEvent, snapshot, WorkspaceActivity.Important);
                 break;
@@ -352,6 +395,36 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             case IrcChannelSynchronizationEvent synchronization:
                 AppendRendered(workspace.EnsureChannel(synchronization.Channel), semanticEvent, snapshot);
                 break;
+            case IrcListStartEvent:
+                var listStart = workspace.EnsureChannelList();
+                if (!listStart.IsLoading)
+                {
+                    listStart.BeginRequest();
+                }
+
+                AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                break;
+            case IrcListItemEvent listItem:
+                workspace.EnsureChannelList().Apply(listItem);
+                break;
+            case IrcListEndEvent:
+                workspace.EnsureChannelList().CompleteRequest();
+                AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                break;
+            case IrcWhoisEvent whois:
+                var whoisView = workspace.FindWhois(whois.Nickname) ?? workspace.EnsureWhois(whois.Nickname);
+                whoisView.Apply(whois);
+                AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                break;
+            case IrcUnknownNumericEvent unknownWhois when WhoisResult.IsPotentialAdditionalNumeric(unknownWhois.Numeric):
+                var pendingWhois = workspace.WhoisViews.LastOrDefault(view => view.IsLoading);
+                if (pendingWhois is not null)
+                {
+                    pendingWhois.ApplyAdditional(unknownWhois.Numeric, MessageText(unknownWhois.Message));
+                }
+
+                AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                break;
             case IrcQuitEvent quit:
                 foreach (var channel in workspace.Channels)
                 {
@@ -367,7 +440,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
                 AppendRendered(workspace.StatusView, semanticEvent, snapshot);
                 break;
-            case IrcNumericEvent numeric when numeric.Numeric is 332 or 331 or 324 or 353 or 366 or 375 or 372 or 376 or 422:
+            case IrcNumericEvent numeric when numeric.Numeric is 332 or 331 or 324 or 353 or 366 or 375 or 372 or 376 or 422
+                || WhoisResult.IsKnownWhoisNumeric(numeric.Numeric):
                 break;
             default:
                 AppendRendered(workspace.StatusView, semanticEvent, snapshot);
@@ -384,10 +458,18 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         var previousActivity = view.Activity;
-        view.Append(entry);
-        if (activity.HasValue && !view.IsActive)
+        var effectiveActivity = activity ?? HighlightPolicy.Classify(view, semanticEvent, snapshot);
+        if (semanticEvent is IrcPrivmsgEvent { IsNotice: false } channelMessage
+            && view is ChannelView
+            && HighlightPolicy.IsHighlight(channelMessage.Text, snapshot.Nickname, snapshot.Features.CaseMapping))
         {
-            view.MarkActivity(activity.Value);
+            entry = entry with { Metadata = "highlight" };
+        }
+
+        view.Append(entry, markActivity: false);
+        if (!view.IsActive && effectiveActivity != WorkspaceActivity.None)
+        {
+            view.MarkActivity(effectiveActivity);
         }
 
         if (!view.IsActive && view.Activity > previousActivity)
@@ -400,7 +482,52 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             {
             }
         }
+
+        Notifications.Publish(new IrcNotification(
+            view.NetworkId,
+            view.Id,
+            view.Kind,
+            NotificationType(semanticEvent, effectiveActivity),
+            effectiveActivity,
+            entry.Sender,
+            entry.DisplayLine,
+            entry.Timestamp,
+            view.IsActive,
+            semanticEvent.GetType().Name));
     }
+
+    private static string FormatStateTransition(SessionStateChangedEvent change, ServerSessionSnapshot snapshot)
+    {
+        var detail = change.Current switch
+        {
+            ServerSessionState.Connecting => "Connecting to the IRC server",
+            ServerSessionState.TlsNegotiation => "Negotiating TLS",
+            ServerSessionState.CapNegotiation => "Negotiating capabilities",
+            ServerSessionState.Registering => "Registering",
+            ServerSessionState.Registered => "Registered",
+            ServerSessionState.ReconnectWaiting => "Waiting before reconnect",
+            ServerSessionState.Disconnecting => "Disconnecting",
+            ServerSessionState.Disconnected => "Disconnected",
+            ServerSessionState.Failed => "Connection failed",
+            _ => change.Current.ToString()
+        };
+        var identity = snapshot.Features.NetworkName ?? snapshot.Identity.NetworkName;
+        return identity is null ? detail : $"{detail} · {identity}";
+    }
+
+    private static IrcNotificationType NotificationType(IrcSemanticEvent semanticEvent, WorkspaceActivity activity) => semanticEvent switch
+    {
+        IrcQueryMessageEvent => IrcNotificationType.PrivateMessage,
+        IrcPrivmsgEvent { IsNotice: true } => IrcNotificationType.Notice,
+        IrcPrivmsgEvent when activity == WorkspaceActivity.Important => IrcNotificationType.Highlight,
+        IrcPrivmsgEvent => IrcNotificationType.Message,
+        IrcServerErrorEvent or IrcUnknownCommandEvent or IrcUnknownNumericEvent => IrcNotificationType.Error,
+        _ => IrcNotificationType.Status
+    };
+
+    private static string MessageText(nexIRC.Core.Protocol.IrcMessage message) => message.HasTrailingParameter
+        ? message.TrailingParameter ?? string.Empty
+        : string.Join(' ', message.Parameters);
 
     private void Dispatch(Action action)
     {

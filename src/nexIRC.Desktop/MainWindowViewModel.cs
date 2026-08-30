@@ -21,12 +21,15 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     {
         Sessions = new NetworkSessionManager(transportFactory, new WpfWorkspaceDispatcher(dispatcher));
         _commands = new IrcCommandDispatcher(Sessions);
+        InputHistory = new InputHistory();
+        Completion = new CompletionEngine();
         NewConnectionCommand = new AsyncRelayCommand(() => NewConnectionRequested?.Invoke() ?? Task.CompletedTask);
         DisconnectCommand = new AsyncRelayCommand(DisconnectSelectedAsync, HasActiveNetwork);
         ReconnectCommand = new AsyncRelayCommand(ReconnectSelectedAsync, HasActiveNetwork);
         JoinCommand = new RelayCommand(() => InputText = "/join ");
         PartCommand = new RelayCommand(() => InputText = "/part", () => ActiveView is ChannelView);
         QueryCommand = new RelayCommand(() => InputText = "/query ");
+        ListCommand = new RelayCommand(() => InputText = "/list ");
         NextViewCommand = new RelayCommand(() => ActivateRelativeView(1), () => Sessions.Networks.Count > 0);
         PreviousViewCommand = new RelayCommand(() => ActivateRelativeView(-1), () => Sessions.Networks.Count > 0);
         ExitCommand = new RelayCommand(() => ExitRequested?.Invoke());
@@ -49,6 +52,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public NetworkSessionManager Sessions { get; }
 
     public ObservableCollection<NetworkWorkspace> Networks => Sessions.Networks;
+
+    public InputHistory InputHistory { get; }
+
+    public CompletionEngine Completion { get; }
+
+    public HighlightActivityPolicy HighlightPolicy => Sessions.HighlightPolicy;
 
     public WorkspaceView? ActiveView
     {
@@ -104,6 +113,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     public ICommand QueryCommand { get; }
 
+    public ICommand ListCommand { get; }
+
     public ICommand NextViewCommand { get; }
 
     public ICommand PreviousViewCommand { get; }
@@ -137,6 +148,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
 
         InputText = string.Empty;
+        InputHistory.Submit(input);
         var result = await _commands.DispatchAsync(Sessions.ActiveNetwork, ActiveView, input).ConfigureAwait(true);
         StatusText = result.Message;
         if (result.View is not null)
@@ -153,6 +165,23 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     }
 
     public void PrepareInput(string text) => InputText = text;
+
+    public void NavigateInputHistory(InputHistoryDirection direction)
+    {
+        InputText = InputHistory.Navigate(direction, InputText);
+    }
+
+    public int CompleteInput(int caretIndex)
+    {
+        var result = Completion.Complete(InputText, caretIndex, Sessions.ActiveNetwork, ActiveView);
+        if (!result.Completed)
+        {
+            return caretIndex;
+        }
+
+        InputText = result.Text;
+        return result.CaretIndex;
+    }
 
     public async ValueTask DisposeAsync()
     {

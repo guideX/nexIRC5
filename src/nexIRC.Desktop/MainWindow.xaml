@@ -21,7 +21,37 @@
         <DataTemplate x:Key="TranscriptEntryTemplate">
             <DockPanel LastChildFill="True" Margin="2,1">
                 <TextBlock DockPanel.Dock="Left" Text="{Binding DisplayTime}" Width="62" Foreground="#94A3B8" />
-                <TextBlock Text="{Binding DisplayLine}" TextWrapping="Wrap" Foreground="#1E293B" />
+                <TextBlock Text="{Binding DisplayLine}" TextWrapping="Wrap">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Foreground" Value="#1E293B" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsOutgoing}" Value="True">
+                                    <Setter Property="Foreground" Value="#2563EB" />
+                                </DataTrigger>
+                                <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.OutgoingAction}">
+                                    <Setter Property="Foreground" Value="#7C3AED" />
+                                </DataTrigger>
+                                <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.Error}">
+                                    <Setter Property="Foreground" Value="#B91C1C" />
+                                </DataTrigger>
+                                <DataTrigger Binding="{Binding IsHighlight}" Value="True">
+                                    <Setter Property="Background" Value="#FEF3C7" />
+                                    <Setter Property="Foreground" Value="#92400E" />
+                                </DataTrigger>
+                                <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.Capability}">
+                                    <Setter Property="Foreground" Value="#047857" />
+                                </DataTrigger>
+                                <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.Authentication}">
+                                    <Setter Property="Foreground" Value="#7C3AED" />
+                                </DataTrigger>
+                                <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.Reconnect}">
+                                    <Setter Property="Foreground" Value="#B45309" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
             </DockPanel>
         </DataTemplate>
         <DataTemplate DataType="{x:Type app:ServerStatusView}">
@@ -91,6 +121,83 @@
                 <ListBox Grid.Row="1" ItemsSource="{Binding Entries}" ItemTemplate="{StaticResource TranscriptEntryTemplate}" BorderThickness="0" Background="White" FontFamily="Cascadia Mono" />
             </Grid>
         </DataTemplate>
+        <DataTemplate DataType="{x:Type app:WhoisView}" x:Key="WhoisContentTemplate">
+            <ScrollViewer Margin="12" VerticalScrollBarVisibility="Auto">
+                <StackPanel>
+                    <TextBlock Text="{Binding Result.Nickname}" FontSize="20" FontWeight="SemiBold" Foreground="#172033" />
+                    <TextBlock Text="{Binding StateText}" Foreground="#2563EB" Margin="0,3,0,12" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="145" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <TextBlock Grid.Row="0" Text="Username" FontWeight="SemiBold" Margin="0,3" />
+                        <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding Result.Username}" Margin="0,3" />
+                        <TextBlock Grid.Row="1" Text="Hostname" FontWeight="SemiBold" Margin="0,3" />
+                        <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Result.Hostname}" Margin="0,3" />
+                        <TextBlock Grid.Row="2" Text="Real name" FontWeight="SemiBold" Margin="0,3" />
+                        <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding Result.RealName}" Margin="0,3" />
+                        <TextBlock Grid.Row="3" Text="Server" FontWeight="SemiBold" Margin="0,3" />
+                        <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding Result.ServerText}" Margin="0,3" />
+                        <TextBlock Grid.Row="4" Text="Account" FontWeight="SemiBold" Margin="0,3" />
+                        <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding Result.Account}" Margin="0,3" />
+                        <TextBlock Grid.Row="5" Text="Operator" FontWeight="SemiBold" Margin="0,3" />
+                        <TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding Result.OperatorStatus}" Margin="0,3" />
+                        <TextBlock Grid.Row="6" Text="Idle" FontWeight="SemiBold" Margin="0,3" />
+                        <TextBlock Grid.Row="6" Grid.Column="1" Text="{Binding Result.IdleText}" Margin="0,3" />
+                        <TextBlock Grid.Row="7" Text="Sign-on" FontWeight="SemiBold" Margin="0,3" />
+                        <TextBlock Grid.Row="7" Grid.Column="1" Text="{Binding Result.SignOnText}" Margin="0,3" />
+                        <TextBlock Grid.Row="8" Text="Secure/TLS" FontWeight="SemiBold" Margin="0,3" />
+                        <TextBlock Grid.Row="8" Grid.Column="1" Text="{Binding Result.IsSecure, StringFormat={}{0}}" Margin="0,3" />
+                    </Grid>
+                    <TextBlock Text="Channels" FontWeight="SemiBold" Margin="0,16,0,4" />
+                    <ItemsControl ItemsSource="{Binding Result.Channels}" />
+                    <TextBlock Text="Away" FontWeight="SemiBold" Margin="0,16,0,4" />
+                    <TextBlock Text="{Binding Result.AwayMessage}" TextWrapping="Wrap" />
+                    <TextBlock Text="Additional server information" FontWeight="SemiBold" Margin="0,16,0,4" />
+                    <ItemsControl ItemsSource="{Binding Result.AdditionalFields}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding DisplayText}" TextWrapping="Wrap" Margin="0,1" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </ScrollViewer>
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type app:ChannelListView}" x:Key="ChannelListContentTemplate">
+            <Grid Margin="12">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <StackPanel Margin="0,0,0,10">
+                    <TextBlock Text="Channel list" FontSize="20" FontWeight="SemiBold" Foreground="#172033" />
+                    <TextBlock Text="{Binding StateText}" Foreground="#2563EB" Margin="0,3,0,0" />
+                    <TextBlock Text="Double-click a channel to prepare a join." Foreground="#64748B" FontSize="11" Margin="0,3,0,0" />
+                </StackPanel>
+                <ListView Grid.Row="1" ItemsSource="{Binding Result.Rows}" MouseDoubleClick="OnChannelListDoubleClick">
+                    <ListView.View>
+                        <GridView>
+                            <GridViewColumn Header="Channel" DisplayMemberBinding="{Binding Channel}" Width="180" />
+                            <GridViewColumn Header="Users" DisplayMemberBinding="{Binding UsersText}" Width="80" />
+                            <GridViewColumn Header="Topic" DisplayMemberBinding="{Binding TopicText}" Width="600" />
+                        </GridView>
+                    </ListView.View>
+                </ListView>
+            </Grid>
+        </DataTemplate>
         <local:WorkspaceContentTemplateSelector x:Key="WorkspaceContentSelector" />
     </Window.Resources>
 
@@ -117,10 +224,13 @@
                 <MenuItem Header="_Part Channel" Command="{Binding PartCommand}" />
                 <MenuItem Header="Change _Nickname" Click="OnNicknameClick" />
                 <MenuItem Header="_WHOIS" Click="OnWhoisClick" />
-                <MenuItem Header="Channel _List" IsEnabled="False" />
+                <MenuItem Header="Channel _List" Click="OnListClick" />
                 <MenuItem Header="_Raw Command" Click="OnRawCommandClick" ToolTip="Type /raw in the command line." />
             </MenuItem>
             <MenuItem Header="_Tools">
+                <MenuItem Header="Highlight nickname" IsCheckable="True" IsChecked="{Binding HighlightPolicy.HighlightNickname, Mode=TwoWay}" />
+                <MenuItem Header="Highlight custom words" IsCheckable="True" IsChecked="{Binding HighlightPolicy.HighlightCustomWords, Mode=TwoWay}" />
+                <Separator />
                 <MenuItem Header="Preferences" IsEnabled="False" />
             </MenuItem>
             <MenuItem Header="_Window">
@@ -147,7 +257,7 @@
         <StatusBar DockPanel.Dock="Bottom" Visibility="{Binding IsStatusBarVisible, Converter={StaticResource BooleanToVisibility}}">
             <StatusBarItem Content="{Binding StatusText}" />
             <Separator />
-            <StatusBarItem Content="nexIRC 5 · Phase 1C" />
+            <StatusBarItem Content="nexIRC 5 · Phase 1D" />
         </StatusBar>
 
         <Grid>

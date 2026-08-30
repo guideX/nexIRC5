@@ -41,7 +41,7 @@ The UI-neutral model contains:
 - snapshot-projected channel topic, synchronization state, modes, and members;
 - WorkspaceActivity with None, Unread, and Important levels.
 
-NetworkSessionManager raises typed ActivityRaised notifications when an inactive view becomes unread or important. This is the application boundary a future notification service can subscribe to; notification delivery does not parse transcript text.
+NetworkSessionManager raises typed ActivityRaised notifications when an inactive view becomes unread or important and now exposes the Phase 1D UI-neutral notification subscription boundary. Notification delivery does not parse transcript text.
 
 The WPF TreeView binds to NetworkWorkspace.Views. Network nodes contain only their own status/channel/query children, so equal channel names and nicknames on two networks cannot collide. The tree label exposes the network's current connection state, and inactive views show activity markers.
 
