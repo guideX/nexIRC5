@@ -123,12 +123,12 @@ public sealed class WorkspaceTests
 
         Assert.True(joined.Succeeded);
         Assert.True(message.Succeeded);
-        Assert.Contains("JOIN #commands", transport.OutboundLines);
-        Assert.Contains("PRIVMSG bob :hello world", transport.OutboundLines);
-        Assert.Contains("PRIVMSG bob :\u0001ACTION waves\u0001", transport.OutboundLines);
-        Assert.Contains("NICK alice_", transport.OutboundLines);
-        Assert.Contains("NOTICE bob :diagnostic", transport.OutboundLines);
-        Assert.Contains("PART #commands :finished", transport.OutboundLines);
+        await WaitForAsync(() => transport.OutboundLines.Contains("JOIN #commands")
+            && transport.OutboundLines.Contains("PRIVMSG bob :hello world")
+            && transport.OutboundLines.Contains("PRIVMSG bob :\u0001ACTION waves\u0001")
+            && transport.OutboundLines.Contains("NICK alice_")
+            && transport.OutboundLines.Contains("NOTICE bob :diagnostic")
+            && transport.OutboundLines.Contains("PART #commands :finished"));
         Assert.Equal("bob", network.Queries.Single().Nickname);
         Assert.Contains(network.Queries.Single().EntriesSnapshot, entry => entry.Text == "hello world");
     }

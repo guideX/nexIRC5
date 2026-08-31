@@ -10,6 +10,22 @@ public enum DestinationKind
     Query
 }
 
+public static class NavigationDefaults
+{
+    // A stable value lets Phase 1F favorites load into the same sensible
+    // default group without rewriting every existing record on first load.
+    public static readonly Guid DefaultFavoriteGroupId = Guid.Parse("4c3c9f7e-9f43-4d2a-a0f1-2c5c8c4f1f50");
+}
+
+public sealed record FavoriteGroup
+{
+    public Guid Id { get; init; } = Guid.NewGuid();
+
+    public string Name { get; init; } = "General";
+
+    public int SortOrder { get; init; }
+}
+
 public sealed record FavoriteDestination
 {
     public Guid Id { get; init; } = Guid.NewGuid();
@@ -22,6 +38,10 @@ public sealed record FavoriteDestination
     public string Name { get; init; } = string.Empty;
 
     public string? Label { get; init; }
+
+    public Guid GroupId { get; init; } = NavigationDefaults.DefaultFavoriteGroupId;
+
+    public int SortOrder { get; init; }
 }
 
 public sealed record RecentDestination
@@ -37,6 +57,52 @@ public sealed record RecentDestination
 
 public static class NavigationValidator
 {
+    public static List<FavoriteGroup> NormalizeFavoriteGroups(IEnumerable<FavoriteGroup>? groups)
+    {
+        var result = new List<FavoriteGroup>();
+        var ids = new HashSet<Guid>();
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var group in (groups ?? []).Take(ConfigurationLimits.MaximumFavoriteGroups))
+        {
+            if (group is null)
+            {
+                continue;
+            }
+
+            var name = group.Name?.Trim() ?? string.Empty;
+            var id = group.Id == Guid.Empty ? Guid.NewGuid() : group.Id;
+            if (name.Length == 0 || name.Length > ConfigurationLimits.MaximumFavoriteGroupNameLength || name.Any(IsLineBreak) || !ids.Add(id) || !names.Add(name))
+            {
+                continue;
+            }
+
+            result.Add(group with
+            {
+                Id = id,
+                Name = name,
+                SortOrder = Math.Clamp(group.SortOrder, 0, ConfigurationLimits.MaximumFavoriteGroups - 1)
+            });
+        }
+
+        if (!result.Any(group => group.Id == NavigationDefaults.DefaultFavoriteGroupId))
+        {
+            result.Insert(0, new FavoriteGroup
+            {
+                Id = NavigationDefaults.DefaultFavoriteGroupId,
+                Name = "General",
+                SortOrder = 0
+            });
+        }
+
+        return result
+            .OrderBy(group => group.SortOrder)
+            .ThenBy(group => group.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(group => group.Id)
+            .Take(ConfigurationLimits.MaximumFavoriteGroups)
+            .Select((group, index) => group with { SortOrder = index })
+            .ToList();
+    }
+
     public static FavoriteDestination? NormalizeFavorite(FavoriteDestination? favorite)
     {
         if (favorite is null || favorite.ScopeId == Guid.Empty)
@@ -54,7 +120,9 @@ public static class NavigationValidator
         {
             Id = favorite.Id == Guid.Empty ? Guid.NewGuid() : favorite.Id,
             Name = name,
-            Label = NormalizeLabel(favorite.Label)
+            Label = NormalizeLabel(favorite.Label),
+            GroupId = favorite.GroupId == Guid.Empty ? NavigationDefaults.DefaultFavoriteGroupId : favorite.GroupId,
+            SortOrder = Math.Clamp(favorite.SortOrder, 0, ConfigurationLimits.MaximumFavoritesPerProfile - 1)
         };
     }
 
@@ -84,13 +152,23 @@ public static class NavigationValidator
     public static bool SameDestination(RecentDestination left, RecentDestination right) =>
         left.ScopeId == right.ScopeId && left.Kind == right.Kind && IrcIdentity.Equals(left.Name, right.Name, IrcCaseMapping.Rfc1459);
 
-    public static List<FavoriteDestination> NormalizeFavorites(IEnumerable<FavoriteDestination>? favorites)
+    public static List<FavoriteDestination> NormalizeFavorites(IEnumerable<FavoriteDestination>? favorites, IReadOnlySet<Guid>? groupIds = null)
     {
         var result = new List<FavoriteDestination>();
         foreach (var favorite in (favorites ?? []).Take(ConfigurationLimits.MaximumProfiles * ConfigurationLimits.MaximumFavoritesPerProfile))
         {
             var normalized = NormalizeFavorite(favorite);
-            if (normalized is null || result.Count(item => item.ScopeId == normalized.ScopeId) >= ConfigurationLimits.MaximumFavoritesPerProfile || result.Any(existing => SameDestination(existing, normalized)))
+            if (normalized is null)
+            {
+                continue;
+            }
+
+            if (groupIds is not null && !groupIds.Contains(normalized.GroupId))
+            {
+                normalized = normalized with { GroupId = NavigationDefaults.DefaultFavoriteGroupId };
+            }
+
+            if (result.Count(item => item.ScopeId == normalized.ScopeId) >= ConfigurationLimits.MaximumFavoritesPerProfile || result.Any(existing => SameDestination(existing, normalized)))
             {
                 continue;
             }
@@ -206,12 +284,43 @@ public sealed record AliasExpansionResult(bool Succeeded, string Input, string? 
     public static AliasExpansionResult NoExpansion(string input) => new(true, input);
 }
 
+public sealed record AliasContext(
+    string? NetworkName = null,
+    string? ProfileName = null,
+    string? Target = null,
+    string? Me = null,
+    string? Server = null,
+    string? Selected = null)
+{
+    public static AliasContext From(NetworkWorkspace network, WorkspaceView? view, string? selected = null)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        return new AliasContext(
+            network.Snapshot.Features.NetworkName ?? network.Snapshot.Identity.NetworkName ?? network.DisplayName,
+            network.DisplayName,
+            view switch
+            {
+                ChannelView channel => channel.Channel,
+                QueryView query => query.Nickname,
+                _ => null
+            },
+            network.Snapshot.Nickname,
+            network.Options.Endpoint.Host,
+            selected);
+    }
+}
+
 public static partial class AliasExpander
 {
-    [GeneratedRegex(@"\$(\*|[1-9][0-9]*)", RegexOptions.CultureInvariant)]
+    private const char LiteralDollar = '\uE000';
+
+    [GeneratedRegex(@"\$(\$|\*|[1-9][0-9]*|network|profile|target|me|server|selected)", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
     private static partial Regex ArgumentPattern();
 
     public static AliasExpansionResult Expand(string input, IReadOnlyList<AliasDefinition> aliases)
+        => Expand(input, aliases, null);
+
+    public static AliasExpansionResult Expand(string input, IReadOnlyList<AliasDefinition> aliases, AliasContext? context)
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(aliases);
@@ -227,41 +336,63 @@ public static partial class AliasExpander
             var parsed = Parse(current);
             if (parsed is null)
             {
-                return AliasExpansionResult.NoExpansion(current);
+                return AliasExpansionResult.NoExpansion(RestoreLiteralDollars(current));
             }
 
             var alias = aliases.FirstOrDefault(candidate => candidate.IsEnabled && string.Equals(candidate.Name, parsed.Value.Name, StringComparison.OrdinalIgnoreCase));
             if (alias is null)
             {
-                return new AliasExpansionResult(true, current, Depth: depth - 1);
+                return new AliasExpansionResult(true, RestoreLiteralDollars(current), Depth: depth - 1);
             }
 
             if (!visited.Add(alias.Name))
             {
-                return new AliasExpansionResult(false, current, $"Alias loop detected at /{alias.Name}.", depth);
+                return new AliasExpansionResult(false, RestoreLiteralDollars(current), $"Alias loop detected at /{alias.Name}.", depth);
             }
 
-            var expansion = Substitute(alias.Expansion, parsed.Value.Arguments);
+            var expansion = Substitute(alias.Expansion, parsed.Value.Arguments, context);
             if (expansion.Length > ConfigurationLimits.MaximumAliasExpansionLength)
             {
-                return new AliasExpansionResult(false, current, "Alias expansion exceeds the supported length.", depth);
+                return new AliasExpansionResult(false, RestoreLiteralDollars(current), "Alias expansion exceeds the supported length.", depth);
             }
 
             current = expansion[0] == '/' ? expansion : "/" + expansion;
         }
 
-        return new AliasExpansionResult(false, current, $"Alias expansion exceeded the maximum depth of {ConfigurationLimits.MaximumAliasRecursionDepth}.", ConfigurationLimits.MaximumAliasRecursionDepth);
+        return new AliasExpansionResult(false, RestoreLiteralDollars(current), $"Alias expansion exceeded the maximum depth of {ConfigurationLimits.MaximumAliasRecursionDepth}.", ConfigurationLimits.MaximumAliasRecursionDepth);
     }
 
-    private static string Substitute(string expansion, IReadOnlyList<string> arguments) => ArgumentPattern().Replace(expansion, match =>
+    private static string Substitute(string expansion, IReadOnlyList<string> arguments, AliasContext? context) => ArgumentPattern().Replace(expansion, match =>
     {
-        if (match.Groups[1].Value == "*")
+        var variable = match.Groups[1].Value;
+        if (variable == "$")
+        {
+            return LiteralDollar.ToString();
+        }
+
+        if (variable == "*")
         {
             return string.Join(' ', arguments);
         }
 
-        return int.TryParse(match.Groups[1].Value, out var index) && index <= arguments.Count ? arguments[index - 1] : string.Empty;
+        if (int.TryParse(variable, out var index))
+        {
+            return index <= arguments.Count ? arguments[index - 1] : string.Empty;
+        }
+
+        return variable.ToLowerInvariant() switch
+        {
+            "network" => context?.NetworkName ?? string.Empty,
+            "profile" => context?.ProfileName ?? string.Empty,
+            "target" => context?.Target ?? string.Empty,
+            "me" => context?.Me ?? string.Empty,
+            "server" => context?.Server ?? string.Empty,
+            "selected" => context?.Selected ?? string.Empty,
+            _ => string.Empty
+        };
     });
+
+    private static string RestoreLiteralDollars(string input) => input.Replace(LiteralDollar, '$');
 
     private static (string Name, IReadOnlyList<string> Arguments)? Parse(string input)
     {
@@ -332,6 +463,8 @@ public sealed class NavigationService
     public IReadOnlyList<FavoriteDestination> Favorites(Guid scopeId, DestinationKind? kind = null) =>
         _configuration.Favorites.Where(item => item.ScopeId == scopeId && (kind is null || item.Kind == kind)).ToArray();
 
+    public IReadOnlyList<FavoriteGroup> FavoriteGroups() => _configuration.FavoriteGroups;
+
     public IReadOnlyList<RecentDestination> Recents(Guid scopeId, DestinationKind? kind = null) =>
         _configuration.RecentDestinations.Where(item => item.ScopeId == scopeId && (kind is null || item.Kind == kind)).OrderByDescending(item => item.LastOpened).ToArray();
 
@@ -340,8 +473,14 @@ public sealed class NavigationService
 
     public bool RemoveFavorite(Guid favoriteId) => _configuration.RemoveFavorite(favoriteId);
 
+    public bool MoveFavorite(Guid favoriteId, Guid groupId) => _configuration.MoveFavorite(favoriteId, groupId);
+
+    public bool ReorderFavorite(Guid favoriteId, int delta) => _configuration.ReorderFavorite(favoriteId, delta);
+
     public void RecordRecent(Guid scopeId, DestinationKind kind, string name) =>
         _configuration.RecordRecent(new RecentDestination { ScopeId = scopeId, Kind = kind, Name = name, LastOpened = DateTimeOffset.UtcNow });
 
     public void ClearRecents(Guid? scopeId = null) => _configuration.ClearRecent(scopeId);
+
+    public bool RemoveRecent(RecentDestination destination) => _configuration.RemoveRecent(destination);
 }

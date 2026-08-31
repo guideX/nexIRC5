@@ -10,10 +10,12 @@ public sealed record DestinationListItem(
     string Name,
     string NetworkName,
     string? Label,
-    DateTimeOffset? LastOpened = null)
+    DateTimeOffset? LastOpened = null,
+    Guid GroupId = default,
+    string? GroupName = null)
 {
     public string DisplayText => LastOpened is null
-        ? $"{NetworkName} · {Name}{(string.IsNullOrWhiteSpace(Label) ? string.Empty : $" — {Label}")}"
+        ? $"{GroupName ?? "General"} · {NetworkName} · {Name}{(string.IsNullOrWhiteSpace(Label) ? string.Empty : $" — {Label}")}"
         : $"{NetworkName} · {Name} ({LastOpened.Value.ToLocalTime():g})";
 }
 
@@ -30,8 +32,12 @@ public partial class FavoritesWindow : Window
 
     private void Refresh()
     {
+        var groups = _viewModel.Sessions.FavoriteGroups().ToArray();
+        GroupBox.ItemsSource = groups;
+        if (GroupBox.SelectedItem is null) GroupBox.SelectedItem = groups.FirstOrDefault();
         var favorites = _viewModel.Networks.SelectMany(network => _viewModel.Sessions.Favorites(network.Id)
-                .Select(item => new DestinationListItem(item.Id, network.Id, item.Kind, item.Name, network.DisplayName, item.Label)))
+                .Select(item => new DestinationListItem(item.Id, network.Id, item.Kind, item.Name, network.DisplayName, item.Label, null,
+                    item.GroupId, groups.FirstOrDefault(group => group.Id == item.GroupId)?.Name)))
             .ToArray();
         var recents = _viewModel.Networks.SelectMany(network => _viewModel.Sessions.RecentDestinations(network.Id)
                 .Select(item => new DestinationListItem(Guid.Empty, network.Id, item.Kind, item.Name, network.DisplayName, null, item.LastOpened)))
@@ -64,11 +70,65 @@ public partial class FavoritesWindow : Window
         }
     }
 
-    private void OnClearRecentsClick(object sender, RoutedEventArgs e)
+    private void OnRemoveRecentClick(object sender, RoutedEventArgs e)
+    {
+        if (RecentsList.SelectedItem is DestinationListItem item)
+        {
+            _viewModel.Sessions.RemoveRecent(item.NetworkId, new RecentDestination { Kind = item.Kind, Name = item.Name });
+            Refresh();
+        }
+    }
+
+    private void OnMoveClick(object sender, RoutedEventArgs e)
+    {
+        if (FavoritesList.SelectedItem is DestinationListItem item
+            && item.FavoriteId != Guid.Empty
+            && GroupBox.SelectedItem is FavoriteGroup group)
+        {
+            _viewModel.MoveFavorite(item.FavoriteId, group.Id);
+            Refresh();
+        }
+    }
+
+    private void OnMoveUpClick(object sender, RoutedEventArgs e)
+    {
+        if (FavoritesList.SelectedItem is DestinationListItem item && item.FavoriteId != Guid.Empty)
+        {
+            _viewModel.ReorderFavorite(item.FavoriteId, -1);
+            Refresh();
+        }
+    }
+
+    private void OnMoveDownClick(object sender, RoutedEventArgs e)
+    {
+        if (FavoritesList.SelectedItem is DestinationListItem item && item.FavoriteId != Guid.Empty)
+        {
+            _viewModel.ReorderFavorite(item.FavoriteId, 1);
+            Refresh();
+        }
+    }
+
+    private async void OnAddGroupClick(object sender, RoutedEventArgs e)
+    {
+        if (_viewModel.Configuration is null || !_viewModel.Configuration.AddFavoriteGroup(NewGroupBox.Text))
+        {
+            return;
+        }
+
+        NewGroupBox.Clear();
+        if (_viewModel.Configuration is not null) await _viewModel.Configuration.SaveAsync();
+        Refresh();
+    }
+
+    private void OnClearChannelsClick(object sender, RoutedEventArgs e) => ClearRecent(DestinationKind.Channel);
+
+    private void OnClearQueriesClick(object sender, RoutedEventArgs e) => ClearRecent(DestinationKind.Query);
+
+    private void ClearRecent(DestinationKind kind)
     {
         if (_viewModel.Sessions.ActiveNetwork is { } network)
         {
-            _viewModel.Sessions.ClearRecent(network.Id);
+            _viewModel.Sessions.ClearRecent(network.Id, kind);
             Refresh();
         }
     }

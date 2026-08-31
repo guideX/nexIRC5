@@ -20,6 +20,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private readonly System.Windows.Threading.Dispatcher _uiDispatcher;
     private readonly Dictionary<Guid, MemorySaslCredentialProvider> _sessionCredentials = [];
     private readonly Dictionary<Guid, MemoryServerPasswordProvider> _sessionServerPasswords = [];
+    private readonly Dictionary<(Guid NetworkId, Guid ViewId), string> _drafts = [];
 
     public MainWindowViewModel(
         IIrcTransportFactory transportFactory,
@@ -105,7 +106,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public string InputText
     {
         get => _inputText;
-        set => SetProperty(ref _inputText, value);
+        set => SetProperty(ref _inputText, (value ?? string.Empty)[..Math.Min(value?.Length ?? 0, ConfigurationLimits.MaximumDraftLength)]);
     }
 
     public string StatusText
@@ -373,6 +374,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     }
 
     public async Task AddCurrentFavoriteAsync(string? label = null)
+        => await AddCurrentFavoriteAsync(label, NavigationDefaults.DefaultFavoriteGroupId).ConfigureAwait(true);
+
+    public async Task AddCurrentFavoriteAsync(string? label, Guid groupId)
     {
         if (Sessions.ActiveNetwork is null || ActiveView is not (ChannelView or QueryView))
         {
@@ -382,7 +386,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
         var kind = ActiveView is ChannelView ? DestinationKind.Channel : DestinationKind.Query;
         var name = ActiveView is ChannelView channel ? channel.Channel : ((QueryView)ActiveView).Nickname;
-        StatusText = Sessions.AddFavorite(Sessions.ActiveNetwork.Id, kind, name, label)
+        StatusText = Sessions.AddFavorite(Sessions.ActiveNetwork.Id, kind, name, label, groupId)
             ? $"Added {name} to favorites."
             : "That destination is already a favorite or the favorite limit was reached.";
         if (Configuration is not null)
@@ -392,6 +396,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     }
 
     public void RemoveFavorite(Guid favoriteId) => Sessions.RemoveFavorite(favoriteId);
+
+    public bool MoveFavorite(Guid favoriteId, Guid groupId) => Sessions.MoveFavorite(favoriteId, groupId);
+
+    public bool ReorderFavorite(Guid favoriteId, int delta) => Sessions.ReorderFavorite(favoriteId, delta);
 
     public async Task OpenDestinationAsync(Guid networkId, DestinationKind kind, string name)
     {
@@ -403,7 +411,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         WorkspaceView view = kind == DestinationKind.Channel
             ? Sessions.EnsureChannel(networkId, name)
             : Sessions.EnsureQuery(networkId, name);
-        Sessions.ActivateView(view.Id);
+        SelectView(view);
         Sessions.RecordRecent(network, kind, name);
         if (kind == DestinationKind.Channel && view is ChannelView channel && !channel.IsJoined)
         {
@@ -429,31 +437,61 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         return await Sessions.LogStore.ReadPageAsync(scopeId, kind, conversationName, pageSize, before).ConfigureAwait(true);
     }
 
+    public async Task<HistoryPage> LoadHistoryWindowAsync(HistoryPageRequest request)
+    {
+        if (Sessions.LogStore is null) return HistoryPage.Empty;
+        return await Sessions.LogStore.ReadPageWindowAsync(request).ConfigureAwait(true);
+    }
+
+    public async Task<ConversationHistoryRange> ExportHistoryAsync(HistoryExportRequest request, string path, HistoryExportFormat format)
+    {
+        if (Sessions.LogStore is null)
+        {
+            return new ConversationHistoryRange(Array.Empty<ConversationLogRecord>(), false);
+        }
+
+        var result = await ConversationLoggingService.ExportAsync(Sessions.LogStore, request, path, format).ConfigureAwait(true);
+        StatusText = result.IsTruncated ? "History exported with the configured size bound." : "History exported.";
+        return result;
+    }
+
     public bool RouteLogSearchResult(ConversationLogSearchResult result)
+        => RouteLogSearchResultAsync(result).GetAwaiter().GetResult();
+
+    public async Task<bool> RouteLogSearchResultAsync(ConversationLogSearchResult result)
     {
         var network = Sessions.Networks.FirstOrDefault(item => item.Id == result.Record.NetworkId)
             ?? (result.Record.ProfileId is Guid profileId ? Sessions.Networks.FirstOrDefault(item => item.ProfileId == profileId) : null);
         if (network is not null)
         {
-            return Sessions.ActivateNotification(new IrcNotification(
-                network.Id,
-                Guid.Empty,
-                result.Record.ConversationKind == LogConversationKind.Channel ? WorkspaceViewKind.Channel
-                    : result.Record.ConversationKind == LogConversationKind.PrivateConversation ? WorkspaceViewKind.Query : WorkspaceViewKind.ServerStatus,
-                IrcNotificationType.Status,
-                WorkspaceActivity.None,
-                result.Record.Sender,
-                result.Preview,
-                result.Record.Timestamp,
-                false,
-                nameof(ConversationLogSearchResult),
-                Activation: new NotificationActivationTarget(
-                    network.Id,
-                    network.ProfileId,
-                    Guid.Empty,
-                    result.Record.ConversationKind == LogConversationKind.Channel ? WorkspaceViewKind.Channel
-                        : result.Record.ConversationKind == LogConversationKind.PrivateConversation ? WorkspaceViewKind.Query : WorkspaceViewKind.ServerStatus,
-                    result.Record.ConversationName)));
+            WorkspaceView view = result.Record.ConversationKind switch
+            {
+                LogConversationKind.Channel => Sessions.EnsureChannel(network.Id, result.Record.ConversationName),
+                LogConversationKind.PrivateConversation => Sessions.EnsureQuery(network.Id, result.Record.ConversationName),
+                _ => network.StatusView
+            };
+            SelectView(view);
+            if (Sessions.LogStore is { } store)
+            {
+                var page = await store.ReadPageWindowAsync(new HistoryPageRequest
+                {
+                    ScopeId = result.Record.ScopeId,
+                    ConversationKind = result.Record.ConversationKind,
+                    ConversationName = result.Record.ConversationName,
+                    PageSize = ConfigurationLimits.MaximumHistoryContextEntries,
+                    Around = result.Record.Timestamp
+                }).ConfigureAwait(true);
+                view.SetHistoryContext(
+                    page.Records.Select(record => new HistoryContextEntry(record, IsSameHistoryRecord(record, result.Record))),
+                    result.Preview);
+            }
+            else
+            {
+                view.SetHistoryContext([new HistoryContextEntry(result.Record, true)], result.Preview);
+            }
+
+            StatusText = $"Opened {result.Record.ConversationName} with surrounding history.";
+            return true;
         }
 
         return false;
@@ -536,8 +574,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
+        SaveDraft();
         Sessions.ActivateView(view.Id);
         ActiveView = view;
+        InputText = _drafts.TryGetValue((view.NetworkId, view.Id), out var draft) ? draft : string.Empty;
         StatusText = $"{view.Title} · {view.Kind}";
         if (Configuration is not null && Sessions.ActiveNetwork?.ProfileId is Guid profileId)
         {
@@ -561,8 +601,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         StatusText = result.Message;
         if (result.View is not null)
         {
-            ActiveView = result.View;
-            RefreshCommandStates();
+            SelectView(result.View);
         }
     }
 
@@ -573,6 +612,33 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     }
 
     public void PrepareInput(string text) => InputText = text;
+
+    public void ClearActiveView()
+    {
+        ActiveView?.ClearEntries();
+        StatusText = "Conversation display cleared; stored history was kept.";
+    }
+
+    public bool CloseActiveView()
+    {
+        if (ActiveView is null || ActiveView.Kind == WorkspaceViewKind.ServerStatus)
+        {
+            return false;
+        }
+
+        var closing = ActiveView;
+        SaveDraft();
+        var closed = Sessions.CloseView(closing.Id);
+        if (closed)
+        {
+            ActiveView = Sessions.ActiveView;
+            InputText = ActiveView is not null && _drafts.TryGetValue((ActiveView.NetworkId, ActiveView.Id), out var draft) ? draft : string.Empty;
+            StatusText = $"Closed {closing.Title}; the conversation remains available to reopen.";
+            RefreshCommandStates();
+        }
+
+        return closed;
+    }
 
     public void NavigateInputHistory(InputHistoryDirection direction)
     {
@@ -633,6 +699,23 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Configuration.SetPreferences(CurrentPreferences);
         _ = SavePreferencesAsync();
     }
+
+    private void SaveDraft()
+    {
+        if (ActiveView is null || string.IsNullOrEmpty(InputText))
+        {
+            if (ActiveView is not null) _drafts.Remove((ActiveView.NetworkId, ActiveView.Id));
+            return;
+        }
+
+        _drafts[(ActiveView.NetworkId, ActiveView.Id)] = InputText[..Math.Min(InputText.Length, ConfigurationLimits.MaximumDraftLength)];
+    }
+
+    private static bool IsSameHistoryRecord(ConversationLogRecord left, ConversationLogRecord right) =>
+        left.Timestamp == right.Timestamp
+        && string.Equals(left.Sender, right.Sender, StringComparison.Ordinal)
+        && string.Equals(left.Text, right.Text, StringComparison.Ordinal)
+        && left.Direction == right.Direction;
 
     private async Task SavePreferencesAsync()
     {

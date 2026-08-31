@@ -27,11 +27,16 @@ public static class ConfigurationLimits
     public const int MaximumAliasExpansionLength = 1024;
     public const int MaximumAliasRecursionDepth = 8;
     public const int MaximumFavoritesPerProfile = 128;
+    public const int MaximumFavoriteGroups = 32;
+    public const int MaximumFavoriteGroupNameLength = 64;
     public const int MaximumRecentChannelsPerProfile = 50;
     public const int MaximumRecentQueriesPerProfile = 50;
     public const int MaximumSearchResults = 500;
     public const int MaximumSearchQueryLength = 256;
     public const int MaximumHistoryPageSize = 100;
+    public const int MaximumHistoryContextEntries = 100;
+    public const int MaximumHistoryExportRecords = 10_000;
+    public const int MaximumDraftLength = 4096;
     public const int MaximumLogRecordBytes = 32_768;
     public const int MaximumNotificationCoalescingEntries = 256;
 }
@@ -180,6 +185,16 @@ public sealed record NexIrcConfiguration
 
     public List<FavoriteDestination> Favorites { get; init; } = [];
 
+    public List<FavoriteGroup> FavoriteGroups { get; init; } =
+    [
+        new FavoriteGroup
+        {
+            Id = NavigationDefaults.DefaultFavoriteGroupId,
+            Name = "General",
+            SortOrder = 0
+        }
+    ];
+
     public List<RecentDestination> RecentDestinations { get; init; } = [];
 
     public List<AliasDefinition> Aliases { get; init; } = [];
@@ -280,6 +295,8 @@ public sealed class ConfigurationService
 
     public IReadOnlyList<FavoriteDestination> Favorites => Current.Favorites;
 
+    public IReadOnlyList<FavoriteGroup> FavoriteGroups => Current.FavoriteGroups;
+
     public IReadOnlyList<RecentDestination> RecentDestinations => Current.RecentDestinations;
 
     public IReadOnlyList<AliasDefinition> Aliases => Current.Aliases;
@@ -294,6 +311,11 @@ public sealed class ConfigurationService
 
         lock (_gate)
         {
+            if (!_configuration.FavoriteGroups.Any(group => group.Id == normalized.GroupId))
+            {
+                normalized = normalized with { GroupId = NavigationDefaults.DefaultFavoriteGroupId };
+            }
+
             var favorites = _configuration.Favorites.ToList();
             var existing = favorites.FindIndex(item => item.Id == normalized.Id);
             if (existing >= 0)
@@ -312,7 +334,12 @@ public sealed class ConfigurationService
                     return true;
                 }
 
-                favorites.Add(normalized);
+                var nextOrder = favorites
+                    .Where(item => item.ScopeId == normalized.ScopeId && item.GroupId == normalized.GroupId)
+                    .Select(item => item.SortOrder)
+                    .DefaultIfEmpty(-1)
+                    .Max() + 1;
+                favorites.Add(normalized with { SortOrder = nextOrder });
             }
 
             _configuration = _configuration with { Favorites = favorites };
@@ -331,6 +358,127 @@ public sealed class ConfigurationService
             }
 
             _configuration = _configuration with { Favorites = favorites };
+            return true;
+        }
+    }
+
+    public bool MoveFavorite(Guid favoriteId, Guid groupId)
+    {
+        lock (_gate)
+        {
+            if (!_configuration.FavoriteGroups.Any(group => group.Id == groupId))
+            {
+                return false;
+            }
+
+            var favorites = _configuration.Favorites.ToList();
+            var index = favorites.FindIndex(item => item.Id == favoriteId);
+            if (index < 0)
+            {
+                return false;
+            }
+
+            var favorite = favorites[index];
+            var nextOrder = favorites
+                .Where(item => item.ScopeId == favorite.ScopeId && item.GroupId == groupId)
+                .Select(item => item.SortOrder)
+                .DefaultIfEmpty(-1)
+                .Max() + 1;
+            favorites[index] = favorite with { GroupId = groupId, SortOrder = nextOrder };
+            _configuration = _configuration with { Favorites = favorites };
+            return true;
+        }
+    }
+
+    public bool ReorderFavorite(Guid favoriteId, int delta)
+    {
+        if (delta == 0)
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            var favorites = _configuration.Favorites.ToList();
+            var index = favorites.FindIndex(item => item.Id == favoriteId);
+            if (index < 0)
+            {
+                return false;
+            }
+
+            var current = favorites[index];
+            var sameGroup = favorites
+                .Where(item => item.ScopeId == current.ScopeId && item.GroupId == current.GroupId)
+                .OrderBy(item => item.SortOrder)
+                .ThenBy(item => item.Id)
+                .ToList();
+            var currentIndex = sameGroup.FindIndex(item => item.Id == favoriteId);
+            var targetIndex = Math.Clamp(currentIndex + Math.Sign(delta), 0, sameGroup.Count - 1);
+            if (currentIndex == targetIndex)
+            {
+                return false;
+            }
+
+            (sameGroup[currentIndex], sameGroup[targetIndex]) = (sameGroup[targetIndex], sameGroup[currentIndex]);
+            for (var order = 0; order < sameGroup.Count; order++)
+            {
+                var itemIndex = favorites.FindIndex(item => item.Id == sameGroup[order].Id);
+                favorites[itemIndex] = sameGroup[order] with { SortOrder = order };
+            }
+
+            _configuration = _configuration with { Favorites = favorites };
+            return true;
+        }
+    }
+
+    public bool AddFavoriteGroup(string name)
+    {
+        var normalized = NavigationValidator.NormalizeFavoriteGroups([new FavoriteGroup { Name = name, SortOrder = int.MaxValue }]).LastOrDefault();
+        if (normalized is null || string.Equals(normalized.Name, "General", StringComparison.OrdinalIgnoreCase) && string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            if (_configuration.FavoriteGroups.Count >= ConfigurationLimits.MaximumFavoriteGroups
+                || _configuration.FavoriteGroups.Any(group => string.Equals(group.Name, normalized.Name, StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+
+            var groups = _configuration.FavoriteGroups.ToList();
+            groups.Add(normalized with { Id = Guid.NewGuid(), SortOrder = groups.Count });
+            _configuration = _configuration with { FavoriteGroups = NavigationValidator.NormalizeFavoriteGroups(groups) };
+            return true;
+        }
+    }
+
+    public bool RemoveFavoriteGroup(Guid groupId)
+    {
+        if (groupId == NavigationDefaults.DefaultFavoriteGroupId)
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            if (!_configuration.FavoriteGroups.Any(group => group.Id == groupId))
+            {
+                return false;
+            }
+
+            var groups = _configuration.FavoriteGroups.Where(group => group.Id != groupId).ToList();
+            var favorites = _configuration.Favorites
+                .Select(favorite => favorite.GroupId == groupId
+                    ? favorite with { GroupId = NavigationDefaults.DefaultFavoriteGroupId }
+                    : favorite)
+                .ToList();
+            _configuration = _configuration with
+            {
+                FavoriteGroups = NavigationValidator.NormalizeFavoriteGroups(groups),
+                Favorites = favorites
+            };
             return true;
         }
     }
@@ -356,15 +504,34 @@ public sealed class ConfigurationService
     }
 
     public void ClearRecent(Guid? scopeId = null)
+        => ClearRecent(scopeId, null);
+
+    public void ClearRecent(Guid? scopeId, DestinationKind? kind)
     {
         lock (_gate)
         {
             _configuration = _configuration with
             {
-                RecentDestinations = scopeId is Guid id
-                    ? _configuration.RecentDestinations.Where(item => item.ScopeId != id).ToList()
-                    : []
+                RecentDestinations = _configuration.RecentDestinations.Where(item =>
+                    !(scopeId is null || item.ScopeId == scopeId)
+                    || kind is not null && item.Kind != kind).ToList()
             };
+        }
+    }
+
+    public bool RemoveRecent(RecentDestination destination)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        lock (_gate)
+        {
+            var recents = _configuration.RecentDestinations.Where(item => !NavigationValidator.SameDestination(item, destination)).ToList();
+            if (recents.Count == _configuration.RecentDestinations.Count)
+            {
+                return false;
+            }
+
+            _configuration = _configuration with { RecentDestinations = recents };
+            return true;
         }
     }
 
@@ -707,7 +874,8 @@ public static class ConfigurationValidator
             ? selectedId
             : null;
         var viewState = ViewStateValidator.Normalize(preferences.ViewState);
-        var favorites = NavigationValidator.NormalizeFavorites(configuration.Favorites);
+        var favoriteGroups = NavigationValidator.NormalizeFavoriteGroups(configuration.FavoriteGroups);
+        var favorites = NavigationValidator.NormalizeFavorites(configuration.Favorites, favoriteGroups.Select(group => group.Id).ToHashSet());
         var recents = NavigationValidator.BoundRecents((configuration.RecentDestinations ?? [])
             .Select(NavigationValidator.NormalizeRecent)
             .Where(static value => value is not null)
@@ -734,6 +902,7 @@ public static class ConfigurationValidator
             },
             Profiles = profiles,
             Favorites = favorites,
+            FavoriteGroups = favoriteGroups,
             RecentDestinations = recents,
             Aliases = aliases
         };

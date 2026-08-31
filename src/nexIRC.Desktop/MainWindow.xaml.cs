@@ -5,6 +5,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using nexIRC.Application;
 using nexIRC.Core.Networking;
+using nexIRC.Core.State;
 using ContextMenu = System.Windows.Controls.ContextMenu;
 using ListBox = System.Windows.Controls.ListBox;
 using MenuItem = System.Windows.Controls.MenuItem;
@@ -138,6 +139,18 @@ public partial class MainWindow : Window
         InputBox.Focus();
     }
 
+    private async void OnRejoinClick(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.Sessions.ActiveNetwork is { } network && ViewModel.ActiveView is ChannelView channel)
+        {
+            await ViewModel.ExecuteInputAsync($"/rejoin {channel.Channel}");
+        }
+    }
+
+    private void OnClearClick(object sender, RoutedEventArgs e) => ViewModel.ClearActiveView();
+
+    private void OnCloseViewClick(object sender, RoutedEventArgs e) => ViewModel.CloseActiveView();
+
     private void OnProfilesClick(object sender, RoutedEventArgs e)
     {
         var dialog = new NetworkProfilesWindow(ViewModel) { Owner = this };
@@ -197,6 +210,11 @@ public partial class MainWindow : Window
 
         if (treeItem?.DataContext is WorkspaceView view)
         {
+            if (!ViewModel.Sessions.TryGet(view.NetworkId, out var viewNetwork) || viewNetwork is null)
+            {
+                return;
+            }
+
             treeItem.IsSelected = true;
             ViewModel.SelectView(view);
             var actions = new List<(string, Func<Task>)>
@@ -206,13 +224,25 @@ public partial class MainWindow : Window
             if (view is ChannelView channel)
             {
                 actions.Add((channel.IsJoined ? "Part" : "Join", () => ViewModel.ExecuteInputAsync(channel.IsJoined ? $"/part {channel.Channel}" : $"/join {channel.Channel}")));
-                actions.Add(("Rejoin", () => ViewModel.ExecuteInputAsync($"/join {channel.Channel}")));
+                actions.Add(("Rejoin", () => ViewModel.ExecuteInputAsync($"/rejoin {channel.Channel}")));
+                actions.Add((IsFavorite(viewNetwork, DestinationKind.Channel, channel.Channel) ? "Remove favorite" : "Add to favorites", () => ToggleFavorite(viewNetwork, channel, DestinationKind.Channel, channel.Channel)));
                 actions.Add(("Copy channel name", () => CopyText(channel.Channel)));
                 actions.Add(("Request channel modes", () => ViewModel.ExecuteInputAsync($"/mode {channel.Channel}")));
                 actions.Add(("Request topic", () => ViewModel.ExecuteInputAsync($"/topic {channel.Channel}")));
                 actions.Add(("Open LIST", () => ViewModel.ExecuteInputAsync("/list")));
-                actions.Add(("Clear local view", () => { channel.ClearEntries(); return Task.CompletedTask; }));
-                actions.Add(("Close local view", () => { ViewModel.Sessions.CloseView(channel.Id); return Task.CompletedTask; }));
+                actions.Add(("Open history", () => OpenHistory(channel)));
+                actions.Add(("Search this conversation", () => OpenHistory(channel)));
+                actions.Add(("Clear conversation display", () => { channel.ClearEntries(); return Task.CompletedTask; }));
+                actions.Add(("Close view (stay joined)", () => { ViewModel.CloseActiveView(); return Task.CompletedTask; }));
+            }
+            else if (view is QueryView query)
+            {
+                actions.Add((IsFavorite(viewNetwork, DestinationKind.Query, query.Nickname) ? "Remove favorite" : "Add to favorites", () => ToggleFavorite(viewNetwork, query, DestinationKind.Query, query.Nickname)));
+                actions.Add(("Copy nickname", () => CopyText(query.Nickname)));
+                actions.Add(("Open history", () => OpenHistory(query)));
+                actions.Add(("Search this conversation", () => OpenHistory(query)));
+                actions.Add(("Clear conversation display", () => { query.ClearEntries(); return Task.CompletedTask; }));
+                actions.Add(("Close query", () => { ViewModel.CloseActiveView(); return Task.CompletedTask; }));
             }
 
             OpenContextMenu(treeItem, actions);
@@ -277,6 +307,29 @@ public partial class MainWindow : Window
     private static Task CopyText(string text)
     {
         System.Windows.Clipboard.SetText(text);
+        return Task.CompletedTask;
+    }
+
+    private bool IsFavorite(NetworkWorkspace network, DestinationKind kind, string name) =>
+        ViewModel.Sessions.Favorites(network.Id, kind).Any(item => IrcCaseMappingComparer.Equals(item.Name, name, network.Snapshot.Features.CaseMapping));
+
+    private async Task ToggleFavorite(NetworkWorkspace network, WorkspaceView view, DestinationKind kind, string name)
+    {
+        var favorite = ViewModel.Sessions.Favorites(network.Id, kind).FirstOrDefault(item => IrcCaseMappingComparer.Equals(item.Name, name, network.Snapshot.Features.CaseMapping));
+        if (favorite is not null)
+        {
+            ViewModel.RemoveFavorite(favorite.Id);
+            ViewModel.StatusText = $"Removed {name} from favorites.";
+        }
+        else
+        {
+            await ViewModel.AddCurrentFavoriteAsync(null).ConfigureAwait(true);
+        }
+    }
+
+    private Task OpenHistory(WorkspaceView view)
+    {
+        new LogViewerWindow(ViewModel, view) { Owner = this }.ShowDialog();
         return Task.CompletedTask;
     }
 

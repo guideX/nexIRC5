@@ -23,6 +23,15 @@ public enum WorkspaceActivity
     Important
 }
 
+public enum ConversationLifecycleState
+{
+    HistoricalOnly,
+    Joined,
+    Parted,
+    Active,
+    Disconnected
+}
+
 public enum TranscriptEntryKind
 {
     Message,
@@ -120,6 +129,15 @@ public sealed record TranscriptEntry(
     };
 }
 
+public sealed record HistoryContextEntry(ConversationLogRecord Record, bool IsMatch = false)
+{
+    public string DisplayTime => Record.Timestamp.ToLocalTime().ToString("HH:mm:ss", System.Globalization.CultureInfo.CurrentCulture);
+
+    public string DisplayLine => string.IsNullOrWhiteSpace(Record.Sender)
+        ? Record.Text
+        : $"<{Record.Sender}> {Record.Text}";
+}
+
 public sealed record NetworkConnectionOptions
 {
     public Guid? ProfileId { get; init; }
@@ -206,6 +224,9 @@ public abstract class WorkspaceView : ObservableObject
     private readonly object _entriesGate = new();
     private WorkspaceActivity _activity;
     private bool _isActive;
+    private bool _isViewOpen = true;
+    private ConversationLifecycleState _lifecycleState = ConversationLifecycleState.HistoricalOnly;
+    private string? _historyContextMatch;
 
     protected WorkspaceView(Guid networkId, Guid id, WorkspaceViewKind kind, string title)
     {
@@ -248,7 +269,49 @@ public abstract class WorkspaceView : ObservableObject
         internal set => SetProperty(ref _isActive, value);
     }
 
+    public bool IsViewOpen
+    {
+        get => _isViewOpen;
+        private set => SetProperty(ref _isViewOpen, value);
+    }
+
+    public ConversationLifecycleState LifecycleState
+    {
+        get => _lifecycleState;
+        private set
+        {
+            if (SetProperty(ref _lifecycleState, value))
+            {
+                OnPropertyChanged(nameof(LifecycleText));
+                OnPropertyChanged(nameof(StateMarker));
+            }
+        }
+    }
+
+    public string LifecycleText => LifecycleState switch
+    {
+        ConversationLifecycleState.Joined => "joined",
+        ConversationLifecycleState.Parted => "parted",
+        ConversationLifecycleState.Active => "active",
+        ConversationLifecycleState.Disconnected => "disconnected",
+        _ => "historical"
+    };
+
+    public string StateMarker => LifecycleState switch
+    {
+        ConversationLifecycleState.Joined or ConversationLifecycleState.Active => "●",
+        ConversationLifecycleState.Disconnected => "◌",
+        ConversationLifecycleState.Parted => "○",
+        _ => "◇"
+    };
+
     public ObservableCollection<TranscriptEntry> Entries { get; } = [];
+
+    public ObservableCollection<HistoryContextEntry> HistoryContext { get; } = [];
+
+    public bool HasHistoryContext => HistoryContext.Count > 0;
+
+    public string? HistoryContextMatch => _historyContextMatch;
 
     public IReadOnlyList<TranscriptEntry> EntriesSnapshot
     {
@@ -293,7 +356,24 @@ public abstract class WorkspaceView : ObservableObject
         lock (_entriesGate)
         {
             Entries.Clear();
+            HistoryContext.Clear();
         }
+
+        _historyContextMatch = null;
+        OnPropertyChanged(nameof(HasHistoryContext));
+        OnPropertyChanged(nameof(HistoryContextMatch));
+    }
+
+    public void ClearHistoryContext()
+    {
+        lock (_entriesGate)
+        {
+            HistoryContext.Clear();
+        }
+
+        _historyContextMatch = null;
+        OnPropertyChanged(nameof(HasHistoryContext));
+        OnPropertyChanged(nameof(HistoryContextMatch));
     }
 
     public void Activate()
@@ -303,6 +383,32 @@ public abstract class WorkspaceView : ObservableObject
     }
 
     internal void Deactivate() => IsActive = false;
+
+    internal void CloseView()
+    {
+        IsViewOpen = false;
+        Deactivate();
+    }
+
+    internal void ReopenView() => IsViewOpen = true;
+
+    internal void SetLifecycleState(ConversationLifecycleState state) => LifecycleState = state;
+
+    public void SetHistoryContext(IEnumerable<HistoryContextEntry> entries, string? match)
+    {
+        lock (_entriesGate)
+        {
+            HistoryContext.Clear();
+            foreach (var entry in entries.Take(ConfigurationLimits.MaximumHistoryContextEntries))
+            {
+                HistoryContext.Add(entry);
+            }
+        }
+
+        _historyContextMatch = match;
+        OnPropertyChanged(nameof(HasHistoryContext));
+        OnPropertyChanged(nameof(HistoryContextMatch));
+    }
 
     public override string ToString() => DisplayLabel;
 }
@@ -517,12 +623,21 @@ public sealed class ChannelView : WorkspaceView
         }
     }
 
-    internal void ApplySnapshot(IrcChannelSnapshot? snapshot, IrcPrefixGrammar? grammar, string? localNickname = null, IrcCaseMapping mapping = IrcCaseMapping.Rfc1459)
+    internal void ApplySnapshot(
+        IrcChannelSnapshot? snapshot,
+        IrcPrefixGrammar? grammar,
+        string? localNickname = null,
+        IrcCaseMapping mapping = IrcCaseMapping.Rfc1459,
+        bool networkAvailable = true,
+        bool isDesired = true)
     {
         if (snapshot is null)
         {
             IsJoined = false;
             IsStale = true;
+            SetLifecycleState(networkAvailable && !isDesired && LifecycleState is not ConversationLifecycleState.HistoricalOnly
+                ? ConversationLifecycleState.Parted
+                : networkAvailable && !isDesired ? ConversationLifecycleState.HistoricalOnly : ConversationLifecycleState.Disconnected);
             Synchronization = ChannelSynchronizationState.NotRequested;
             Topic = null;
             lock (_membersGate)
@@ -538,6 +653,11 @@ public sealed class ChannelView : WorkspaceView
         {
             IsJoined = snapshot.IsJoined;
             IsStale = snapshot.IsStale;
+            SetLifecycleState(snapshot.IsJoined
+                ? ConversationLifecycleState.Joined
+                : snapshot.IsStale || !networkAvailable
+                    ? ConversationLifecycleState.Disconnected
+                    : !isDesired && LifecycleState is not ConversationLifecycleState.HistoricalOnly ? ConversationLifecycleState.Parted : ConversationLifecycleState.HistoricalOnly);
             Synchronization = snapshot.Synchronization;
             Topic = snapshot.Topic;
             ModeSummary = new string(snapshot.Modes.OrderBy(static mode => mode).ToArray());
@@ -609,6 +729,11 @@ public sealed class QueryView : WorkspaceView
     }
 
     public string Nickname { get; }
+
+    internal void ApplyConnectionState(bool connected)
+    {
+        SetLifecycleState(connected ? ConversationLifecycleState.Active : ConversationLifecycleState.Disconnected);
+    }
 }
 
 public sealed class NetworkWorkspace : ObservableObject
@@ -646,7 +771,12 @@ public sealed class NetworkWorkspace : ObservableObject
         StatusView.ApplySnapshot(_snapshot);
         foreach (var channel in Channels)
         {
-            channel.ApplySnapshot(null, _snapshot.Features.Prefix, _snapshot.Nickname, _snapshot.Features.CaseMapping);
+            channel.ApplySnapshot(null, _snapshot.Features.Prefix, _snapshot.Nickname, _snapshot.Features.CaseMapping, networkAvailable: false, isDesired: true);
+        }
+
+        foreach (var query in Queries)
+        {
+            query.ApplyConnectionState(connected: false);
         }
     }
 
@@ -723,9 +853,11 @@ public sealed class NetworkWorkspace : ObservableObject
         NetworkName = snapshot.Features.NetworkName ?? snapshot.Identity.NetworkName;
         StatusView.ApplySnapshot(snapshot);
 
+        var networkAvailable = snapshot.State is not (ServerSessionState.Disconnected or ServerSessionState.Failed or ServerSessionState.ReconnectWaiting);
         foreach (var channel in snapshot.Channels)
         {
-            EnsureChannel(channel.Name).ApplySnapshot(channel, snapshot.Features.Prefix, snapshot.Nickname, snapshot.Features.CaseMapping);
+            var isDesired = snapshot.DesiredChannels.Any(item => IrcCaseMappingComparer.Equals(item, channel.Name, snapshot.Features.CaseMapping));
+            EnsureChannel(channel.Name, reopen: false).ApplySnapshot(channel, snapshot.Features.Prefix, snapshot.Nickname, snapshot.Features.CaseMapping, networkAvailable, isDesired);
         }
 
         foreach (var channel in Channels)
@@ -733,22 +865,38 @@ public sealed class NetworkWorkspace : ObservableObject
             if (!snapshot.Channels.Any(item => IrcCaseMappingComparer.Equals(item.Name, channel.Channel, snapshot.Features.CaseMapping)) &&
                 snapshot.DesiredChannels.All(item => !IrcCaseMappingComparer.Equals(item, channel.Channel, snapshot.Features.CaseMapping)))
             {
-                channel.ApplySnapshot(null, snapshot.Features.Prefix, snapshot.Nickname, snapshot.Features.CaseMapping);
+                channel.ApplySnapshot(
+                    null,
+                    snapshot.Features.Prefix,
+                    snapshot.Nickname,
+                    snapshot.Features.CaseMapping,
+                    networkAvailable,
+                    snapshot.DesiredChannels.Any(item => IrcCaseMappingComparer.Equals(item, channel.Channel, snapshot.Features.CaseMapping)));
             }
         }
 
         foreach (var query in snapshot.Queries)
         {
-            EnsureQuery(query.Nickname);
+            EnsureQuery(query.Nickname, reopen: false).ApplyConnectionState(networkAvailable);
+        }
+
+        foreach (var query in Queries)
+        {
+            query.ApplyConnectionState(networkAvailable);
         }
     }
 
-    internal ChannelView EnsureChannel(string channel)
+    internal ChannelView EnsureChannel(string channel, bool reopen = true)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(channel);
         var existing = Channels.FirstOrDefault(item => IrcCaseMappingComparer.Equals(item.Channel, channel, _snapshot.Features.CaseMapping));
         if (existing is not null)
         {
+            if (reopen)
+            {
+                ReopenView(existing);
+            }
+
             return existing;
         }
 
@@ -758,16 +906,22 @@ public sealed class NetworkWorkspace : ObservableObject
         return view;
     }
 
-    internal QueryView EnsureQuery(string nickname)
+    internal QueryView EnsureQuery(string nickname, bool reopen = true)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
         var existing = Queries.FirstOrDefault(item => IrcCaseMappingComparer.Equals(item.Nickname, nickname, _snapshot.Features.CaseMapping));
         if (existing is not null)
         {
+            if (reopen)
+            {
+                ReopenView(existing);
+            }
+
             return existing;
         }
 
         var view = new QueryView(Id, Guid.NewGuid(), nickname);
+        view.ApplyConnectionState(_snapshot.State is not (ServerSessionState.Disconnected or ServerSessionState.Failed or ServerSessionState.ReconnectWaiting));
         Queries.Add(view);
         InsertView(view);
         return view;
@@ -842,6 +996,24 @@ public sealed class NetworkWorkspace : ObservableObject
         }
 
         ActiveView = view;
+    }
+
+    internal void Close(WorkspaceView view)
+    {
+        view.CloseView();
+        Views.Remove(view);
+    }
+
+    internal void ReopenView(WorkspaceView view)
+    {
+        if (Views.Contains(view))
+        {
+            view.ReopenView();
+            return;
+        }
+
+        view.ReopenView();
+        InsertView(view);
     }
 
     private void InsertView(WorkspaceView view)

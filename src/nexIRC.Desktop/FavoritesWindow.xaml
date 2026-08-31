@@ -5,11 +5,23 @@
         Width="760" Height="520" MinWidth="620" MinHeight="420"
         WindowStartupLocation="CenterOwner">
     <DockPanel Margin="16">
+        <WrapPanel DockPanel.Dock="Top" Margin="0,0,0,10">
+            <TextBlock Text="New group" VerticalAlignment="Center" Margin="0,0,8,0" />
+            <TextBox x:Name="NewGroupBox" Width="150" Margin="0,0,8,0" />
+            <Button Content="Add group" Click="OnAddGroupClick" Padding="12,4" Margin="0,0,16,0" />
+            <TextBlock Text="Move favorite to" VerticalAlignment="Center" Margin="0,0,8,0" />
+            <ComboBox x:Name="GroupBox" Width="150" DisplayMemberPath="Name" />
+            <Button Content="Move" Click="OnMoveClick" Padding="12,4" Margin="8,0,0,0" />
+        </WrapPanel>
         <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
             <Button Content="Add current" Click="OnAddCurrentClick" Padding="12,6" Margin="0,0,8,0" />
             <Button Content="Open selected" Click="OnOpenClick" Padding="12,6" Margin="0,0,8,0" />
+            <Button Content="Move up" Click="OnMoveUpClick" Padding="12,6" Margin="0,0,8,0" />
+            <Button Content="Move down" Click="OnMoveDownClick" Padding="12,6" Margin="0,0,8,0" />
             <Button Content="Remove favorite" Click="OnRemoveClick" Padding="12,6" Margin="0,0,8,0" />
-            <Button Content="Clear recents" Click="OnClearRecentsClick" Padding="12,6" Margin="0,0,8,0" />
+            <Button Content="Remove recent" Click="OnRemoveRecentClick" Padding="12,6" Margin="0,0,8,0" />
+            <Button Content="Clear channel recents" Click="OnClearChannelsClick" Padding="12,6" Margin="0,0,8,0" />
+            <Button Content="Clear query recents" Click="OnClearQueriesClick" Padding="12,6" Margin="0,0,8,0" />
             <Button Content="Close" IsCancel="True" Padding="12,6" />
         </StackPanel>
         <Grid>

@@ -101,9 +101,16 @@ public sealed class DemoScenario
 
         sessions.Configuration?.AddOrUpdateAlias(new AliasDefinition { Name = "j", Expansion = "/join $1", Description = "Join a channel quickly." });
         sessions.Configuration?.AddOrUpdateAlias(new AliasDefinition { Name = "w", Expansion = "/whois $1", Description = "Open WHOIS quickly." });
+        sessions.Configuration?.AddOrUpdateAlias(new AliasDefinition { Name = "where", Expansion = "/raw NOTICE $target :$network/$profile/$me@$server/$$ $*", Description = "Show safe contextual alias values." });
+        sessions.Configuration?.AddFavoriteGroup("Team Nexgen");
+        var groupId = sessions.Configuration?.FavoriteGroups.FirstOrDefault(item => item.Name == "Team Nexgen")?.Id
+            ?? NavigationDefaults.DefaultFavoriteGroupId;
         sessions.AddFavorite(alpha.Id, DestinationKind.Channel, "#alpha", "Alpha home");
-        sessions.AddFavorite(beta.Id, DestinationKind.Channel, "#lounge", "Beta lounge");
+        sessions.AddFavorite(alpha.Id, DestinationKind.Channel, "#lounge", "Alpha parted example", groupId);
+        sessions.AddFavorite(beta.Id, DestinationKind.Channel, "#lounge", "Beta lounge", groupId);
+        sessions.AddFavorite(alpha.Id, DestinationKind.Query, "Mira", "Alpha private conversation", groupId);
         sessions.RecordRecent(alpha, DestinationKind.Channel, "#alpha");
+        sessions.RecordRecent(alpha, DestinationKind.Query, "Mira");
         sessions.RecordRecent(beta, DestinationKind.Channel, "#lounge");
 
         var dispatcher = new IrcCommandDispatcher(sessions);
@@ -117,9 +124,29 @@ public sealed class DemoScenario
         await dispatcher.DispatchAsync(alpha, alphaChannel, "Local AlphaNet message").ConfigureAwait(true);
         await dispatcher.DispatchAsync(alpha, alphaChannel, "/me demonstrates a local action").ConfigureAwait(true);
         await dispatcher.DispatchAsync(alpha, alphaChannel, "/msg Mira A local private message").ConfigureAwait(true);
+        await dispatcher.DispatchAsync(alpha, alphaChannel, "/where demo-context").ConfigureAwait(true);
+        await dispatcher.DispatchAsync(alpha, alpha.Channels.First(channel => channel.Channel == "#lounge"), "/part #lounge demo parted view").ConfigureAwait(true);
+        sessions.OpenHistoricalConversation(alpha.Id, DestinationKind.Query, "OldMira");
 
         if (sessions.LogStore is { } logs)
         {
+            for (var index = 0; index < 125; index++)
+            {
+                await logs.AppendAsync(new ConversationLogRecord
+                {
+                    Timestamp = DateTimeOffset.UtcNow.AddMinutes(-index),
+                    NetworkId = alpha.Id,
+                    ScopeId = alpha.ProfileId ?? alpha.Id,
+                    ProfileId = alpha.ProfileId,
+                    ConversationKind = LogConversationKind.Channel,
+                    ConversationName = "#alpha",
+                    ConversationKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, "#alpha"),
+                    Sender = index % 2 == 0 ? "Mira" : "Rook",
+                    MessageKind = LogMessageKind.Message,
+                    Direction = LogDirection.Incoming,
+                    Text = $"Demo history page record {index + 1:000}; this is fake deterministic workspace data."
+                }).ConfigureAwait(true);
+            }
             await logs.FlushAsync().ConfigureAwait(true);
             var results = await logs.SearchAsync(new ConversationLogQuery { Text = "Welcome", NetworkId = alpha.Id }).ConfigureAwait(true);
             var result = results.Count > 0 ? results[0] : null;

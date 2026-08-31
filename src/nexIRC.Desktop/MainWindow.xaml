@@ -54,14 +54,43 @@
                 </TextBlock>
             </DockPanel>
         </DataTemplate>
+        <DataTemplate x:Key="HistoryContextEntryTemplate">
+            <DockPanel Margin="2,1">
+                <TextBlock DockPanel.Dock="Left" Text="{Binding DisplayTime}" Width="62" Foreground="#94A3B8" />
+                <TextBlock Text="{Binding DisplayLine}" TextWrapping="Wrap">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Foreground" Value="#475569" />
+                            <Setter Property="FontStyle" Value="Italic" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsMatch}" Value="True">
+                                    <Setter Property="Background" Value="#FEF3C7" />
+                                    <Setter Property="Foreground" Value="#92400E" />
+                                    <Setter Property="FontStyle" Value="Normal" />
+                                    <Setter Property="FontWeight" Value="SemiBold" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
+            </DockPanel>
+        </DataTemplate>
         <DataTemplate DataType="{x:Type app:ServerStatusView}">
-            <TextBlock Text="{Binding DisplayLabel}" Margin="4,2" />
+            <TextBlock Text="{Binding DisplayLabel}" Margin="4,2" ToolTip="{Binding StateText}" />
         </DataTemplate>
         <DataTemplate DataType="{x:Type app:ChannelView}">
-            <TextBlock Text="{Binding DisplayLabel}" Margin="4,2" />
+            <TextBlock Margin="4,2" ToolTip="{Binding LifecycleText}">
+                <Run Text="{Binding StateMarker}" />
+                <Run Text=" " />
+                <Run Text="{Binding DisplayLabel}" />
+            </TextBlock>
         </DataTemplate>
         <DataTemplate DataType="{x:Type app:QueryView}">
-            <TextBlock Text="{Binding DisplayLabel}" Margin="4,2" />
+            <TextBlock Margin="4,2" ToolTip="{Binding LifecycleText}">
+                <Run Text="{Binding StateMarker}" />
+                <Run Text=" " />
+                <Run Text="{Binding DisplayLabel}" />
+            </TextBlock>
         </DataTemplate>
         <HierarchicalDataTemplate DataType="{x:Type app:NetworkWorkspace}" ItemsSource="{Binding Views}">
             <TextBlock Text="{Binding DisplayLabel}" Margin="4,2" FontWeight="SemiBold" />
@@ -88,9 +117,14 @@
                 </Grid.RowDefinitions>
                 <Border Background="#E2E8F0" CornerRadius="4" Padding="10,7" Margin="0,0,0,8">
                     <StackPanel>
-                        <TextBlock Text="{Binding Channel}" FontSize="19" FontWeight="SemiBold" Foreground="#172033" />
+                        <TextBlock FontSize="19" FontWeight="SemiBold" Foreground="#172033">
+                            <Run Text="{Binding StateMarker}" />
+                            <Run Text=" " />
+                            <Run Text="{Binding Channel}" />
+                        </TextBlock>
                         <TextBlock Text="{Binding TopicText}" Foreground="#475569" TextTrimming="CharacterEllipsis" />
-                        <TextBlock Text="{Binding SynchronizationText, StringFormat=State: {0}}" Foreground="#64748B" FontSize="11" />
+                        <TextBlock Text="{Binding LifecycleText, StringFormat=Conversation: {0}}" Foreground="#64748B" FontSize="11" />
+                        <TextBlock Text="{Binding SynchronizationText, StringFormat=Sync: {0}}" Foreground="#64748B" FontSize="11" />
                     </StackPanel>
                 </Border>
                 <Grid Grid.Row="1">
@@ -98,7 +132,19 @@
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
-                    <ListBox ItemsSource="{Binding Entries}" ItemTemplate="{StaticResource TranscriptEntryTemplate}" BorderThickness="0" Background="White" FontFamily="Cascadia Mono" />
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <ListBox ItemsSource="{Binding Entries}" ItemTemplate="{StaticResource TranscriptEntryTemplate}" BorderThickness="0" Background="White" FontFamily="Cascadia Mono" />
+                        <Expander Grid.Row="1" Header="Historical context" IsExpanded="True" Visibility="{Binding HasHistoryContext, Converter={StaticResource BooleanToVisibility}}" Margin="0,8,0,0">
+                            <DockPanel MaxHeight="220">
+                                <TextBlock DockPanel.Dock="Top" Text="{Binding HistoryContextMatch, StringFormat=Match: {0}}" Foreground="#92400E" Margin="6,4" />
+                                <ListBox ItemsSource="{Binding HistoryContext}" ItemTemplate="{StaticResource HistoryContextEntryTemplate}" BorderThickness="0" FontFamily="Cascadia Mono" />
+                            </DockPanel>
+                        </Expander>
+                    </Grid>
                     <Border Grid.Column="1" Width="205" Margin="10,0,0,0" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="1" Visibility="{Binding DataContext.IsMemberListVisible, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource BooleanToVisibility}}">
                         <DockPanel>
                             <TextBlock DockPanel.Dock="Top" Text="Members" Style="{StaticResource PaneHeader}" />
@@ -115,10 +161,26 @@
                     <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
                 <StackPanel Margin="0,0,0,8">
-                    <TextBlock Text="{Binding Nickname}" FontSize="19" FontWeight="SemiBold" Foreground="#172033" />
-                    <TextBlock Text="Private conversation" Foreground="#64748B" />
+                    <TextBlock FontSize="19" FontWeight="SemiBold" Foreground="#172033">
+                        <Run Text="{Binding StateMarker}" />
+                        <Run Text=" " />
+                        <Run Text="{Binding Nickname}" />
+                    </TextBlock>
+                    <TextBlock Text="{Binding LifecycleText, StringFormat=Private conversation · {0}}" Foreground="#64748B" />
                 </StackPanel>
-                <ListBox Grid.Row="1" ItemsSource="{Binding Entries}" ItemTemplate="{StaticResource TranscriptEntryTemplate}" BorderThickness="0" Background="White" FontFamily="Cascadia Mono" />
+                <Grid Grid.Row="1">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <ListBox ItemsSource="{Binding Entries}" ItemTemplate="{StaticResource TranscriptEntryTemplate}" BorderThickness="0" Background="White" FontFamily="Cascadia Mono" />
+                    <Expander Grid.Row="1" Header="Historical context" IsExpanded="True" Visibility="{Binding HasHistoryContext, Converter={StaticResource BooleanToVisibility}}" Margin="0,8,0,0">
+                        <DockPanel MaxHeight="220">
+                            <TextBlock DockPanel.Dock="Top" Text="{Binding HistoryContextMatch, StringFormat=Match: {0}}" Foreground="#92400E" Margin="6,4" />
+                            <ListBox ItemsSource="{Binding HistoryContext}" ItemTemplate="{StaticResource HistoryContextEntryTemplate}" BorderThickness="0" FontFamily="Cascadia Mono" />
+                        </DockPanel>
+                    </Expander>
+                </Grid>
             </Grid>
         </DataTemplate>
         <DataTemplate DataType="{x:Type app:WhoisView}" x:Key="WhoisContentTemplate">
@@ -209,6 +271,7 @@
                 <Separator />
                 <MenuItem Header="_Disconnect" Command="{Binding DisconnectCommand}" />
                 <MenuItem Header="_Reconnect" Command="{Binding ReconnectCommand}" />
+                <MenuItem Header="Favorites and recents…" Click="OnFavoritesClick" />
                 <Separator />
                 <MenuItem Header="E_xit" Command="{Binding ExitCommand}" />
             </MenuItem>
@@ -223,6 +286,9 @@
             <MenuItem Header="_IRC / Server">
                 <MenuItem Header="_Join Channel" Command="{Binding JoinCommand}" />
                 <MenuItem Header="_Part Channel" Command="{Binding PartCommand}" />
+                <MenuItem Header="_Rejoin Channel" Click="OnRejoinClick" />
+                <MenuItem Header="_Clear Conversation Display" Click="OnClearClick" />
+                <MenuItem Header="_Close View" Click="OnCloseViewClick" />
                 <MenuItem Header="Change _Nickname" Click="OnNicknameClick" />
                 <MenuItem Header="_WHOIS" Click="OnWhoisClick" />
                 <MenuItem Header="Channel _List" Click="OnListClick" />
@@ -254,6 +320,7 @@
                 <Separator />
                 <Button Content="Join" Command="{Binding JoinCommand}" Padding="10,3" />
                 <Button Content="Part" Command="{Binding PartCommand}" Padding="10,3" />
+                <Button Content="Clear" Click="OnClearClick" Padding="10,3" />
                 <Button Content="Query" Command="{Binding QueryCommand}" Padding="10,3" />
             </ToolBar>
         </ToolBarTray>
@@ -261,7 +328,7 @@
         <StatusBar DockPanel.Dock="Bottom" Visibility="{Binding IsStatusBarVisible, Converter={StaticResource BooleanToVisibility}}">
             <StatusBarItem Content="{Binding StatusText}" />
             <Separator />
-            <StatusBarItem Content="nexIRC 5 · Phase 1F" />
+             <StatusBarItem Content="nexIRC 5 · Phase 1G" />
         </StatusBar>
 
         <Grid>

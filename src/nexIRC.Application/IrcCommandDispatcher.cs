@@ -19,7 +19,7 @@ public sealed class IrcCommandDispatcher
 {
     public static IReadOnlyList<string> SupportedCommands { get; } =
     [
-        "server", "join", "part", "msg", "query", "q", "nick", "me", "quit",
+        "server", "join", "rejoin", "part", "msg", "query", "q", "nick", "me", "quit",
         "disconnect", "whois", "list", "notice", "ctcp", "op", "deop", "voice",
         "devoice", "kick", "mode", "topic", "clear", "close", "raw", "quote", "help"
     ];
@@ -34,10 +34,18 @@ public sealed class IrcCommandDispatcher
     public static bool IsBuiltInCommand(string command) =>
         SupportedCommands.Contains(command.Trim().TrimStart('/'), StringComparer.OrdinalIgnoreCase);
 
+    public ValueTask<CommandDispatchResult> DispatchAsync(
+        NetworkWorkspace? network,
+        WorkspaceView? activeView,
+        string input,
+        CancellationToken cancellationToken = default) =>
+        DispatchAsync(network, activeView, input, null, cancellationToken);
+
     public async ValueTask<CommandDispatchResult> DispatchAsync(
         NetworkWorkspace? network,
         WorkspaceView? activeView,
         string input,
+        AliasContext? aliasContext,
         CancellationToken cancellationToken = default)
     {
         if (network is null || activeView is null || string.IsNullOrWhiteSpace(input))
@@ -87,7 +95,10 @@ public sealed class IrcCommandDispatcher
 
         if (!IsBuiltInCommand(command))
         {
-            var expanded = AliasExpander.Expand(input, _sessions.Configuration?.Aliases ?? Array.Empty<AliasDefinition>());
+            var expanded = AliasExpander.Expand(
+                input,
+                _sessions.Configuration?.Aliases ?? Array.Empty<AliasDefinition>(),
+                aliasContext ?? AliasContext.From(network, activeView));
             if (!expanded.Succeeded)
             {
                 return CommandDispatchResult.Failure(expanded.Error ?? "Alias expansion failed.", activeView);
@@ -95,7 +106,7 @@ public sealed class IrcCommandDispatcher
 
             if (!string.Equals(expanded.Input, input, StringComparison.Ordinal))
             {
-                return await DispatchAsync(network, activeView, expanded.Input, cancellationToken).ConfigureAwait(false);
+                return await DispatchAsync(network, activeView, expanded.Input, aliasContext, cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -107,6 +118,8 @@ public sealed class IrcCommandDispatcher
                     return await ConnectServerAsync(network, parts, cancellationToken).ConfigureAwait(false);
                 case "JOIN":
                     return await JoinAsync(network, parts, cancellationToken).ConfigureAwait(false);
+                case "REJOIN":
+                    return await RejoinAsync(network, activeView, parts, cancellationToken).ConfigureAwait(false);
                 case "PART":
                     return await PartAsync(network, activeView, arguments, parts, cancellationToken).ConfigureAwait(false);
                 case "MSG":
@@ -225,7 +238,7 @@ public sealed class IrcCommandDispatcher
         string[] parts,
         CancellationToken cancellationToken)
     {
-        var channel = activeView is ChannelView activeChannel ? activeChannel.Channel : parts.FirstOrDefault();
+        var channel = activeView is ChannelView activeChannelView ? activeChannelView.Channel : parts.FirstOrDefault();
         if (string.IsNullOrWhiteSpace(channel))
         {
             return CommandDispatchResult.Failure("Usage: /part [#channel] [reason]", activeView);
@@ -236,7 +249,25 @@ public sealed class IrcCommandDispatcher
             ? arguments[channel.Length..].Trim()
             : string.Empty;
         await network.Session.PartChannelAsync(channel, string.IsNullOrWhiteSpace(reason) ? null : reason, cancellationToken).ConfigureAwait(false);
+        if (activeView is ChannelView partedChannel
+            && IrcIdentity.Equals(partedChannel.Channel, channel, network.Snapshot.Features.CaseMapping))
+        {
+            partedChannel.SetLifecycleState(ConversationLifecycleState.Parted);
+        }
+
         return CommandDispatchResult.Success($"Leaving {channel}.", activeView);
+    }
+
+    private async ValueTask<CommandDispatchResult> RejoinAsync(NetworkWorkspace network, WorkspaceView activeView, string[] parts, CancellationToken cancellationToken)
+    {
+        var channel = activeView is ChannelView activeChannel ? activeChannel.Channel : parts.FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(channel))
+        {
+            return CommandDispatchResult.Failure("Usage: /rejoin [#channel]", activeView);
+        }
+
+        await _sessions.RejoinChannelAsync(network.Id, channel, cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success($"Rejoining {channel}.", _sessions.EnsureChannel(network.Id, channel));
     }
 
     private async ValueTask<CommandDispatchResult> MessageAsync(NetworkWorkspace network, string arguments, CancellationToken cancellationToken)

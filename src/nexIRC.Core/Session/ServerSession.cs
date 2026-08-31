@@ -154,6 +154,26 @@ public sealed class ServerSession : IAsyncDisposable
         }
     }
 
+    public async ValueTask RejoinChannelAsync(string channel, CancellationToken cancellationToken = default)
+    {
+        ValidateChannelName(channel);
+        var shouldSend = false;
+        lock (_gate)
+        {
+            _stateStore.AddDesiredChannel(channel);
+            shouldSend = _registration == RegistrationState.Registered;
+            if (shouldSend)
+            {
+                _stateStore.MarkChannelJoining(channel);
+            }
+        }
+
+        if (shouldSend)
+        {
+            await SendCommandAsync("JOIN", [channel], cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     public async ValueTask PartChannelAsync(string channel, string? reason = null, CancellationToken cancellationToken = default)
     {
         ValidateChannelName(channel);

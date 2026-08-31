@@ -65,10 +65,6 @@ public partial class App : System.Windows.Application
             try
             {
                 await demoScenario.SeedAsync(window.ViewModel.Sessions);
-                if (window.ViewModel.Sessions.Networks.FirstOrDefault()?.ProfileId is Guid profileId)
-                {
-                    await window.ViewModel.Credentials.SaveAsync(profileId, ProfileCredentialKind.Sasl, "demo-user", "demo-only-secret-123");
-                }
             }
             catch (Exception exception)
             {

@@ -140,6 +140,17 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         return workspace.EnsureQuery(nickname);
     }
 
+    public WorkspaceView OpenHistoricalConversation(Guid networkId, DestinationKind kind, string name)
+    {
+        var workspace = GetWorkspace(networkId);
+        WorkspaceView view = kind == DestinationKind.Channel
+            ? workspace.EnsureChannel(name)
+            : workspace.EnsureQuery(name);
+        view.SetLifecycleState(ConversationLifecycleState.HistoricalOnly);
+        ActivateView(view.Id);
+        return view;
+    }
+
     public WhoisView BeginWhois(Guid networkId, string nickname)
     {
         var workspace = GetWorkspace(networkId);
@@ -330,6 +341,28 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         ActiveView = view;
     }
 
+    public bool ReopenView(Guid viewId)
+    {
+        foreach (var workspace in Networks)
+        {
+            var view = workspace.Channels.Cast<WorkspaceView>()
+                .Concat(workspace.Queries)
+                .Concat(workspace.WhoisViews)
+                .Concat(workspace.ChannelListViews)
+                .FirstOrDefault(item => item.Id == viewId);
+            if (view is null)
+            {
+                continue;
+            }
+
+            workspace.ReopenView(view);
+            ActivateView(view.Id);
+            return true;
+        }
+
+        return false;
+    }
+
     public bool CloseView(Guid viewId)
     {
         if (!TryGetView(viewId, out var workspace, out var view) || workspace is null || view is null || view.Kind == WorkspaceViewKind.ServerStatus)
@@ -337,31 +370,40 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             return false;
         }
 
-        if (view is ChannelView channel)
+        if (view is ChannelView or QueryView)
         {
-            workspace.Channels.Remove(channel);
-        }
-        else if (view is QueryView query)
-        {
-            workspace.Queries.Remove(query);
+            // Closing a view only changes presentation. The logical
+            // conversation remains addressable for reopen/history routing.
+            workspace.Close(view);
         }
         else if (view is WhoisView whois)
         {
             workspace.WhoisViews.Remove(whois);
+            workspace.Close(whois);
+            ClearOperations(workspace.Id);
         }
         else if (view is ChannelListView list)
         {
             workspace.ChannelListViews.Remove(list);
+            workspace.Close(list);
+            ClearOperations(workspace.Id);
         }
 
-        workspace.Views.Remove(view);
-        ClearOperations(workspace.Id);
         if (ReferenceEquals(ActiveView, view))
         {
             ActivateView(workspace.StatusView.Id);
         }
 
         return true;
+    }
+
+    public async ValueTask RejoinChannelAsync(Guid networkId, string channel, CancellationToken cancellationToken = default)
+    {
+        var workspace = GetWorkspace(networkId);
+        var view = workspace.EnsureChannel(channel);
+        ActivateView(view.Id);
+        RecordRecent(workspace, DestinationKind.Channel, channel);
+        await workspace.Session.RejoinChannelAsync(view.Channel, cancellationToken).ConfigureAwait(false);
     }
 
     public IReadOnlyList<FavoriteDestination> Favorites(Guid networkId, DestinationKind? kind = null)
@@ -373,8 +415,16 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         var scope = workspace.ProfileId ?? workspace.Id;
-        return Configuration.Favorites.Where(item => item.ScopeId == scope && (kind is null || item.Kind == kind)).ToArray();
+        var groupOrder = Configuration.FavoriteGroups.ToDictionary(group => group.Id, group => group.SortOrder);
+        return Configuration.Favorites
+            .Where(item => item.ScopeId == scope && (kind is null || item.Kind == kind))
+            .OrderBy(item => groupOrder.TryGetValue(item.GroupId, out var order) ? order : int.MaxValue)
+            .ThenBy(item => item.SortOrder)
+            .ThenBy(item => item.Id)
+            .ToArray();
     }
+
+    public IReadOnlyList<FavoriteGroup> FavoriteGroups() => Configuration?.FavoriteGroups ?? Array.Empty<FavoriteGroup>();
 
     public IReadOnlyList<RecentDestination> RecentDestinations(Guid networkId, DestinationKind? kind = null)
     {
@@ -389,6 +439,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     }
 
     public bool AddFavorite(Guid networkId, DestinationKind kind, string name, string? label = null)
+        => AddFavorite(networkId, kind, name, label, NavigationDefaults.DefaultFavoriteGroupId);
+
+    public bool AddFavorite(Guid networkId, DestinationKind kind, string name, string? label, Guid groupId)
     {
         var workspace = GetWorkspace(networkId);
         if (Configuration is null)
@@ -401,7 +454,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             ScopeId = workspace.ProfileId ?? workspace.Id,
             Kind = kind,
             Name = name,
-            Label = label
+            Label = label,
+            GroupId = groupId
         });
         if (added)
         {
@@ -409,6 +463,30 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         return added;
+    }
+
+    public bool MoveFavorite(Guid favoriteId, Guid groupId)
+    {
+        if (Configuration is null)
+        {
+            return false;
+        }
+
+        var moved = Configuration.MoveFavorite(favoriteId, groupId);
+        if (moved) SaveConfigurationInBackground();
+        return moved;
+    }
+
+    public bool ReorderFavorite(Guid favoriteId, int delta)
+    {
+        if (Configuration is null)
+        {
+            return false;
+        }
+
+        var moved = Configuration.ReorderFavorite(favoriteId, delta);
+        if (moved) SaveConfigurationInBackground();
+        return moved;
     }
 
     public bool RemoveFavorite(Guid favoriteId)
@@ -423,15 +501,28 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         return removed;
     }
 
-    public void ClearRecent(Guid networkId)
+    public void ClearRecent(Guid networkId, DestinationKind? kind = null)
     {
         if (Configuration is null || !TryGet(networkId, out var workspace) || workspace is null)
         {
             return;
         }
 
-        Configuration.ClearRecent(workspace.ProfileId ?? workspace.Id);
+        Configuration.ClearRecent(workspace.ProfileId ?? workspace.Id, kind);
         SaveConfigurationInBackground();
+    }
+
+    public bool RemoveRecent(Guid networkId, RecentDestination destination)
+    {
+        if (Configuration is null || !TryGet(networkId, out var workspace) || workspace is null)
+        {
+            return false;
+        }
+
+        var scoped = destination with { ScopeId = workspace.ProfileId ?? workspace.Id };
+        var removed = Configuration.RemoveRecent(scoped);
+        if (removed) SaveConfigurationInBackground();
+        return removed;
     }
 
     public void RecordRecent(NetworkWorkspace workspace, DestinationKind kind, string name)
@@ -461,14 +552,13 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         if (notification.Activation is { } target
-            && target.ProfileId is Guid profileId
-            && Networks.FirstOrDefault(item => item.ProfileId == profileId) is { } profileWorkspace)
+            && ResolveActivationWorkspace(target) is { } targetWorkspace)
         {
             WorkspaceView targetView = target.ViewKind switch
             {
-                WorkspaceViewKind.Channel when !string.IsNullOrWhiteSpace(target.ConversationName) => profileWorkspace.EnsureChannel(target.ConversationName),
-                WorkspaceViewKind.Query when !string.IsNullOrWhiteSpace(target.ConversationName) => profileWorkspace.EnsureQuery(target.ConversationName),
-                _ => profileWorkspace.StatusView
+                WorkspaceViewKind.Channel when !string.IsNullOrWhiteSpace(target.ConversationName) => targetWorkspace.EnsureChannel(target.ConversationName),
+                WorkspaceViewKind.Query when !string.IsNullOrWhiteSpace(target.ConversationName) => targetWorkspace.EnsureQuery(target.ConversationName),
+                _ => targetWorkspace.StatusView
             };
             ActivateView(targetView.Id);
             return true;
@@ -1096,16 +1186,16 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         switch (semanticEvent)
         {
             case IrcCtcpEvent ctcp when snapshot.Features.ChannelTypes.Contains(ctcp.Target.FirstOrDefault()):
-                AppendRendered(workspace.EnsureChannel(ctcp.Target), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureChannel(ctcp.Target, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcCtcpEvent ctcp when IrcIdentity.Equals(ctcp.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping):
-                AppendRendered(workspace.EnsureQuery(ctcp.Target), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureQuery(ctcp.Target, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcCtcpEvent ctcp when ctcp.Message.Prefix?.Name is { } sender:
-                AppendRendered(workspace.EnsureQuery(sender), semanticEvent, snapshot, WorkspaceActivity.Important);
+                AppendRendered(workspace.EnsureQuery(sender, reopen: false), semanticEvent, snapshot, WorkspaceActivity.Important);
                 break;
             case IrcPrivmsgEvent message when snapshot.Features.ChannelTypes.Contains(message.Target.FirstOrDefault()):
-                AppendRendered(workspace.EnsureChannel(message.Target), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureChannel(message.Target, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcPrivmsgEvent message when message.IsNotice && message.Message.Prefix?.User is null:
                 AppendRendered(workspace.StatusView, semanticEvent, snapshot);
@@ -1115,37 +1205,37 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 // event below; do not duplicate it in server status.
                 break;
             case IrcQueryMessageEvent query:
-                AppendRendered(workspace.EnsureQuery(query.Nickname), semanticEvent, snapshot, WorkspaceActivity.Important);
+                AppendRendered(workspace.EnsureQuery(query.Nickname, reopen: false), semanticEvent, snapshot, WorkspaceActivity.Important);
                 break;
             case IrcJoinEvent join:
-                AppendRendered(workspace.EnsureChannel(join.Channel), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureChannel(join.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcPartEvent part:
-                AppendRendered(workspace.EnsureChannel(part.Channel), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureChannel(part.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcKickEvent kick:
-                AppendRendered(workspace.EnsureChannel(kick.Channel), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureChannel(kick.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcTopicEvent topic:
-                AppendRendered(workspace.EnsureChannel(topic.Channel), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureChannel(topic.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcTopicUnsetEvent topic:
-                AppendRendered(workspace.EnsureChannel(topic.Channel), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureChannel(topic.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcNamesEvent names:
-                AppendRendered(workspace.EnsureChannel(names.Channel), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureChannel(names.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcNamesCompleteEvent names:
-                AppendRendered(workspace.EnsureChannel(names.Channel), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureChannel(names.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcWhoEvent who:
-                AppendRendered(workspace.EnsureChannel(who.Channel), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureChannel(who.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcModeEvent mode:
-                AppendRendered(workspace.EnsureChannel(mode.Channel), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureChannel(mode.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcChannelSynchronizationEvent synchronization:
-                AppendRendered(workspace.EnsureChannel(synchronization.Channel), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureChannel(synchronization.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcListStartEvent listStartEvent:
                 if (RouteListEvent(workspace, listStartEvent.RequestLabel, completes: false, starts: true) is not null)
@@ -1421,6 +1511,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     }
 
     private NetworkWorkspace GetWorkspace(Guid networkId) => GetEntry(networkId).Workspace;
+
+    private NetworkWorkspace? ResolveActivationWorkspace(NotificationActivationTarget target) =>
+        Networks.FirstOrDefault(item => item.Id == target.NetworkId)
+        ?? (target.ProfileId is Guid profileId
+            ? Networks.FirstOrDefault(item => item.ProfileId == profileId)
+            : null);
 
     private static void ValidateOptions(NetworkConnectionOptions options)
     {
