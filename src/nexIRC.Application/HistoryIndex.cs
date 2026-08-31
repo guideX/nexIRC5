@@ -11,7 +11,9 @@ internal sealed record JsonlHistoryIndexEntry(long TimestampTicks, long Offset, 
 internal sealed record JsonlHistoryIndexSnapshot(
     long SourceLength,
     long SourceLastWriteTicks,
-    IReadOnlyList<JsonlHistoryIndexEntry> Entries);
+    IReadOnlyList<JsonlHistoryIndexEntry> Entries,
+    long SidecarLength = 0,
+    long SidecarLastWriteTicks = 0);
 
 /// <summary>
 /// A small, disposable acceleration structure for JSONL navigation. It stores
@@ -84,7 +86,21 @@ internal static class JsonlHistoryIndex
             // The sidecar is disposable. Navigation can continue using JSONL.
         }
 
-        return snapshot;
+        try
+        {
+            var sidecarInfo = new FileInfo(sidecarPath);
+            return sidecarInfo.Exists
+                ? snapshot with { SidecarLength = sidecarInfo.Length, SidecarLastWriteTicks = sidecarInfo.LastWriteTimeUtc.Ticks }
+                : snapshot;
+        }
+        catch (IOException)
+        {
+            return snapshot;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return snapshot;
+        }
     }
 
     public static string GetSidecarPath(string sourcePath) => $"{sourcePath}.hidx";
@@ -110,8 +126,8 @@ internal static class JsonlHistoryIndex
                 continue;
             }
 
-            if (record is null
-                || record.Text.Length > ConfigurationLimits.MaximumLogRecordBytes
+            if (!ConversationLogRecordValidation.IsReadable(record)
+                || record!.Text.Length > ConfigurationLimits.MaximumLogRecordBytes
                 || record.ScopeId != scopeId
                 || record.ConversationKind != conversationKind
                 || !IrcCaseMappingComparer.Equals(record.ConversationName, conversationName, IrcCaseMapping.Rfc1459))
@@ -193,10 +209,40 @@ internal static class JsonlHistoryIndex
                 previousOffset = offset;
             }
 
-            snapshot = new JsonlHistoryIndexSnapshot(sourceLength, sourceLastWriteTicks, entries);
+            var sidecarInfo = new FileInfo(path);
+            snapshot = new JsonlHistoryIndexSnapshot(
+                sourceLength,
+                sourceLastWriteTicks,
+                entries,
+                stream.Length,
+                sidecarInfo.LastWriteTimeUtc.Ticks);
             return true;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or EndOfStreamException)
+        {
+            return false;
+        }
+    }
+
+    internal static bool IsSidecarCurrent(string path, JsonlHistoryIndexSnapshot snapshot)
+    {
+        if (snapshot.SidecarLength <= 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            var info = new FileInfo(path);
+            return info.Exists
+                && info.Length == snapshot.SidecarLength
+                && info.LastWriteTimeUtc.Ticks == snapshot.SidecarLastWriteTicks;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
         {
             return false;
         }
@@ -259,21 +305,31 @@ internal static class JsonlHistoryIndex
         await stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async IAsyncEnumerable<IndexedLine> ReadLinesWithOffsetsAsync(
+    internal static async IAsyncEnumerable<IndexedLine> ReadLinesWithOffsetsAsync(
         string path,
         int maximumRecordBytes,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken,
+        long startOffset = 0,
+        long? endOffset = null)
     {
         await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        stream.Position = startOffset;
         var buffer = new byte[64 * 1024];
         using var line = new MemoryStream(Math.Min(maximumRecordBytes, 64 * 1024));
-        var lineOffset = 0L;
-        var sourceOffset = 0L;
+        var lineOffset = startOffset;
+        var sourceOffset = startOffset;
         var oversized = false;
-        while (await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false) is var read && read > 0)
+        var reachedEnd = false;
+        while (!reachedEnd && await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false) is var read && read > 0)
         {
             for (var index = 0; index < read; index++, sourceOffset++)
             {
+                if (endOffset is long end && sourceOffset >= end)
+                {
+                    reachedEnd = true;
+                    break;
+                }
+
                 var value = buffer[index];
                 if (value == (byte)'\n')
                 {
@@ -309,11 +365,11 @@ internal static class JsonlHistoryIndex
             }
         }
 
-        if (!oversized && line.Length > 0)
+        if (!reachedEnd && !oversized && line.Length > 0 && (endOffset is null || lineOffset < endOffset))
         {
             yield return new IndexedLine(lineOffset, line.ToArray());
         }
     }
 
-    private sealed record IndexedLine(long Offset, byte[] Bytes);
+    internal sealed record IndexedLine(long Offset, byte[] Bytes);
 }

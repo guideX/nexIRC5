@@ -39,6 +39,9 @@ public static class ConfigurationLimits
     public const long MaximumHistoryFileBytes = 256L * 1024 * 1024;
     public const int MaximumHistoryIndexEntries = 1_000_000;
     public const int MinimumHistoryIndexFileBytes = 1 * 1024 * 1024;
+    public const int HistorySearchIndexBlockRecords = 4096;
+    public const int MaximumHistorySearchIndexBlocks = 4096;
+    public const int HistorySearchIndexBloomBytes = 128;
     public const int MaximumConversationNavigationHistory = 64;
     public const int MaximumDraftLength = 4096;
     public const int MaximumLogRecordBytes = 32_768;

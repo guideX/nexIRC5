@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -16,6 +17,13 @@ public enum LogMessageKind
 
 public enum LogDirection { Incoming, Outgoing }
 
+public enum ConversationLogSearchScope
+{
+    CurrentConversation,
+    CurrentNetwork,
+    AllHistory
+}
+
 public sealed record ConversationLogRecord
 {
     public DateTimeOffset Timestamp { get; init; }
@@ -32,20 +40,109 @@ public sealed record ConversationLogRecord
     public bool IsHighlight { get; init; }
 }
 
+internal static class ConversationLogRecordValidation
+{
+    public static bool IsReadable(ConversationLogRecord? record) =>
+        record is not null
+        && record.Text is not null
+        && record.ConversationName is not null
+        && record.ConversationKey is not null;
+}
+
 public sealed record ConversationLogQuery
 {
+    public ConversationLogSearchScope Scope { get; init; } = ConversationLogSearchScope.AllHistory;
+
+    public Guid? HistoryScopeId { get; init; }
+
     public string? Text { get; init; }
     public Guid? NetworkId { get; init; }
     public Guid? ProfileId { get; init; }
     public LogConversationKind? ConversationKind { get; init; }
     public string? ConversationName { get; init; }
+    public string? Sender { get; init; }
+    public LogMessageKind? MessageKind { get; init; }
     public DateTimeOffset? From { get; init; }
     public DateTimeOffset? To { get; init; }
     public int MaximumResults { get; init; } = 100;
     public int Skip { get; init; }
 }
 
-public sealed record ConversationLogSearchResult(ConversationLogRecord Record, string Preview);
+public sealed record ConversationLogSearchLocation(
+    Guid ScopeId,
+    string ConversationKey,
+    DateTimeOffset Timestamp,
+    long? SourceOffset = null,
+    int? SourceLength = null);
+
+/// <summary>
+/// A bounded, navigation-ready search result. The legacy Record property is
+/// retained for source compatibility; application and desktop code should use
+/// the typed fields and Location instead of treating a result as raw JSON.
+/// </summary>
+public sealed record ConversationLogSearchResult
+{
+    public ConversationLogSearchResult(ConversationLogRecord record, string preview, ConversationLogSearchLocation? location = null)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        Record = record;
+        NetworkId = record.NetworkId;
+        ScopeId = record.ScopeId;
+        ProfileId = record.ProfileId;
+        ConversationKind = record.ConversationKind;
+        ConversationName = record.ConversationName;
+        Timestamp = record.Timestamp;
+        Sender = record.Sender;
+        MessageKind = record.MessageKind;
+        ArgumentNullException.ThrowIfNull(preview);
+        Preview = preview.Length > 240 ? preview[..240] : preview;
+        Location = location ?? new ConversationLogSearchLocation(
+            record.ScopeId,
+            string.IsNullOrWhiteSpace(record.ConversationKey)
+                ? ConversationLoggingService.BuildConversationKey(record.ConversationKind, record.ConversationName)
+                : record.ConversationKey,
+            record.Timestamp);
+    }
+
+    public ConversationLogRecord Record { get; }
+
+    public Guid NetworkId { get; }
+
+    public Guid ScopeId { get; }
+
+    public Guid? ProfileId { get; }
+
+    public LogConversationKind ConversationKind { get; }
+
+    public string ConversationName { get; }
+
+    public DateTimeOffset Timestamp { get; }
+
+    public string? Sender { get; }
+
+    public LogMessageKind MessageKind { get; }
+
+    public string Preview { get; }
+
+    public ConversationLogSearchLocation Location { get; }
+}
+
+public sealed record ConversationLogSearchStatistics(
+    long RecordsExamined,
+    int FilesExamined,
+    int FilesSkipped,
+    long MatchingRecords,
+    int ResultsProduced,
+    bool ResultsTruncated,
+    bool FilesTruncated,
+    long RecordsSkippedByIndex = 0,
+    int IndexFilesUsed = 0,
+    long IndexBuildMilliseconds = 0,
+    int IndexFilesBuilt = 0);
+
+public sealed record ConversationLogSearchPage(
+    IReadOnlyList<ConversationLogSearchResult> Results,
+    ConversationLogSearchStatistics Statistics);
 
 public sealed record HistoryPageRequest
 {
@@ -97,6 +194,7 @@ public interface IConversationLogStore : IAsyncDisposable
     ValueTask<HistoryPage> ReadPageWindowAsync(HistoryPageRequest request, CancellationToken cancellationToken = default);
     ValueTask<ConversationHistoryRange> ReadRangeAsync(HistoryExportRequest request, CancellationToken cancellationToken = default);
     ValueTask<IReadOnlyList<ConversationLogSearchResult>> SearchAsync(ConversationLogQuery query, CancellationToken cancellationToken = default);
+    ValueTask<ConversationLogSearchPage> SearchDetailedAsync(ConversationLogQuery query, CancellationToken cancellationToken = default);
     ValueTask<int> CleanupAsync(DateTimeOffset olderThan, CancellationToken cancellationToken = default);
     Task FlushAsync(CancellationToken cancellationToken = default);
 }
@@ -301,6 +399,8 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
     private readonly object _diagnosticGate = new();
     private readonly object _historyIndexGate = new();
     private readonly Dictionary<string, JsonlHistoryIndexSnapshot> _historyIndexes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _searchIndexGate = new();
+    private readonly Dictionary<string, JsonlSearchIndexSnapshot> _searchIndexes = new(StringComparer.OrdinalIgnoreCase);
     private string? _lastDiagnostic;
     private int _disposed;
 
@@ -487,51 +587,155 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
 
     public async ValueTask<IReadOnlyList<ConversationLogSearchResult>> SearchAsync(ConversationLogQuery query, CancellationToken cancellationToken = default)
     {
+        var page = await SearchDetailedAsync(query, cancellationToken).ConfigureAwait(false);
+        return page.Results;
+    }
+
+    public async ValueTask<ConversationLogSearchPage> SearchDetailedAsync(ConversationLogQuery query, CancellationToken cancellationToken = default)
+    {
         ArgumentNullException.ThrowIfNull(query);
         await FlushAsync(cancellationToken).ConfigureAwait(false);
         var text = query.Text?.Trim() ?? string.Empty;
         if (text.Length > ConfigurationLimits.MaximumSearchQueryLength)
         {
-            return Array.Empty<ConversationLogSearchResult>();
+            return new ConversationLogSearchPage(
+                Array.Empty<ConversationLogSearchResult>(),
+                new ConversationLogSearchStatistics(0, 0, 0, 0, 0, false, false));
         }
 
         var maximum = Math.Clamp(query.MaximumResults, 1, ConfigurationLimits.MaximumSearchResults);
         var skip = Math.Clamp(query.Skip, 0, ConfigurationLimits.MaximumSearchResults);
         var candidateLimit = Math.Min(ConfigurationLimits.MaximumSearchResults * 2, maximum + skip);
-        var results = new List<ConversationLogSearchResult>(candidateLimit);
+        var collector = new SearchResultCollector(candidateLimit);
+        var recordsExamined = 0L;
+        var filesExamined = 0;
+        var filesSkipped = 0;
+        var filesTruncated = false;
+        var recordsSkippedByIndex = 0L;
+        var indexFilesUsed = 0;
+        var indexFilesBuilt = 0;
+        var indexBuildMilliseconds = 0L;
         if (!Directory.Exists(_root))
         {
-            return results;
+            return new ConversationLogSearchPage(
+                Array.Empty<ConversationLogSearchResult>(),
+                new ConversationLogSearchStatistics(0, 0, 0, 0, 0, false, false));
         }
 
         try
         {
-            foreach (var path in Directory.EnumerateFiles(_root, "*.jsonl", SearchOption.AllDirectories).Take(4096))
+            var paths = EnumerateSearchPaths(query, out filesTruncated);
+            foreach (var path in paths)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                filesExamined++;
+                FileInfo sourceInfo;
                 try
                 {
-                    await foreach (var record in ReadFileAsync(path, cancellationToken).ConfigureAwait(false))
+                    sourceInfo = new FileInfo(path);
+                    if (sourceInfo.Length > ConfigurationLimits.MaximumHistoryFileBytes)
                     {
-                        if (!Matches(record, query, text))
-                        {
-                            continue;
-                        }
+                        filesSkipped++;
+                        continue;
+                    }
+                }
+                catch (IOException)
+                {
+                    filesSkipped++;
+                    continue;
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    filesSkipped++;
+                    continue;
+                }
 
-                        results.Add(new ConversationLogSearchResult(record, Preview(record.Text, text)));
-                        if (results.Count > candidateLimit)
+                var scanSucceeded = true;
+                JsonlSearchIndexBuilder? indexBuilder = null;
+                Stopwatch? indexBuildStopwatch = null;
+                try
+                {
+                    var indexLoad = await GetSearchIndexAsync(path, cancellationToken).ConfigureAwait(false);
+                    var index = indexLoad?.Snapshot;
+                    indexBuilder = index is null && sourceInfo.Length >= ConfigurationLimits.MinimumHistoryIndexFileBytes
+                        ? new JsonlSearchIndexBuilder()
+                        : null;
+                    indexBuildStopwatch = indexBuilder is null ? null : Stopwatch.StartNew();
+                    if (index is not null)
+                    {
+                        indexFilesUsed++;
+                    }
+
+                    JsonlSearchIndexBlock[] blocks = index is null
+                        ? Array.Empty<JsonlSearchIndexBlock>()
+                        : index.Blocks.Where(block => IsSearchBlockEligible(block, query, text)).ToArray();
+                    var useIndexRanges = index is not null && blocks.Length < index.Blocks.Count;
+                    if (useIndexRanges && index is not null)
+                    {
+                        recordsSkippedByIndex += index.Blocks.Sum(block => block.RecordCount) - blocks.Sum(block => block.RecordCount);
+                    }
+
+                    var ranges = !useIndexRanges
+                        ? new (long Start, long? End)[] { (0L, null) }
+                        : blocks.Select(block => (Start: block.Offset, End: (long?)(block.Offset + block.Length))).ToArray();
+                    foreach (var range in ranges)
+                    {
+                        await foreach (var item in ReadFileWithPositionsAsync(path, cancellationToken, range.Start, range.End).ConfigureAwait(false))
                         {
-                            var oldest = results.MinBy(result => result.Record.Timestamp);
-                            if (oldest is not null)
+                            recordsExamined++;
+                            indexBuilder?.Add(item.Offset, item.Record);
+                            if (!Matches(item.Record, query, text))
                             {
-                                results.Remove(oldest);
+                                continue;
                             }
+
+                            var record = item.Record;
+                            collector.Add(new ConversationLogSearchResult(
+                                record,
+                                Preview(record.Text, text),
+                                new ConversationLogSearchLocation(
+                                    record.ScopeId,
+                                    string.IsNullOrWhiteSpace(record.ConversationKey)
+                                        ? ConversationLoggingService.BuildConversationKey(record.ConversationKind, record.ConversationName)
+                                        : record.ConversationKey,
+                                    record.Timestamp,
+                                    item.Offset,
+                                    item.Length)));
                         }
                     }
                 }
                 catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
                 {
+                    filesSkipped++;
+                    scanSucceeded = false;
                     SetDiagnostic($"Conversation log search skipped an unreadable file safely: {exception.Message}");
+                }
+
+                if (scanSucceeded && indexBuilder is not null)
+                {
+                    var builtBlocks = indexBuilder.Complete(sourceInfo.Length);
+                    if (builtBlocks is not null)
+                    {
+                        var builtIndex = await JsonlSearchIndex.WriteBuiltAsync(
+                            path,
+                            sourceInfo.Length,
+                            sourceInfo.LastWriteTimeUtc.Ticks,
+                            builtBlocks,
+                            cancellationToken).ConfigureAwait(false);
+                        indexBuildStopwatch?.Stop();
+                        if (builtIndex is not null)
+                        {
+                            indexFilesBuilt++;
+                            indexBuildMilliseconds += indexBuildStopwatch?.ElapsedMilliseconds ?? 0;
+                            if (JsonlSearchIndex.IsSidecarCurrent(JsonlSearchIndex.GetSidecarPath(path), builtIndex))
+                            {
+                                lock (_searchIndexGate)
+                                {
+                                    _searchIndexes[path] = builtIndex;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -540,11 +744,24 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             SetDiagnostic($"Conversation log search failed safely: {exception.Message}");
         }
 
-        return results
-            .OrderByDescending(result => result.Record.Timestamp)
+        var results = collector.Results
             .Skip(skip)
             .Take(maximum)
             .ToArray();
+        return new ConversationLogSearchPage(
+            results,
+            new ConversationLogSearchStatistics(
+                recordsExamined,
+                filesExamined,
+                filesSkipped,
+                collector.MatchingRecords,
+                results.Length,
+                collector.MatchingRecords > (long)skip + maximum,
+                filesTruncated,
+                recordsSkippedByIndex,
+                indexFilesUsed,
+                indexBuildMilliseconds,
+                indexFilesBuilt));
     }
 
     public async ValueTask<int> CleanupAsync(DateTimeOffset olderThan, CancellationToken cancellationToken = default)
@@ -559,40 +776,58 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         foreach (var path in Directory.EnumerateFiles(_root, "*.jsonl", SearchOption.AllDirectories).Take(4096))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var retained = new List<ConversationLogRecord>();
-            await foreach (var record in ReadFileAsync(path, cancellationToken).ConfigureAwait(false))
-            {
-                if (record.Timestamp >= olderThan) retained.Add(record); else removed++;
-            }
-
-            if (retained.Count == 0)
-            {
-                File.Delete(path);
-                InvalidateHistoryIndex(path);
-                continue;
-            }
-
             var temporaryPath = $"{path}.{Guid.NewGuid():N}.tmp";
+            var retainedCount = 0;
+            var removedInFile = 0;
+            var readSucceeded = false;
             try
             {
                 {
                     await using var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 8192, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                    foreach (var record in retained)
+                    await foreach (var record in ReadFileAsync(path, cancellationToken).ConfigureAwait(false))
                     {
+                        if (record.Timestamp < olderThan)
+                        {
+                            removedInFile++;
+                            continue;
+                        }
+
                         var line = JsonSerializer.SerializeToUtf8Bytes(record, JsonOptions);
                         await stream.WriteAsync(line, cancellationToken).ConfigureAwait(false);
                         await stream.WriteAsync("\n"u8.ToArray(), cancellationToken).ConfigureAwait(false);
+                        retainedCount++;
                     }
 
                     await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
                 }
 
-                File.Move(temporaryPath, path, true);
-                InvalidateHistoryIndex(path);
+                readSucceeded = true;
+                removed += removedInFile;
+                if (retainedCount == 0)
+                {
+                    File.Delete(path);
+                    InvalidateHistoryIndex(path);
+                    InvalidateSearchIndex(path);
+                }
+                else
+                {
+                    File.Move(temporaryPath, path, true);
+                    InvalidateHistoryIndex(path);
+                    InvalidateSearchIndex(path);
+                }
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                SetDiagnostic($"Conversation history cleanup skipped a file safely: {exception.Message}");
             }
             finally
             {
                 if (File.Exists(temporaryPath)) try { File.Delete(temporaryPath); } catch { }
+            }
+
+            if (!readSucceeded)
+            {
+                continue;
             }
         }
 
@@ -602,8 +837,14 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
     public async Task FlushAsync(CancellationToken cancellationToken = default)
     {
         var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!_queue.Writer.TryWrite(new PendingWrite(null, completion))) return;
-        await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        while (await _queue.Writer.WaitToWriteAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (_queue.Writer.TryWrite(new PendingWrite(null, completion)))
+            {
+                await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                return;
+            }
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -631,12 +872,25 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                     Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                     var line = JsonSerializer.SerializeToUtf8Bytes(pending.Record, JsonOptions);
                     await using var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read, 8192, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                    var requiredBytes = (long)line.Length + 1;
+                    if (stream.Length > ConfigurationLimits.MaximumHistoryFileBytes
+                        || requiredBytes > ConfigurationLimits.MaximumHistoryFileBytes - stream.Length)
+                    {
+                        SetDiagnostic("Conversation history file reached the supported 256 MiB bound; the new record was not persisted.");
+                        pending.Completion.TrySetResult(false);
+                        continue;
+                    }
+
                     await stream.WriteAsync(line).ConfigureAwait(false);
                     await stream.WriteAsync("\n"u8.ToArray()).ConfigureAwait(false);
                     await stream.FlushAsync().ConfigureAwait(false);
                     lock (_historyIndexGate)
                     {
                         _historyIndexes.Remove(path);
+                    }
+                    lock (_searchIndexGate)
+                    {
+                        _searchIndexes.Remove(path);
                     }
                     pending.Completion.TrySetResult(true);
                 }
@@ -662,7 +916,24 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             if (line.Length > _maximumRecordBytes) continue;
             ConversationLogRecord? record;
             try { record = JsonSerializer.Deserialize<ConversationLogRecord>(line, JsonOptions); } catch (JsonException) { continue; }
-            if (record is not null && record.Text.Length <= ConfigurationLimits.MaximumLogRecordBytes) yield return record;
+            if (ConversationLogRecordValidation.IsReadable(record) && record!.Text.Length <= ConfigurationLimits.MaximumLogRecordBytes) yield return record;
+        }
+    }
+
+    private async IAsyncEnumerable<LocatedConversationLogRecord> ReadFileWithPositionsAsync(
+        string path,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken,
+        long startOffset = 0,
+        long? endOffset = null)
+    {
+        await foreach (var line in JsonlHistoryIndex.ReadLinesWithOffsetsAsync(path, _maximumRecordBytes, cancellationToken, startOffset, endOffset).ConfigureAwait(false))
+        {
+            ConversationLogRecord? record;
+            try { record = JsonSerializer.Deserialize<ConversationLogRecord>(line.Bytes, JsonOptions); } catch (JsonException) { continue; }
+            if (ConversationLogRecordValidation.IsReadable(record) && record!.Text.Length <= ConfigurationLimits.MaximumLogRecordBytes)
+            {
+                yield return new LocatedConversationLogRecord(record, line.Offset, line.Bytes.Length);
+            }
         }
     }
 
@@ -672,14 +943,108 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         return Path.Combine(_root, scopeId.ToString("N"), $"{hash}.jsonl");
     }
 
-    private static bool Matches(ConversationLogRecord record, ConversationLogQuery query, string text) =>
-        (string.IsNullOrEmpty(text) || record.Text.Contains(text, StringComparison.OrdinalIgnoreCase) || record.Sender?.Contains(text, StringComparison.OrdinalIgnoreCase) == true)
-        && (query.NetworkId is null || record.NetworkId == query.NetworkId)
-        && (query.ProfileId is null || record.ProfileId == query.ProfileId || record.ScopeId == query.ProfileId)
-        && (query.ConversationKind is null || record.ConversationKind == query.ConversationKind)
-        && (string.IsNullOrWhiteSpace(query.ConversationName) || IrcIdentity.Equals(record.ConversationName, query.ConversationName, IrcCaseMapping.Rfc1459))
-        && (query.From is null || record.Timestamp >= query.From)
-        && (query.To is null || record.Timestamp <= query.To);
+    private IEnumerable<string> EnumerateSearchPaths(ConversationLogQuery query, out bool filesTruncated)
+    {
+        filesTruncated = false;
+        if (query.Scope == ConversationLogSearchScope.CurrentConversation
+            && query.HistoryScopeId is Guid conversationScope
+            && query.ConversationKind is LogConversationKind conversationKind
+            && !string.IsNullOrWhiteSpace(query.ConversationName))
+        {
+            return [GetPath(conversationScope, ConversationLoggingService.BuildConversationKey(conversationKind, query.ConversationName))];
+        }
+
+        var knownScope = query.HistoryScopeId ?? query.ProfileId;
+        var searchRoot = knownScope is Guid scopeId
+            ? Path.Combine(_root, scopeId.ToString("N"))
+            : _root;
+        if (!Directory.Exists(searchRoot))
+        {
+            return [];
+        }
+
+        var paths = Directory.EnumerateFiles(searchRoot, "*.jsonl", SearchOption.AllDirectories).Take(4097).ToArray();
+        filesTruncated = paths.Length > 4096;
+        return paths.Take(4096);
+    }
+
+    private async Task<SearchIndexLoadResult?> GetSearchIndexAsync(string path, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var sourceInfo = new FileInfo(path);
+            if (!sourceInfo.Exists
+                || sourceInfo.Length < ConfigurationLimits.MinimumHistoryIndexFileBytes
+                || sourceInfo.Length > ConfigurationLimits.MaximumHistoryFileBytes)
+            {
+                return null;
+            }
+
+            lock (_searchIndexGate)
+            {
+                if (_searchIndexes.TryGetValue(path, out var cached)
+                    && cached.SourceLength == sourceInfo.Length
+                    && cached.SourceLastWriteTicks == sourceInfo.LastWriteTimeUtc.Ticks
+                    && JsonlSearchIndex.IsSidecarCurrent(JsonlSearchIndex.GetSidecarPath(path), cached))
+                {
+                    return new SearchIndexLoadResult(cached, 0);
+                }
+            }
+
+            if (!JsonlSearchIndex.TryLoad(path, out var loaded) || loaded is null)
+            {
+                return null;
+            }
+
+            if (JsonlSearchIndex.IsSidecarCurrent(JsonlSearchIndex.GetSidecarPath(path), loaded))
+            {
+                lock (_searchIndexGate)
+                {
+                    _searchIndexes[path] = loaded;
+                }
+            }
+
+            return new SearchIndexLoadResult(loaded, 0);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+        {
+            SetDiagnostic($"Conversation search index was ignored safely: {exception.Message}");
+            return null;
+        }
+    }
+
+    private static bool IsSearchBlockEligible(JsonlSearchIndexBlock block, ConversationLogQuery query, string text) =>
+        (query.From is null || block.MaximumTimestampTicks >= query.From.Value.UtcTicks)
+        && (query.To is null || block.MinimumTimestampTicks <= query.To.Value.UtcTicks)
+        && (!JsonlSearchIndex.CanUseTextFilter(text) || JsonlSearchIndex.MayContain(block, text));
+
+    internal static bool Matches(ConversationLogRecord record, ConversationLogQuery query, string text)
+    {
+        if (query.Scope == ConversationLogSearchScope.CurrentConversation
+            && (query.NetworkId is null || string.IsNullOrWhiteSpace(query.ConversationName)
+                || record.NetworkId != query.NetworkId
+                || query.ConversationKind is not null && record.ConversationKind != query.ConversationKind
+                || !IrcIdentity.Equals(record.ConversationName, query.ConversationName, IrcCaseMapping.Rfc1459)))
+        {
+            return false;
+        }
+
+        if (query.Scope == ConversationLogSearchScope.CurrentNetwork && (query.NetworkId is null || record.NetworkId != query.NetworkId))
+        {
+            return false;
+        }
+
+        return (string.IsNullOrEmpty(text) || record.Text.Contains(text, StringComparison.OrdinalIgnoreCase) || record.Sender?.Contains(text, StringComparison.OrdinalIgnoreCase) == true)
+            && (query.NetworkId is null || record.NetworkId == query.NetworkId)
+            && (query.HistoryScopeId is null || record.ScopeId == query.HistoryScopeId)
+            && (query.ProfileId is null || record.ProfileId == query.ProfileId || record.ScopeId == query.ProfileId)
+            && (query.ConversationKind is null || record.ConversationKind == query.ConversationKind)
+            && (string.IsNullOrWhiteSpace(query.ConversationName) || IrcIdentity.Equals(record.ConversationName, query.ConversationName, IrcCaseMapping.Rfc1459))
+            && (string.IsNullOrWhiteSpace(query.Sender) || record.Sender is not null && IrcCaseMappingComparer.Equals(record.Sender, query.Sender, IrcCaseMapping.Rfc1459))
+            && (query.MessageKind is null || record.MessageKind == query.MessageKind)
+            && (query.From is null || record.Timestamp >= query.From)
+            && (query.To is null || record.Timestamp <= query.To);
+    }
 
     private static string Preview(string text, string query)
     {
@@ -712,6 +1077,8 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
 
     private void SetDiagnostic(string diagnostic) { lock (_diagnosticGate) _lastDiagnostic = diagnostic; }
     private sealed record PendingWrite(ConversationLogRecord? Record, TaskCompletionSource<bool> Completion);
+    private sealed record LocatedConversationLogRecord(ConversationLogRecord Record, long Offset, int Length);
+    private sealed record SearchIndexLoadResult(JsonlSearchIndexSnapshot Snapshot, long BuildMilliseconds);
 
     private async Task<HistoryPage?> TryReadIndexedPageAsync(
         string path,
@@ -785,7 +1152,8 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             {
                 if (_historyIndexes.TryGetValue(path, out var cached)
                     && cached.SourceLength == sourceInfo.Length
-                    && cached.SourceLastWriteTicks == sourceInfo.LastWriteTimeUtc.Ticks)
+                    && cached.SourceLastWriteTicks == sourceInfo.LastWriteTimeUtc.Ticks
+                    && JsonlHistoryIndex.IsSidecarCurrent(JsonlHistoryIndex.GetSidecarPath(path), cached))
                 {
                     return cached;
                 }
@@ -839,8 +1207,8 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                 stream.Position = entry.Offset;
                 await stream.ReadExactlyAsync(bytes, cancellationToken).ConfigureAwait(false);
                 var record = JsonSerializer.Deserialize<ConversationLogRecord>(bytes, JsonOptions);
-                if (record is null
-                    || record.Text.Length > ConfigurationLimits.MaximumLogRecordBytes
+                if (!ConversationLogRecordValidation.IsReadable(record)
+                    || record!.Text.Length > ConfigurationLimits.MaximumLogRecordBytes
                     || record.ScopeId != scopeId
                     || record.ConversationKind != conversationKind
                     || !IrcIdentity.Equals(record.ConversationName, conversationName, IrcCaseMapping.Rfc1459)
@@ -892,6 +1260,65 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             SetDiagnostic("Conversation history index cleanup was deferred safely.");
         }
     }
+
+    private void InvalidateSearchIndex(string path)
+    {
+        lock (_searchIndexGate)
+        {
+            _searchIndexes.Remove(path);
+        }
+
+        try
+        {
+            var sidecarPath = JsonlSearchIndex.GetSidecarPath(path);
+            if (File.Exists(sidecarPath))
+            {
+                File.Delete(sidecarPath);
+            }
+        }
+        catch (IOException)
+        {
+            SetDiagnostic("Conversation search index cleanup was deferred safely.");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            SetDiagnostic("Conversation search index cleanup was deferred safely.");
+        }
+    }
+}
+
+internal sealed class SearchResultCollector
+{
+    private readonly PriorityQueue<Candidate, (long TimestampTicks, long Sequence)> _candidates = new();
+    private readonly int _maximumCandidates;
+    private long _sequence;
+
+    public SearchResultCollector(int maximumCandidates)
+    {
+        _maximumCandidates = Math.Max(1, maximumCandidates);
+    }
+
+    public long MatchingRecords { get; private set; }
+
+    public IReadOnlyList<ConversationLogSearchResult> Results => _candidates.UnorderedItems
+        .Select(item => item.Element)
+        .OrderByDescending(item => item.Result.Timestamp)
+        .ThenByDescending(item => item.Sequence)
+        .Select(item => item.Result)
+        .ToArray();
+
+    public void Add(ConversationLogSearchResult result)
+    {
+        MatchingRecords++;
+        var candidate = new Candidate(result, _sequence++);
+        _candidates.Enqueue(candidate, (result.Timestamp.UtcTicks, candidate.Sequence));
+        if (_candidates.Count > _maximumCandidates)
+        {
+            _candidates.Dequeue();
+        }
+    }
+
+    private sealed record Candidate(ConversationLogSearchResult Result, long Sequence);
 }
 
 internal static class HistoryPageSelector
@@ -998,27 +1425,56 @@ public sealed class InMemoryConversationLogStore : IConversationLogStore
 
     public ValueTask<IReadOnlyList<ConversationLogSearchResult>> SearchAsync(ConversationLogQuery query, CancellationToken cancellationToken = default)
     {
+        return SearchAsyncCore(query, cancellationToken);
+    }
+
+    private async ValueTask<IReadOnlyList<ConversationLogSearchResult>> SearchAsyncCore(ConversationLogQuery query, CancellationToken cancellationToken)
+    {
+        var page = await SearchDetailedAsync(query, cancellationToken).ConfigureAwait(false);
+        return page.Results;
+    }
+
+    public ValueTask<ConversationLogSearchPage> SearchDetailedAsync(ConversationLogQuery query, CancellationToken cancellationToken = default)
+    {
         ArgumentNullException.ThrowIfNull(query);
+        cancellationToken.ThrowIfCancellationRequested();
         var text = query.Text?.Trim() ?? string.Empty;
         if (text.Length > ConfigurationLimits.MaximumSearchQueryLength)
         {
-            return ValueTask.FromResult<IReadOnlyList<ConversationLogSearchResult>>(Array.Empty<ConversationLogSearchResult>());
+            return ValueTask.FromResult(new ConversationLogSearchPage(
+                Array.Empty<ConversationLogSearchResult>(),
+                new ConversationLogSearchStatistics(0, 0, 0, 0, 0, false, false)));
         }
 
-        var result = Records.Where(record => (string.IsNullOrEmpty(text) || record.Text.Contains(text, StringComparison.OrdinalIgnoreCase) || record.Sender?.Contains(text, StringComparison.OrdinalIgnoreCase) == true)
-                && (query.NetworkId is null || record.NetworkId == query.NetworkId)
-                && (query.ProfileId is null || record.ProfileId == query.ProfileId || record.ScopeId == query.ProfileId)
-                && (query.ConversationKind is null || record.ConversationKind == query.ConversationKind)
-                && (string.IsNullOrWhiteSpace(query.ConversationName) || IrcIdentity.Equals(record.ConversationName, query.ConversationName, IrcCaseMapping.Rfc1459))
-                && (query.From is null || record.Timestamp >= query.From)
-                && (query.To is null || record.Timestamp <= query.To))
-            .OrderByDescending(record => record.Timestamp)
-            .Skip(Math.Clamp(query.Skip, 0, ConfigurationLimits.MaximumSearchResults))
-            .Take(Math.Clamp(query.MaximumResults, 1, ConfigurationLimits.MaximumSearchResults))
-            .Select(record => new ConversationLogSearchResult(record, record.Text.Length > 240 ? record.Text[..240] : record.Text))
-            .ToArray();
-        return ValueTask.FromResult<IReadOnlyList<ConversationLogSearchResult>>(result);
+        var maximum = Math.Clamp(query.MaximumResults, 1, ConfigurationLimits.MaximumSearchResults);
+        var skip = Math.Clamp(query.Skip, 0, ConfigurationLimits.MaximumSearchResults);
+        var collector = new SearchResultCollector(Math.Min(ConfigurationLimits.MaximumSearchResults * 2, maximum + skip));
+        var examined = 0L;
+        foreach (var record in Records)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            examined++;
+            if (JsonlConversationLogStore.Matches(record, query, text))
+            {
+                collector.Add(new ConversationLogSearchResult(record, Preview(record.Text, text)));
+            }
+        }
+
+        var results = collector.Results.Skip(skip).Take(maximum).ToArray();
+        return ValueTask.FromResult(new ConversationLogSearchPage(
+            results,
+            new ConversationLogSearchStatistics(
+                examined,
+                0,
+                0,
+                collector.MatchingRecords,
+                results.Length,
+                collector.MatchingRecords > (long)skip + maximum,
+                false)));
     }
+
+    private static string Preview(string text, string query) =>
+        text.Length > 240 ? text[..240] : text;
 
     public ValueTask<int> CleanupAsync(DateTimeOffset olderThan, CancellationToken cancellationToken = default)
     {

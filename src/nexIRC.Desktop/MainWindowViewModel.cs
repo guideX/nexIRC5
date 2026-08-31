@@ -457,10 +457,22 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
-    public async Task<IReadOnlyList<ConversationLogSearchResult>> SearchLogsAsync(ConversationLogQuery query)
+    public async Task<IReadOnlyList<ConversationLogSearchResult>> SearchLogsAsync(ConversationLogQuery query, CancellationToken cancellationToken = default)
     {
         if (Sessions.LogStore is null) return Array.Empty<ConversationLogSearchResult>();
-        return await Sessions.LogStore.SearchAsync(query).ConfigureAwait(true);
+        return await Sessions.LogStore.SearchAsync(query, cancellationToken).ConfigureAwait(true);
+    }
+
+    public async Task<ConversationLogSearchPage> SearchLogsDetailedAsync(ConversationLogQuery query, CancellationToken cancellationToken = default)
+    {
+        if (Sessions.LogStore is null)
+        {
+            return new ConversationLogSearchPage(
+                Array.Empty<ConversationLogSearchResult>(),
+                new ConversationLogSearchStatistics(0, 0, 0, 0, 0, false, false));
+        }
+
+        return await Sessions.LogStore.SearchDetailedAsync(query, cancellationToken).ConfigureAwait(true);
     }
 
     public async Task<IReadOnlyList<ConversationLogRecord>> LoadHistoryPageAsync(
@@ -474,20 +486,20 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         return await Sessions.LogStore.ReadPageAsync(scopeId, kind, conversationName, pageSize, before).ConfigureAwait(true);
     }
 
-    public async Task<HistoryPage> LoadHistoryWindowAsync(HistoryPageRequest request)
+    public async Task<HistoryPage> LoadHistoryWindowAsync(HistoryPageRequest request, CancellationToken cancellationToken = default)
     {
         if (Sessions.LogStore is null) return HistoryPage.Empty;
-        return await Sessions.LogStore.ReadPageWindowAsync(request).ConfigureAwait(true);
+        return await Sessions.LogStore.ReadPageWindowAsync(request, cancellationToken).ConfigureAwait(true);
     }
 
-    public async Task<ConversationHistoryRange> ExportHistoryAsync(HistoryExportRequest request, string path, HistoryExportFormat format)
+    public async Task<ConversationHistoryRange> ExportHistoryAsync(HistoryExportRequest request, string path, HistoryExportFormat format, CancellationToken cancellationToken = default)
     {
         if (Sessions.LogStore is null)
         {
             return new ConversationHistoryRange(Array.Empty<ConversationLogRecord>(), false);
         }
 
-        var result = await ConversationLoggingService.ExportAsync(Sessions.LogStore, request, path, format).ConfigureAwait(true);
+        var result = await ConversationLoggingService.ExportAsync(Sessions.LogStore, request, path, format, cancellationToken: cancellationToken).ConfigureAwait(true);
         StatusText = result.IsTruncated ? "History exported with the configured size bound." : "History exported.";
         return result;
     }
@@ -495,16 +507,18 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public bool RouteLogSearchResult(ConversationLogSearchResult result)
         => RouteLogSearchResultAsync(result).GetAwaiter().GetResult();
 
-    public async Task<bool> RouteLogSearchResultAsync(ConversationLogSearchResult result)
+    public async Task<bool> RouteLogSearchResultAsync(ConversationLogSearchResult result, CancellationToken cancellationToken = default)
     {
-        var network = Sessions.Networks.FirstOrDefault(item => item.Id == result.Record.NetworkId)
-            ?? (result.Record.ProfileId is Guid profileId ? Sessions.Networks.FirstOrDefault(item => item.ProfileId == profileId) : null);
+        ArgumentNullException.ThrowIfNull(result);
+        var network = Sessions.Networks.FirstOrDefault(item => item.Id == result.NetworkId)
+            ?? (result.ProfileId is Guid profileId ? Sessions.Networks.FirstOrDefault(item => item.ProfileId == profileId) : null);
         if (network is not null)
         {
-            WorkspaceView view = result.Record.ConversationKind switch
+            cancellationToken.ThrowIfCancellationRequested();
+            WorkspaceView view = result.ConversationKind switch
             {
-                LogConversationKind.Channel => Sessions.EnsureChannel(network.Id, result.Record.ConversationName),
-                LogConversationKind.PrivateConversation => Sessions.EnsureQuery(network.Id, result.Record.ConversationName),
+                LogConversationKind.Channel => Sessions.OpenHistoricalConversation(network.Id, DestinationKind.Channel, result.ConversationName),
+                LogConversationKind.PrivateConversation => Sessions.OpenHistoricalConversation(network.Id, DestinationKind.Query, result.ConversationName),
                 _ => network.StatusView
             };
             SelectView(view);
@@ -512,14 +526,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             {
                 var page = await store.ReadPageWindowAsync(new HistoryPageRequest
                 {
-                    ScopeId = result.Record.ScopeId,
-                    ConversationKind = result.Record.ConversationKind,
-                    ConversationName = result.Record.ConversationName,
+                    ScopeId = result.Location.ScopeId,
+                    ConversationKind = result.ConversationKind,
+                    ConversationName = result.ConversationName,
                     PageSize = ConfigurationLimits.MaximumHistoryContextEntries,
-                    Around = result.Record.Timestamp
-                }).ConfigureAwait(true);
+                    Around = result.Timestamp
+                }, cancellationToken).ConfigureAwait(true);
                 view.SetHistoryContext(
-                    page.Records.Select(record => new HistoryContextEntry(record, IsSameHistoryRecord(record, result.Record))),
+                    page.Records.Select(record => new HistoryContextEntry(record, IsSameHistoryRecord(record, result))),
                     result.Preview);
             }
             else
@@ -527,7 +541,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 view.SetHistoryContext([new HistoryContextEntry(result.Record, true)], result.Preview);
             }
 
-            StatusText = $"Opened {result.Record.ConversationName} with surrounding history.";
+            StatusText = $"Opened {result.ConversationName} with surrounding history.";
             return true;
         }
 
@@ -848,6 +862,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         && string.Equals(left.Sender, right.Sender, StringComparison.Ordinal)
         && string.Equals(left.Text, right.Text, StringComparison.Ordinal)
         && left.Direction == right.Direction;
+
+    private static bool IsSameHistoryRecord(ConversationLogRecord record, ConversationLogSearchResult result) =>
+        record.Timestamp == result.Timestamp
+        && string.Equals(record.Sender, result.Sender, StringComparison.Ordinal)
+        && record.MessageKind == result.MessageKind
+        && record.Text.Contains(result.Preview.TrimStart('…'), StringComparison.Ordinal)
+        && record.ConversationKind == result.ConversationKind
+        && nexIRC.Core.State.IrcCaseMappingComparer.Equals(record.ConversationName, result.ConversationName, nexIRC.Core.State.IrcCaseMapping.Rfc1459);
 
     private async Task SavePreferencesAsync()
     {

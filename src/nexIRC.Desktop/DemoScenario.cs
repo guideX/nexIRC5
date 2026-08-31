@@ -134,6 +134,19 @@ public sealed class DemoScenario
 
         if (sessions.LogStore is { } logs)
         {
+            var historyScope = alpha.ProfileId ?? alpha.Id;
+            var betaHistoryScope = beta.ProfileId ?? beta.Id;
+            foreach (var record in new[]
+            {
+                DemoRecord(alpha.Id, historyScope, LogConversationKind.Channel, "#lounge", 500_101, "same-target marker from AlphaNet", "Mira"),
+                DemoRecord(beta.Id, betaHistoryScope, LogConversationKind.Channel, "#lounge", 500_102, "same-target marker from BetaNet", "Rook"),
+                DemoRecord(alpha.Id, historyScope, LogConversationKind.Channel, "#history-00", 500_103, "reopen historical marker", "Mira"),
+                DemoRecord(alpha.Id, historyScope, LogConversationKind.PrivateConversation, "Mira", 500_104, "private search marker", "Rook")
+            })
+            {
+                await logs.AppendAsync(record).ConfigureAwait(true);
+            }
+
             for (var index = 0; index < 5_000; index++)
             {
                 await logs.AppendAsync(new ConversationLogRecord
@@ -152,6 +165,30 @@ public sealed class DemoScenario
                 }).ConfigureAwait(true);
             }
             await logs.FlushAsync().ConfigureAwait(true);
+            var currentConversationResults = await logs.SearchDetailedAsync(new ConversationLogQuery
+            {
+                Scope = ConversationLogSearchScope.CurrentConversation,
+                HistoryScopeId = historyScope,
+                NetworkId = alpha.Id,
+                ConversationKind = LogConversationKind.Channel,
+                ConversationName = "#alpha",
+                Text = "Demo history page",
+                Sender = "Mira",
+                From = DateTimeOffset.UnixEpoch.AddMinutes(499_000),
+                To = DateTimeOffset.UnixEpoch.AddMinutes(500_000)
+            }).ConfigureAwait(true);
+            var crossConversationResults = await logs.SearchDetailedAsync(new ConversationLogQuery
+            {
+                Scope = ConversationLogSearchScope.AllHistory,
+                Text = "same-target marker",
+                MaximumResults = 10
+            }).ConfigureAwait(true);
+            if (currentConversationResults.Results.Count == 0
+                || crossConversationResults.Results.Select(result => result.NetworkId).Distinct().Count() != 2)
+            {
+                throw new InvalidOperationException("The deterministic demo history search scenarios did not return the expected records.");
+            }
+
             var results = await logs.SearchAsync(new ConversationLogQuery { Text = "Welcome", NetworkId = alpha.Id }).ConfigureAwait(true);
             var result = results.Count > 0 ? results[0] : null;
             if (result is not null)
@@ -162,12 +199,12 @@ public sealed class DemoScenario
                     WorkspaceViewKind.Channel,
                     IrcNotificationType.Status,
                     WorkspaceActivity.None,
-                    result.Record.Sender,
+                    result.Sender,
                     result.Preview,
-                    result.Record.Timestamp,
+                    result.Timestamp,
                     false,
                     nameof(DemoScenario),
-                    Activation: new NotificationActivationTarget(alpha.Id, alpha.ProfileId, Guid.Empty, WorkspaceViewKind.Channel, result.Record.ConversationName)));
+                    Activation: new NotificationActivationTarget(alpha.Id, alpha.ProfileId, Guid.Empty, WorkspaceViewKind.Channel, result.ConversationName)));
             }
         }
 
@@ -177,6 +214,21 @@ public sealed class DemoScenario
             if (index % 2 == 0)
             {
                 sessions.CloseView(historical.Id);
+            }
+        }
+
+        if (sessions.LogStore is { } searchLogs)
+        {
+            var reopened = alpha.Channels.FirstOrDefault(channel => channel.Channel == "#history-00");
+            if (reopened is not null)
+            {
+                sessions.CloseView(reopened.Id);
+            }
+
+            var reopenResults = await searchLogs.SearchAsync(new ConversationLogQuery { Text = "reopen historical marker", NetworkId = alpha.Id }).ConfigureAwait(true);
+            if (reopenResults.Count == 0 || !await viewModel.RouteLogSearchResultAsync(reopenResults[0]).ConfigureAwait(true))
+            {
+                throw new InvalidOperationException("The deterministic demo could not reopen a historical search result.");
             }
         }
 
@@ -213,6 +265,28 @@ public sealed class DemoScenario
         DesiredChannels = channels.ToHashSet(StringComparer.Ordinal),
         Reconnect = new ReconnectPolicy(Enabled: false)
     };
+
+    private static ConversationLogRecord DemoRecord(
+        Guid networkId,
+        Guid scopeId,
+        LogConversationKind conversationKind,
+        string conversationName,
+        int minute,
+        string text,
+        string sender) => new()
+        {
+            Timestamp = DateTimeOffset.UnixEpoch.AddMinutes(minute),
+            NetworkId = networkId,
+            ScopeId = scopeId,
+            ProfileId = scopeId,
+            ConversationKind = conversationKind,
+            ConversationName = conversationName,
+            ConversationKey = ConversationLoggingService.BuildConversationKey(conversationKind, conversationName),
+            Sender = sender,
+            MessageKind = LogMessageKind.Message,
+            Direction = LogDirection.Incoming,
+            Text = text
+        };
 
     private static void Register(FakeIrcTransport transport, string server, string nickname, string network, string prefix)
     {
