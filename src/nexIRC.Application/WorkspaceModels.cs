@@ -226,6 +226,7 @@ public abstract class WorkspaceView : ObservableObject
     private bool _isActive;
     private bool _isViewOpen = true;
     private ConversationLifecycleState _lifecycleState = ConversationLifecycleState.HistoricalOnly;
+    private DateTimeOffset _lastActivity;
     private string? _historyContextMatch;
 
     protected WorkspaceView(Guid networkId, Guid id, WorkspaceViewKind kind, string title)
@@ -261,6 +262,12 @@ public abstract class WorkspaceView : ObservableObject
                 OnPropertyChanged(nameof(DisplayLabel));
             }
         }
+    }
+
+    public DateTimeOffset LastActivity
+    {
+        get => _lastActivity;
+        private set => SetProperty(ref _lastActivity, value);
     }
 
     public bool IsActive
@@ -326,6 +333,7 @@ public abstract class WorkspaceView : ObservableObject
 
     internal void Append(TranscriptEntry entry, bool markActivity = true, WorkspaceActivity? activity = null)
     {
+        LastActivity = entry.Timestamp;
         lock (_entriesGate)
         {
             Entries.Add(entry);
@@ -1014,6 +1022,20 @@ public sealed class NetworkWorkspace : ObservableObject
 
         view.ReopenView();
         InsertView(view);
+    }
+
+    internal void RemoveConversation(WorkspaceView view)
+    {
+        view.CloseView();
+        Views.Remove(view);
+        if (view is ChannelView channel)
+        {
+            Channels.Remove(channel);
+        }
+        else if (view is QueryView query)
+        {
+            Queries.Remove(query);
+        }
     }
 
     private void InsertView(WorkspaceView view)

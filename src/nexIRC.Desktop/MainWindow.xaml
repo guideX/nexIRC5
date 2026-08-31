@@ -11,6 +11,16 @@
         WindowStartupLocation="CenterScreen"
         Background="#F5F6F8"
         Closing="OnClosing" Loaded="OnLoaded">
+    <Window.InputBindings>
+        <KeyBinding Key="Tab" Modifiers="Control" Command="{Binding NextConversationCommand}" />
+        <KeyBinding Key="Tab" Modifiers="Control+Shift" Command="{Binding PreviousConversationCommand}" />
+        <KeyBinding Key="PageDown" Modifiers="Control+Alt" Command="{Binding NextUnreadCommand}" />
+        <KeyBinding Key="PageUp" Modifiers="Control+Alt" Command="{Binding PreviousUnreadCommand}" />
+        <KeyBinding Key="PageDown" Modifiers="Control+Alt+Shift" Command="{Binding NextHighlightCommand}" />
+        <KeyBinding Key="PageUp" Modifiers="Control+Alt+Shift" Command="{Binding PreviousHighlightCommand}" />
+        <KeyBinding Key="Left" Modifiers="Alt" Command="{Binding BackConversationCommand}" />
+        <KeyBinding Key="Right" Modifiers="Alt" Command="{Binding ForwardConversationCommand}" />
+    </Window.InputBindings>
     <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BooleanToVisibility" />
         <Style x:Key="PaneHeader" TargetType="TextBlock">
@@ -80,16 +90,16 @@
         </DataTemplate>
         <DataTemplate DataType="{x:Type app:ChannelView}">
             <TextBlock Margin="4,2" ToolTip="{Binding LifecycleText}">
-                <Run Text="{Binding StateMarker}" />
+                <Run Text="{Binding StateMarker, Mode=OneWay}" />
                 <Run Text=" " />
-                <Run Text="{Binding DisplayLabel}" />
+                <Run Text="{Binding DisplayLabel, Mode=OneWay}" />
             </TextBlock>
         </DataTemplate>
         <DataTemplate DataType="{x:Type app:QueryView}">
             <TextBlock Margin="4,2" ToolTip="{Binding LifecycleText}">
-                <Run Text="{Binding StateMarker}" />
+                <Run Text="{Binding StateMarker, Mode=OneWay}" />
                 <Run Text=" " />
-                <Run Text="{Binding DisplayLabel}" />
+                <Run Text="{Binding DisplayLabel, Mode=OneWay}" />
             </TextBlock>
         </DataTemplate>
         <HierarchicalDataTemplate DataType="{x:Type app:NetworkWorkspace}" ItemsSource="{Binding Views}">
@@ -118,9 +128,9 @@
                 <Border Background="#E2E8F0" CornerRadius="4" Padding="10,7" Margin="0,0,0,8">
                     <StackPanel>
                         <TextBlock FontSize="19" FontWeight="SemiBold" Foreground="#172033">
-                            <Run Text="{Binding StateMarker}" />
+                            <Run Text="{Binding StateMarker, Mode=OneWay}" />
                             <Run Text=" " />
-                            <Run Text="{Binding Channel}" />
+                            <Run Text="{Binding Channel, Mode=OneWay}" />
                         </TextBlock>
                         <TextBlock Text="{Binding TopicText}" Foreground="#475569" TextTrimming="CharacterEllipsis" />
                         <TextBlock Text="{Binding LifecycleText, StringFormat=Conversation: {0}}" Foreground="#64748B" FontSize="11" />
@@ -162,9 +172,9 @@
                 </Grid.RowDefinitions>
                 <StackPanel Margin="0,0,0,8">
                     <TextBlock FontSize="19" FontWeight="SemiBold" Foreground="#172033">
-                        <Run Text="{Binding StateMarker}" />
+                        <Run Text="{Binding StateMarker, Mode=OneWay}" />
                         <Run Text=" " />
-                        <Run Text="{Binding Nickname}" />
+                        <Run Text="{Binding Nickname, Mode=OneWay}" />
                     </TextBlock>
                     <TextBlock Text="{Binding LifecycleText, StringFormat=Private conversation · {0}}" Foreground="#64748B" />
                 </StackPanel>
@@ -306,6 +316,15 @@
             <MenuItem Header="_Window">
                 <MenuItem Header="_Next View" Command="{Binding NextViewCommand}" />
                 <MenuItem Header="_Previous View" Command="{Binding PreviousViewCommand}" />
+                <Separator />
+                <MenuItem Header="Next conversation" Command="{Binding NextConversationCommand}" InputGestureText="Ctrl+Tab" />
+                <MenuItem Header="Previous conversation" Command="{Binding PreviousConversationCommand}" InputGestureText="Ctrl+Shift+Tab" />
+                <MenuItem Header="Next unread" Command="{Binding NextUnreadCommand}" InputGestureText="Ctrl+Alt+PageDown" />
+                <MenuItem Header="Previous unread" Command="{Binding PreviousUnreadCommand}" InputGestureText="Ctrl+Alt+PageUp" />
+                <MenuItem Header="Next highlight / priority" Command="{Binding NextHighlightCommand}" InputGestureText="Ctrl+Alt+Shift+PageDown" />
+                <MenuItem Header="Previous highlight / priority" Command="{Binding PreviousHighlightCommand}" InputGestureText="Ctrl+Alt+Shift+PageUp" />
+                <MenuItem Header="Conversation back" Command="{Binding BackConversationCommand}" InputGestureText="Alt+Left" />
+                <MenuItem Header="Conversation forward" Command="{Binding ForwardConversationCommand}" InputGestureText="Alt+Right" />
             </MenuItem>
             <MenuItem Header="_Help">
                 <MenuItem Header="About nexIRC" Click="OnAboutClick" />
@@ -328,7 +347,7 @@
         <StatusBar DockPanel.Dock="Bottom" Visibility="{Binding IsStatusBarVisible, Converter={StaticResource BooleanToVisibility}}">
             <StatusBarItem Content="{Binding StatusText}" />
             <Separator />
-             <StatusBarItem Content="nexIRC 5 · Phase 1G" />
+             <StatusBarItem Content="nexIRC 5 · Phase 1H" />
         </StatusBar>
 
         <Grid>
@@ -339,6 +358,23 @@
             </Grid.ColumnDefinitions>
             <Border Grid.Column="0" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="0,0,1,0" Visibility="{Binding IsNetworkTreeVisible, Converter={StaticResource BooleanToVisibility}}">
                 <DockPanel>
+                    <Expander DockPanel.Dock="Bottom" Header="Conversation switcher" IsExpanded="True" MaxHeight="270" Margin="5,0,5,8">
+                        <ListBox ItemsSource="{Binding ConversationNavigator}" BorderThickness="0" KeyboardNavigation.TabNavigation="Local">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <Button Command="{Binding DataContext.ActivateConversationCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                            CommandParameter="{Binding}" HorizontalContentAlignment="Stretch" Padding="4,3" BorderThickness="0" Background="Transparent"
+                                            ToolTip="{Binding AccessibleText}">
+                                        <DockPanel>
+                                            <TextBlock DockPanel.Dock="Left" Text="{Binding StateMarker, Mode=OneWay}" Width="20" />
+                                            <TextBlock Text="{Binding DisplayText}" TextTrimming="CharacterEllipsis" />
+                                            <TextBlock DockPanel.Dock="Right" Text="{Binding ActivityText}" Foreground="#64748B" Margin="8,0,0,0" />
+                                        </DockPanel>
+                                    </Button>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </Expander>
                     <TextBlock DockPanel.Dock="Top" Text="NETWORKS &amp; WINDOWS" Style="{StaticResource PaneHeader}" />
                     <TreeView x:Name="WorkspaceTree" ItemsSource="{Binding Networks}" SelectedItemChanged="OnTreeSelectionChanged" Margin="5,0,5,8" />
                 </DockPanel>

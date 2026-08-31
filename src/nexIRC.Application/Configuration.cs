@@ -36,6 +36,10 @@ public static class ConfigurationLimits
     public const int MaximumHistoryPageSize = 100;
     public const int MaximumHistoryContextEntries = 100;
     public const int MaximumHistoryExportRecords = 10_000;
+    public const long MaximumHistoryFileBytes = 256L * 1024 * 1024;
+    public const int MaximumHistoryIndexEntries = 1_000_000;
+    public const int MinimumHistoryIndexFileBytes = 1 * 1024 * 1024;
+    public const int MaximumConversationNavigationHistory = 64;
     public const int MaximumDraftLength = 4096;
     public const int MaximumLogRecordBytes = 32_768;
     public const int MaximumNotificationCoalescingEntries = 256;

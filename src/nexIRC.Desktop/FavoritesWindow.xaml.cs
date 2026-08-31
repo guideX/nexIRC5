@@ -1,5 +1,6 @@
 using System.Windows;
 using nexIRC.Application;
+using nexIRC.Core.State;
 
 namespace nexIRC.Desktop;
 
@@ -12,11 +13,12 @@ public sealed record DestinationListItem(
     string? Label,
     DateTimeOffset? LastOpened = null,
     Guid GroupId = default,
-    string? GroupName = null)
+    string? GroupName = null,
+    string? LifecycleText = null)
 {
     public string DisplayText => LastOpened is null
-        ? $"{GroupName ?? "General"} · {NetworkName} · {Name}{(string.IsNullOrWhiteSpace(Label) ? string.Empty : $" — {Label}")}"
-        : $"{NetworkName} · {Name} ({LastOpened.Value.ToLocalTime():g})";
+        ? $"{GroupName ?? "General"} · {NetworkName} · {Name}{(string.IsNullOrWhiteSpace(Label) ? string.Empty : $" — {Label}")} [{LifecycleText ?? "not open"}]"
+        : $"{NetworkName} · {Name} [{LifecycleText ?? "not open"}] ({LastOpened.Value.ToLocalTime():g})";
 }
 
 public partial class FavoritesWindow : Window
@@ -37,10 +39,12 @@ public partial class FavoritesWindow : Window
         if (GroupBox.SelectedItem is null) GroupBox.SelectedItem = groups.FirstOrDefault();
         var favorites = _viewModel.Networks.SelectMany(network => _viewModel.Sessions.Favorites(network.Id)
                 .Select(item => new DestinationListItem(item.Id, network.Id, item.Kind, item.Name, network.DisplayName, item.Label, null,
-                    item.GroupId, groups.FirstOrDefault(group => group.Id == item.GroupId)?.Name)))
+                    item.GroupId, groups.FirstOrDefault(group => group.Id == item.GroupId)?.Name,
+                    FindLifecycle(network, item.Kind, item.Name))))
             .ToArray();
         var recents = _viewModel.Networks.SelectMany(network => _viewModel.Sessions.RecentDestinations(network.Id)
-                .Select(item => new DestinationListItem(Guid.Empty, network.Id, item.Kind, item.Name, network.DisplayName, null, item.LastOpened)))
+                .Select(item => new DestinationListItem(Guid.Empty, network.Id, item.Kind, item.Name, network.DisplayName, null, item.LastOpened,
+                    LifecycleText: FindLifecycle(network, item.Kind, item.Name))))
             .OrderByDescending(item => item.LastOpened)
             .ToArray();
         FavoritesList.ItemsSource = favorites;
@@ -52,6 +56,18 @@ public partial class FavoritesWindow : Window
         var item = FavoritesList.SelectedItem as DestinationListItem ?? RecentsList.SelectedItem as DestinationListItem;
         if (item is null) return;
         await _viewModel.OpenDestinationAsync(item.NetworkId, item.Kind, item.Name);
+        Close();
+    }
+
+    private async void OnJoinClick(object sender, RoutedEventArgs e)
+    {
+        var item = FavoritesList.SelectedItem as DestinationListItem ?? RecentsList.SelectedItem as DestinationListItem;
+        if (item is null || item.Kind != DestinationKind.Channel)
+        {
+            return;
+        }
+
+        await _viewModel.OpenDestinationAsync(item.NetworkId, item.Kind, item.Name, joinIfNeeded: true);
         Close();
     }
 
@@ -132,4 +148,13 @@ public partial class FavoritesWindow : Window
             Refresh();
         }
     }
+
+    private static string? FindLifecycle(NetworkWorkspace network, DestinationKind kind, string name) =>
+        network.Channels.Cast<WorkspaceView>()
+            .Concat(network.Queries)
+            .Where(view =>
+            view.Kind == (kind == DestinationKind.Channel ? WorkspaceViewKind.Channel : WorkspaceViewKind.Query)
+            && IrcCaseMappingComparer.Equals(view.Title, name, network.Snapshot.Features.CaseMapping))
+            .Select(view => view.IsViewOpen ? view.LifecycleText : $"{view.LifecycleText}, closed view")
+            .FirstOrDefault();
 }

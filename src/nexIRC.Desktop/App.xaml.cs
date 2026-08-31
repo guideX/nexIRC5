@@ -64,7 +64,7 @@ public partial class App : System.Windows.Application
         {
             try
             {
-                await demoScenario.SeedAsync(window.ViewModel.Sessions);
+                await demoScenario.SeedAsync(window.ViewModel);
             }
             catch (Exception exception)
             {

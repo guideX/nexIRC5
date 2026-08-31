@@ -17,6 +17,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private readonly ConversationLoggingService? _logging;
     private readonly IConversationLogStore? _logStore;
     private readonly NotificationCoalescer _notificationCoalescer = new();
+    private readonly ConversationNavigationHistory _navigationHistory = new();
     private readonly bool _ownsNotifications;
     private readonly bool _ownsLogStore;
     private long _operationSequence;
@@ -76,6 +77,20 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     }
 
     public event EventHandler<WorkspaceActivityEventArgs>? ActivityRaised;
+
+    public event EventHandler? NavigationChanged;
+
+    public IReadOnlyList<ConversationIdentity> NavigationHistory => _navigationHistory.Entries;
+
+    public IReadOnlyList<ConversationNavigationItem> GetConversationNavigator(ConversationOrderingMode ordering = ConversationOrderingMode.Workspace)
+    {
+        var items = Networks
+            .SelectMany(network => network.Views.Select(view => CreateNavigationItem(network, view)))
+            .ToArray();
+        return ordering == ConversationOrderingMode.RecentActivity
+            ? items.OrderByDescending(item => item.LastActivity).ThenBy(item => item.NetworkDisplayName, StringComparer.OrdinalIgnoreCase).ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase).ToArray()
+            : items;
+    }
 
     public NetworkWorkspace Add(NetworkConnectionOptions options)
     {
@@ -143,10 +158,26 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     public WorkspaceView OpenHistoricalConversation(Guid networkId, DestinationKind kind, string name)
     {
         var workspace = GetWorkspace(networkId);
+        var existing = kind == DestinationKind.Channel
+            ? workspace.Channels.Any(channel => IrcCaseMappingComparer.Equals(channel.Channel, name, workspace.Snapshot.Features.CaseMapping))
+            : workspace.Queries.Any(query => IrcCaseMappingComparer.Equals(query.Nickname, name, workspace.Snapshot.Features.CaseMapping));
         WorkspaceView view = kind == DestinationKind.Channel
             ? workspace.EnsureChannel(name)
             : workspace.EnsureQuery(name);
-        view.SetLifecycleState(ConversationLifecycleState.HistoricalOnly);
+        if (!existing && view is ChannelView channel && !channel.IsJoined)
+        {
+            view.SetLifecycleState(ConversationLifecycleState.HistoricalOnly);
+        }
+        else if (!existing && view is QueryView)
+        {
+            view.SetLifecycleState(ConversationLifecycleState.HistoricalOnly);
+        }
+
+        if (!view.IsViewOpen)
+        {
+            workspace.ReopenView(view);
+        }
+
         ActivateView(view.Id);
         return view;
     }
@@ -331,14 +362,58 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     public void ActivateView(Guid viewId)
     {
+        ActivateViewCore(viewId, recordNavigation: true);
+    }
+
+    public bool NavigateBack()
+    {
+        if (!_navigationHistory.TryGoBack(IsOpenIdentityAvailable, out var identity) || identity is null)
+        {
+            return false;
+        }
+
+        return TryActivateIdentity(identity);
+    }
+
+    public bool NavigateForward()
+    {
+        if (!_navigationHistory.TryGoForward(IsOpenIdentityAvailable, out var identity) || identity is null)
+        {
+            return false;
+        }
+
+        return TryActivateIdentity(identity);
+    }
+
+    public bool NavigateNextConversation() => ActivateRelativeConversation(1);
+
+    public bool NavigatePreviousConversation() => ActivateRelativeConversation(-1);
+
+    public bool NavigateNextUnread() => ActivateMatchingView(view => view.Activity != WorkspaceActivity.None, 1);
+
+    public bool NavigatePreviousUnread() => ActivateMatchingView(view => view.Activity != WorkspaceActivity.None, -1);
+
+    public bool NavigateNextHighlight() => ActivateMatchingView(view => view.Activity == WorkspaceActivity.Important, 1);
+
+    public bool NavigatePreviousHighlight() => ActivateMatchingView(view => view.Activity == WorkspaceActivity.Important, -1);
+
+    private void ActivateViewCore(Guid viewId, bool recordNavigation)
+    {
         if (!TryGetView(viewId, out var workspace, out var view) || workspace is null || view is null)
         {
             return;
         }
 
+        if (recordNavigation && ActiveView is not null && !ReferenceEquals(ActiveView, view))
+        {
+            _navigationHistory.Record(ConversationIdentity.From(ActiveView));
+        }
+
         workspace.Activate(view);
         ActiveNetwork = workspace;
         ActiveView = view;
+        _navigationHistory.Record(ConversationIdentity.From(view));
+        NotifyNavigationChanged();
     }
 
     public bool ReopenView(Guid viewId)
@@ -357,6 +432,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
             workspace.ReopenView(view);
             ActivateView(view.Id);
+            NotifyNavigationChanged();
             return true;
         }
 
@@ -374,6 +450,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         {
             // Closing a view only changes presentation. The logical
             // conversation remains addressable for reopen/history routing.
+            RecordRecent(workspace, view is ChannelView ? DestinationKind.Channel : DestinationKind.Query, ConversationIdentity.From(view).Name);
             workspace.Close(view);
         }
         else if (view is WhoisView whois)
@@ -394,6 +471,57 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             ActivateView(workspace.StatusView.Id);
         }
 
+        NotifyNavigationChanged();
+
+        return true;
+    }
+
+    public async ValueTask<bool> PartAndCloseAsync(Guid viewId, string? reason = null, CancellationToken cancellationToken = default)
+    {
+        if (!TryGetView(viewId, out var workspace, out var view) || workspace is null || view is not ChannelView channel)
+        {
+            return false;
+        }
+
+        await workspace.Session.PartChannelAsync(channel.Channel, reason, cancellationToken).ConfigureAwait(false);
+        channel.SetLifecycleState(ConversationLifecycleState.Parted);
+        return CloseView(viewId);
+    }
+
+    public bool RemoveHistoricalConversation(Guid viewId)
+    {
+        if (!TryGetView(viewId, out var workspace, out var view) || workspace is null || view is null
+            || view is not (ChannelView or QueryView)
+            || view.LifecycleState is ConversationLifecycleState.Joined or ConversationLifecycleState.Active)
+        {
+            return false;
+        }
+
+        if (Configuration is not null)
+        {
+            Configuration.RemoveRecent(new RecentDestination
+            {
+                ScopeId = workspace.ProfileId ?? workspace.Id,
+                Kind = view is ChannelView ? DestinationKind.Channel : DestinationKind.Query,
+                Name = ConversationIdentity.From(view).Name
+            });
+            SaveConfigurationInBackground();
+        }
+
+        var wasActive = ReferenceEquals(ActiveView, view);
+        workspace.RemoveConversation(view);
+        if (wasActive)
+        {
+            ActiveView = null;
+        }
+
+        _navigationHistory.Remove(ConversationIdentity.From(view));
+        if (wasActive)
+        {
+            ActivateView(workspace.StatusView.Id);
+        }
+
+        NotifyNavigationChanged();
         return true;
     }
 
@@ -401,9 +529,15 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     {
         var workspace = GetWorkspace(networkId);
         var view = workspace.EnsureChannel(channel);
+        if (!view.IsViewOpen)
+        {
+            workspace.ReopenView(view);
+        }
+
         ActivateView(view.Id);
         RecordRecent(workspace, DestinationKind.Channel, channel);
         await workspace.Session.RejoinChannelAsync(view.Channel, cancellationToken).ConfigureAwait(false);
+        NotifyNavigationChanged();
     }
 
     public IReadOnlyList<FavoriteDestination> Favorites(Guid networkId, DestinationKind? kind = null)
@@ -623,6 +757,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             }
         }
 
+        _navigationHistory.RemoveNetwork(networkId);
+        NotifyNavigationChanged();
+
         await StopEntryAsync(entry, "nexIRC network removed").ConfigureAwait(false);
         DisposeCredentialProviders(entry.Options);
     }
@@ -674,6 +811,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         {
             _logging?.Record(workspace.Id, workspace.ProfileId, view, entry);
         }
+
+        NotifyNavigationChanged();
     }
 
     internal WhoisView? RouteWhoisEvent(NetworkWorkspace workspace, IrcWhoisEvent item)
@@ -1144,6 +1283,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             }
 
             entry.Workspace.StatusView.Append(new TranscriptEntry(DateTimeOffset.Now, kind, null, text));
+            NotifyNavigationChanged();
             if (change.Current == ServerSessionState.Failed)
             {
                 Notifications.Publish(new IrcNotification(
@@ -1364,6 +1504,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             }
         }
 
+        NotifyNavigationChanged();
+
         var notification = new IrcNotification(
             view.NetworkId,
             view.Id,
@@ -1427,6 +1569,101 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         IrcServerErrorEvent or IrcUnknownCommandEvent or IrcUnknownNumericEvent => IrcNotificationType.Error,
         _ => IrcNotificationType.Status
     };
+
+    private ConversationNavigationItem CreateNavigationItem(NetworkWorkspace network, WorkspaceView view) => new(
+        ConversationIdentity.From(view),
+        view.Id,
+        network.DisplayName,
+        network.NetworkName ?? network.Snapshot.Features.NetworkName ?? network.Snapshot.Identity.NetworkName ?? network.DisplayName,
+        view is ChannelView channel ? channel.Channel : view is QueryView query ? query.Nickname : view.Title,
+        view.Kind,
+        view.Activity,
+        view.LifecycleState,
+        view.IsViewOpen,
+        view.LastActivity);
+
+    private bool IsOpenIdentityAvailable(ConversationIdentity identity) => Networks
+        .Where(network => network.Id == identity.NetworkId)
+        .SelectMany(network => network.Views)
+        .Any(view => ConversationIdentity.From(view).SameAs(identity));
+
+    private bool TryActivateIdentity(ConversationIdentity identity)
+    {
+        var view = Networks
+            .Where(network => network.Id == identity.NetworkId)
+            .SelectMany(network => network.Views)
+            .FirstOrDefault(candidate => ConversationIdentity.From(candidate).SameAs(identity));
+        if (view is null)
+        {
+            return false;
+        }
+
+        ActivateViewCore(view.Id, recordNavigation: false);
+        return true;
+    }
+
+    private bool ActivateRelativeConversation(int delta)
+    {
+        if (delta == 0)
+        {
+            return false;
+        }
+
+        var views = Networks.SelectMany(network => network.Views).ToArray();
+        if (views.Length == 0)
+        {
+            return false;
+        }
+
+        var currentIndex = ActiveView is null ? (delta > 0 ? -1 : 0) : Array.IndexOf(views, ActiveView);
+        if (currentIndex < 0)
+        {
+            currentIndex = delta > 0 ? -1 : 0;
+        }
+
+        var nextIndex = (currentIndex + delta + views.Length) % views.Length;
+        ActivateViewCore(views[nextIndex].Id, recordNavigation: true);
+        return true;
+    }
+
+    private bool ActivateMatchingView(Func<WorkspaceView, bool> predicate, int delta)
+    {
+        var views = Networks.SelectMany(network => network.Views).ToArray();
+        if (views.Length == 0 || delta == 0)
+        {
+            return false;
+        }
+
+        var currentIndex = ActiveView is null ? (delta > 0 ? -1 : 0) : Array.IndexOf(views, ActiveView);
+        if (currentIndex < 0)
+        {
+            currentIndex = delta > 0 ? -1 : 0;
+        }
+
+        for (var offset = 1; offset <= views.Length; offset++)
+        {
+            var index = (currentIndex + (delta * offset) + (views.Length * 2)) % views.Length;
+            if (predicate(views[index]))
+            {
+                ActivateViewCore(views[index].Id, recordNavigation: true);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void NotifyNavigationChanged()
+    {
+        try
+        {
+            NavigationChanged?.Invoke(this, EventArgs.Empty);
+        }
+        catch
+        {
+            // Navigation observers are presentation boundaries.
+        }
+    }
 
     private static string MessageText(nexIRC.Core.Protocol.IrcMessage message) => message.HasTrailingParameter
         ? message.TrailingParameter ?? string.Empty

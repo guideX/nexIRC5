@@ -27,8 +27,10 @@ public sealed class DemoScenario
         return factory;
     }
 
-    public async Task SeedAsync(NetworkSessionManager sessions)
+    public async Task SeedAsync(MainWindowViewModel viewModel)
     {
+        ArgumentNullException.ThrowIfNull(viewModel);
+        var sessions = viewModel.Sessions;
         var alphaProfile = new NetworkProfile
         {
             Id = Guid.NewGuid(),
@@ -109,6 +111,8 @@ public sealed class DemoScenario
         sessions.AddFavorite(alpha.Id, DestinationKind.Channel, "#lounge", "Alpha parted example", groupId);
         sessions.AddFavorite(beta.Id, DestinationKind.Channel, "#lounge", "Beta lounge", groupId);
         sessions.AddFavorite(alpha.Id, DestinationKind.Query, "Mira", "Alpha private conversation", groupId);
+        sessions.AddFavorite(alpha.Id, DestinationKind.Channel, "#history-00", "Historical-only example", groupId);
+        sessions.AddFavorite(beta.Id, DestinationKind.Query, "Mira", "Same nickname on BetaNet", groupId);
         sessions.RecordRecent(alpha, DestinationKind.Channel, "#alpha");
         sessions.RecordRecent(alpha, DestinationKind.Query, "Mira");
         sessions.RecordRecent(beta, DestinationKind.Channel, "#lounge");
@@ -130,11 +134,11 @@ public sealed class DemoScenario
 
         if (sessions.LogStore is { } logs)
         {
-            for (var index = 0; index < 125; index++)
+            for (var index = 0; index < 5_000; index++)
             {
                 await logs.AppendAsync(new ConversationLogRecord
                 {
-                    Timestamp = DateTimeOffset.UtcNow.AddMinutes(-index),
+                    Timestamp = DateTimeOffset.UnixEpoch.AddMinutes(500_000 - index),
                     NetworkId = alpha.Id,
                     ScopeId = alpha.ProfileId ?? alpha.Id,
                     ProfileId = alpha.ProfileId,
@@ -166,6 +170,34 @@ public sealed class DemoScenario
                     Activation: new NotificationActivationTarget(alpha.Id, alpha.ProfileId, Guid.Empty, WorkspaceViewKind.Channel, result.Record.ConversationName)));
             }
         }
+
+        for (var index = 0; index < 12; index++)
+        {
+            var historical = sessions.OpenHistoricalConversation(alpha.Id, DestinationKind.Channel, $"#history-{index:00}");
+            if (index % 2 == 0)
+            {
+                sessions.CloseView(historical.Id);
+            }
+        }
+
+        for (var index = 0; index < 6; index++)
+        {
+            sessions.OpenHistoricalConversation(beta.Id, DestinationKind.Query, $"ArchiveNick{index:00}");
+        }
+
+        var closedQuery = sessions.EnsureQuery(alpha.Id, "ClosedMira");
+        sessions.ActivateView(closedQuery.Id);
+        sessions.CloseView(closedQuery.Id);
+        sessions.OpenHistoricalConversation(alpha.Id, DestinationKind.Query, "ClosedMira");
+
+        var alphaChannelForDraft = sessions.EnsureChannel(alpha.Id, "#alpha");
+        viewModel.SelectView(alphaChannelForDraft);
+        viewModel.PrepareInput("Draft stays with AlphaNet/#alpha while navigating.");
+        var betaQueryForDraft = sessions.EnsureQuery(beta.Id, "Mira");
+        viewModel.SelectView(betaQueryForDraft);
+        viewModel.PrepareInput("BetaNet/Mira has an independent draft.");
+
+        await sessions.DisconnectAsync(beta.Id).ConfigureAwait(true);
 
         sessions.ActivateView(alpha.StatusView.Id);
     }

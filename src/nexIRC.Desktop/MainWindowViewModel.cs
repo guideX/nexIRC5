@@ -60,19 +60,39 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         ListCommand = new RelayCommand(() => InputText = "/list ");
         NextViewCommand = new RelayCommand(() => ActivateRelativeView(1), () => Sessions.Networks.Count > 0);
         PreviousViewCommand = new RelayCommand(() => ActivateRelativeView(-1), () => Sessions.Networks.Count > 0);
+        ActivateConversationCommand = new ParameterizedRelayCommand(ActivateConversation, parameter => parameter is ConversationNavigationItem);
+        NextConversationCommand = new RelayCommand(() => { Sessions.NavigateNextConversation(); }, () => Sessions.Networks.Count > 0);
+        PreviousConversationCommand = new RelayCommand(() => { Sessions.NavigatePreviousConversation(); }, () => Sessions.Networks.Count > 0);
+        NextUnreadCommand = new RelayCommand(() => { Sessions.NavigateNextUnread(); }, () => Sessions.Networks.Count > 0);
+        PreviousUnreadCommand = new RelayCommand(() => { Sessions.NavigatePreviousUnread(); }, () => Sessions.Networks.Count > 0);
+        NextHighlightCommand = new RelayCommand(() => { Sessions.NavigateNextHighlight(); }, () => Sessions.Networks.Count > 0);
+        PreviousHighlightCommand = new RelayCommand(() => { Sessions.NavigatePreviousHighlight(); }, () => Sessions.Networks.Count > 0);
+        BackConversationCommand = new RelayCommand(() => { Sessions.NavigateBack(); }, () => Sessions.Networks.Count > 0);
+        ForwardConversationCommand = new RelayCommand(() => { Sessions.NavigateForward(); }, () => Sessions.Networks.Count > 0);
         ExitCommand = new RelayCommand(() => ExitRequested?.Invoke());
 
         HighlightPolicy.PropertyChanged += (_, _) => SavePreferencesInBackground();
 
-        Sessions.Networks.CollectionChanged += (_, _) =>
+        Sessions.Networks.CollectionChanged += (_, args) =>
         {
+            if (args.OldItems is not null)
+            {
+                foreach (var oldNetwork in args.OldItems.OfType<NetworkWorkspace>())
+                {
+                    RemoveDraftsForNetwork(oldNetwork.Id);
+                }
+            }
+
             if (ActiveView is null && Sessions.Networks.Count > 0)
             {
                 SelectView(Sessions.Networks[0].StatusView);
             }
 
             RefreshCommandStates();
+            RefreshConversationNavigator();
         };
+        Sessions.NavigationChanged += OnNavigationChanged;
+        RefreshConversationNavigator();
     }
 
     public event Func<Task>? NewConnectionRequested;
@@ -90,6 +110,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public IReadOnlyList<AliasDefinition> Aliases => Configuration?.Aliases ?? Array.Empty<AliasDefinition>();
 
     public ObservableCollection<NetworkWorkspace> Networks => Sessions.Networks;
+
+    public ObservableCollection<ConversationNavigationItem> ConversationNavigator { get; } = [];
 
     public InputHistory InputHistory { get; }
 
@@ -168,6 +190,24 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public ICommand NextViewCommand { get; }
 
     public ICommand PreviousViewCommand { get; }
+
+    public ICommand ActivateConversationCommand { get; }
+
+    public ICommand NextConversationCommand { get; }
+
+    public ICommand PreviousConversationCommand { get; }
+
+    public ICommand NextUnreadCommand { get; }
+
+    public ICommand PreviousUnreadCommand { get; }
+
+    public ICommand NextHighlightCommand { get; }
+
+    public ICommand PreviousHighlightCommand { get; }
+
+    public ICommand BackConversationCommand { get; }
+
+    public ICommand ForwardConversationCommand { get; }
 
     public ICommand ExitCommand { get; }
 
@@ -401,23 +441,20 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     public bool ReorderFavorite(Guid favoriteId, int delta) => Sessions.ReorderFavorite(favoriteId, delta);
 
-    public async Task OpenDestinationAsync(Guid networkId, DestinationKind kind, string name)
+    public async Task OpenDestinationAsync(Guid networkId, DestinationKind kind, string name, bool joinIfNeeded = false)
     {
         if (!Sessions.TryGet(networkId, out var network) || network is null)
         {
             return;
         }
 
-        WorkspaceView view = kind == DestinationKind.Channel
-            ? Sessions.EnsureChannel(networkId, name)
-            : Sessions.EnsureQuery(networkId, name);
+        var view = Sessions.OpenHistoricalConversation(networkId, kind, name);
         SelectView(view);
         Sessions.RecordRecent(network, kind, name);
-        if (kind == DestinationKind.Channel && view is ChannelView channel && !channel.IsJoined)
+        if (joinIfNeeded && kind == DestinationKind.Channel && view is ChannelView channel && !channel.IsJoined)
         {
             await network.Session.JoinChannelAsync(name).ConfigureAwait(true);
         }
-        await Task.CompletedTask;
     }
 
     public async Task<IReadOnlyList<ConversationLogSearchResult>> SearchLogsAsync(ConversationLogQuery query)
@@ -576,6 +613,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
         SaveDraft();
         Sessions.ActivateView(view.Id);
+        if (!ReferenceEquals(Sessions.ActiveView, view))
+        {
+            return;
+        }
         ActiveView = view;
         InputText = _drafts.TryGetValue((view.NetworkId, view.Id), out var draft) ? draft : string.Empty;
         StatusText = $"{view.Title} · {view.Kind}";
@@ -585,6 +626,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             SavePreferencesInBackground();
         }
         RefreshCommandStates();
+        RefreshConversationNavigator();
     }
 
     public async Task SubmitInputAsync()
@@ -638,6 +680,55 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
 
         return closed;
+    }
+
+    public async Task<bool> PartAndCloseActiveAsync()
+    {
+        if (ActiveView is not ChannelView channel)
+        {
+            return false;
+        }
+
+        SaveDraft();
+        var closed = await Sessions.PartAndCloseAsync(channel.Id).ConfigureAwait(true);
+        if (closed)
+        {
+            ActiveView = Sessions.ActiveView;
+            InputText = ActiveView is not null && _drafts.TryGetValue((ActiveView.NetworkId, ActiveView.Id), out var draft) ? draft : string.Empty;
+            StatusText = $"Parted and closed {channel.Channel}.";
+            RefreshCommandStates();
+        }
+
+        return closed;
+    }
+
+    public bool ReopenConversation(WorkspaceView view)
+    {
+        ArgumentNullException.ThrowIfNull(view);
+        var reopened = Sessions.ReopenView(view.Id);
+        if (reopened)
+        {
+            SelectView(view);
+            StatusText = $"Reopened {view.Title}.";
+        }
+
+        return reopened;
+    }
+
+    public bool RemoveHistoricalConversation(WorkspaceView view)
+    {
+        ArgumentNullException.ThrowIfNull(view);
+        var removed = Sessions.RemoveHistoricalConversation(view.Id);
+        if (removed)
+        {
+            _drafts.Remove((view.NetworkId, view.Id));
+            ActiveView = Sessions.ActiveView;
+            InputText = ActiveView is not null && _drafts.TryGetValue((ActiveView.NetworkId, ActiveView.Id), out var draft) ? draft : string.Empty;
+            StatusText = $"Removed {view.Title} from the workspace; stored history was kept.";
+            RefreshCommandStates();
+        }
+
+        return removed;
     }
 
     public void NavigateInputHistory(InputHistoryDirection direction)
@@ -709,6 +800,47 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
 
         _drafts[(ActiveView.NetworkId, ActiveView.Id)] = InputText[..Math.Min(InputText.Length, ConfigurationLimits.MaximumDraftLength)];
+    }
+
+    private void RemoveDraftsForNetwork(Guid networkId)
+    {
+        foreach (var key in _drafts.Keys.Where(key => key.NetworkId == networkId).ToArray())
+        {
+            _drafts.Remove(key);
+        }
+    }
+
+    private void ActivateConversation(object? parameter)
+    {
+        if (parameter is ConversationNavigationItem item)
+        {
+            SelectView(item.ViewId);
+        }
+    }
+
+    private void OnNavigationChanged(object? sender, EventArgs e)
+    {
+        if (_uiDispatcher.CheckAccess())
+        {
+            RefreshConversationNavigator();
+            RefreshCommandStates();
+            return;
+        }
+
+        _uiDispatcher.BeginInvoke(new Action(() =>
+        {
+            RefreshConversationNavigator();
+            RefreshCommandStates();
+        }));
+    }
+
+    private void RefreshConversationNavigator()
+    {
+        ConversationNavigator.Clear();
+        foreach (var item in Sessions.GetConversationNavigator())
+        {
+            ConversationNavigator.Add(item);
+        }
     }
 
     private static bool IsSameHistoryRecord(ConversationLogRecord left, ConversationLogRecord right) =>
@@ -792,6 +924,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         (PartCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
         (NextViewCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
         (PreviousViewCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
+        (NextConversationCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
+        (PreviousConversationCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
+        (NextUnreadCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
+        (PreviousUnreadCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
+        (NextHighlightCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
+        (PreviousHighlightCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
+        (BackConversationCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
+        (ForwardConversationCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
     }
 
     private abstract class RelayCommandBase : ICommand
@@ -813,6 +953,16 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         public override bool CanExecute(object? parameter) => _canExecute();
 
         public override void Execute(object? parameter) => _execute();
+    }
+
+    private sealed class ParameterizedRelayCommand(Action<object?> execute, Func<object?, bool>? canExecute = null) : RelayCommandBase
+    {
+        private readonly Action<object?> _execute = execute;
+        private readonly Func<object?, bool> _canExecute = canExecute ?? (_ => true);
+
+        public override bool CanExecute(object? parameter) => _canExecute(parameter);
+
+        public override void Execute(object? parameter) => _execute(parameter);
     }
 
     private sealed class AsyncRelayCommand(Func<Task> execute, Func<bool>? canExecute = null) : RelayCommandBase

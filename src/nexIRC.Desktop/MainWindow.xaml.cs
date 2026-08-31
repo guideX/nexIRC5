@@ -223,24 +223,36 @@ public partial class MainWindow : Window
             };
             if (view is ChannelView channel)
             {
-                actions.Add((channel.IsJoined ? "Part" : "Join", () => ViewModel.ExecuteInputAsync(channel.IsJoined ? $"/part {channel.Channel}" : $"/join {channel.Channel}")));
-                actions.Add(("Rejoin", () => ViewModel.ExecuteInputAsync($"/rejoin {channel.Channel}")));
+                if (channel.IsJoined)
+                {
+                    actions.Add(("PART (keep view)", () => ViewModel.ExecuteInputAsync($"/part {channel.Channel}")));
+                    actions.Add(("PART and close", () => ViewModel.PartAndCloseActiveAsync()));
+                    actions.Add(("Close view without PART", () => { ViewModel.CloseActiveView(); return Task.CompletedTask; }));
+                }
+                else
+                {
+                    actions.Add(("Reopen view", () => { ViewModel.ReopenConversation(channel); return Task.CompletedTask; }));
+                    actions.Add(("Rejoin channel", () => ViewModel.ExecuteInputAsync($"/rejoin {channel.Channel}")));
+                    if (channel.LifecycleState is ConversationLifecycleState.HistoricalOnly or ConversationLifecycleState.Parted)
+                    {
+                        actions.Add(("Remove historical view", () => { ViewModel.RemoveHistoricalConversation(channel); return Task.CompletedTask; }));
+                    }
+                }
                 actions.Add((IsFavorite(viewNetwork, DestinationKind.Channel, channel.Channel) ? "Remove favorite" : "Add to favorites", () => ToggleFavorite(viewNetwork, channel, DestinationKind.Channel, channel.Channel)));
                 actions.Add(("Copy channel name", () => CopyText(channel.Channel)));
                 actions.Add(("Request channel modes", () => ViewModel.ExecuteInputAsync($"/mode {channel.Channel}")));
                 actions.Add(("Request topic", () => ViewModel.ExecuteInputAsync($"/topic {channel.Channel}")));
                 actions.Add(("Open LIST", () => ViewModel.ExecuteInputAsync("/list")));
-                actions.Add(("Open history", () => OpenHistory(channel)));
-                actions.Add(("Search this conversation", () => OpenHistory(channel)));
+                actions.Add(("History / search", () => OpenHistory(channel)));
+                actions.Add(("Export history", () => OpenHistory(channel)));
                 actions.Add(("Clear conversation display", () => { channel.ClearEntries(); return Task.CompletedTask; }));
-                actions.Add(("Close view (stay joined)", () => { ViewModel.CloseActiveView(); return Task.CompletedTask; }));
             }
             else if (view is QueryView query)
             {
                 actions.Add((IsFavorite(viewNetwork, DestinationKind.Query, query.Nickname) ? "Remove favorite" : "Add to favorites", () => ToggleFavorite(viewNetwork, query, DestinationKind.Query, query.Nickname)));
                 actions.Add(("Copy nickname", () => CopyText(query.Nickname)));
-                actions.Add(("Open history", () => OpenHistory(query)));
-                actions.Add(("Search this conversation", () => OpenHistory(query)));
+                actions.Add(("History / search", () => OpenHistory(query)));
+                actions.Add(("Export history", () => OpenHistory(query)));
                 actions.Add(("Clear conversation display", () => { query.ClearEntries(); return Task.CompletedTask; }));
                 actions.Add(("Close query", () => { ViewModel.CloseActiveView(); return Task.CompletedTask; }));
             }
