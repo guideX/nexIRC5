@@ -144,6 +144,20 @@ public sealed record ConversationLogSearchPage(
     IReadOnlyList<ConversationLogSearchResult> Results,
     ConversationLogSearchStatistics Statistics);
 
+public sealed record ConversationLogCleanupStatistics(
+    int SegmentsExamined,
+    int SegmentsDeleted,
+    int SegmentsRewritten,
+    int SegmentsSkipped,
+    long RecordsExamined,
+    long RecordsRemoved,
+    long BytesRead,
+    long BytesWritten,
+    bool FilesTruncated)
+{
+    public static ConversationLogCleanupStatistics Empty { get; } = new(0, 0, 0, 0, 0, 0, 0, 0, false);
+}
+
 public sealed record HistoryPageRequest
 {
     public required Guid ScopeId { get; init; }
@@ -389,6 +403,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
     };
     private readonly string _root;
     private readonly int _maximumRecordBytes;
+    private readonly long _maximumSegmentBytes;
     private readonly Channel<PendingWrite> _queue = Channel.CreateBounded<PendingWrite>(new BoundedChannelOptions(2048)
     {
         FullMode = BoundedChannelFullMode.DropWrite,
@@ -402,18 +417,25 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
     private readonly object _searchIndexGate = new();
     private readonly Dictionary<string, JsonlSearchIndexSnapshot> _searchIndexes = new(StringComparer.OrdinalIgnoreCase);
     private string? _lastDiagnostic;
+    private ConversationLogCleanupStatistics _lastCleanupStatistics = ConversationLogCleanupStatistics.Empty;
     private int _disposed;
 
-    public JsonlConversationLogStore(string root, int maximumRecordBytes = ConfigurationLimits.MaximumLogRecordBytes)
+    public JsonlConversationLogStore(
+        string root,
+        int maximumRecordBytes = ConfigurationLimits.MaximumLogRecordBytes,
+        long maximumSegmentBytes = ConfigurationLimits.DefaultHistorySegmentBytes)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(root);
         _root = Path.GetFullPath(root);
         _maximumRecordBytes = Math.Max(1024, maximumRecordBytes);
+        _maximumSegmentBytes = Math.Clamp(maximumSegmentBytes, 1024L, ConfigurationLimits.MaximumHistoryFileBytes);
         _writer = Task.Run(WriterAsync);
     }
 
     public string RootPath => _root;
+    public long MaximumSegmentBytes => _maximumSegmentBytes;
     public string? LastDiagnostic { get { lock (_diagnosticGate) return _lastDiagnostic; } }
+    public ConversationLogCleanupStatistics LastCleanupStatistics => Volatile.Read(ref _lastCleanupStatistics);
 
     public ValueTask<bool> AppendAsync(ConversationLogRecord record, CancellationToken cancellationToken = default)
     {
@@ -454,17 +476,115 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         ArgumentNullException.ThrowIfNull(request);
         await FlushAsync(cancellationToken).ConfigureAwait(false);
         var pageSize = Math.Clamp(request.PageSize, 1, ConfigurationLimits.MaximumHistoryPageSize);
-        var path = GetPath(request.ScopeId, ConversationLoggingService.BuildConversationKey(request.ConversationKind, request.ConversationName));
-        if (!File.Exists(path))
+        var conversationKey = ConversationLoggingService.BuildConversationKey(request.ConversationKind, request.ConversationName);
+        var paths = GetConversationPaths(request.ScopeId, conversationKey);
+        if (paths.Length == 0)
         {
             return HistoryPage.Empty;
         }
 
-        if (await TryReadIndexedPageAsync(path, request, pageSize, cancellationToken).ConfigureAwait(false) is { } indexedPage)
+        var selected = new List<ConversationLogRecord>(pageSize + 1);
+        var preferOldest = (request.After is not null || request.Oldest) && request.Around is null;
+        var hasOlder = false;
+        var hasNewer = false;
+        DateTimeOffset? discardedOldest = null;
+        DateTimeOffset? discardedNewest = null;
+        foreach (var path in paths)
         {
-            return indexedPage;
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!File.Exists(path))
+            {
+                continue;
+            }
+
+            var segmentPage = await TryReadIndexedPageAsync(path, request, pageSize, cancellationToken).ConfigureAwait(false)
+                ?? await ReadPageByScanAsync(path, request, pageSize, cancellationToken).ConfigureAwait(false);
+            if (segmentPage is not null && segmentPage.Records.Count > 0)
+            {
+                hasOlder |= segmentPage.HasOlder;
+                hasNewer |= segmentPage.HasNewer;
+                selected.AddRange(segmentPage.Records);
+                selected.Sort(request.Around is not null
+                    ? (left, right) => CompareAround(left, right, request.Around.Value)
+                    : preferOldest ? CompareAscending : CompareDescending);
+                while (selected.Count > pageSize)
+                {
+                    var discarded = selected[^1];
+                    selected.RemoveAt(selected.Count - 1);
+                    discardedOldest = discardedOldest is null || discarded.Timestamp < discardedOldest
+                        ? discarded.Timestamp
+                        : discardedOldest;
+                    discardedNewest = discardedNewest is null || discarded.Timestamp > discardedNewest
+                        ? discarded.Timestamp
+                        : discardedNewest;
+                }
+            }
         }
 
+        if (selected.Count == 0)
+        {
+            return HistoryPage.Empty;
+        }
+
+        var records = selected.OrderByDescending(record => record.Timestamp).ToArray();
+        var pageOldest = records[^1].Timestamp;
+        var pageNewest = records[0].Timestamp;
+        hasOlder |= discardedOldest < pageOldest;
+        hasNewer |= discardedNewest > pageNewest;
+        return new HistoryPage(records, hasOlder, hasNewer, pageOldest, pageNewest);
+    }
+
+    public async ValueTask<ConversationHistoryRange> ReadRangeAsync(HistoryExportRequest request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        await FlushAsync(cancellationToken).ConfigureAwait(false);
+        var maximum = Math.Clamp(request.MaximumRecords, 1, ConfigurationLimits.MaximumHistoryExportRecords);
+        var conversationKey = ConversationLoggingService.BuildConversationKey(request.ConversationKind, request.ConversationName);
+        var paths = GetConversationPaths(request.ScopeId, conversationKey);
+        if (paths.Length == 0)
+        {
+            return new ConversationHistoryRange(Array.Empty<ConversationLogRecord>(), false);
+        }
+
+        var records = new List<ConversationLogRecord>(Math.Min(maximum, ConfigurationLimits.MaximumHistoryPageSize));
+        var truncated = false;
+        foreach (var path in paths)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!File.Exists(path))
+            {
+                continue;
+            }
+
+            var segmentRecords = await ReadRangeFromSegmentAsync(path, request, maximum - records.Count, cancellationToken).ConfigureAwait(false);
+            if (segmentRecords is null)
+            {
+                continue;
+            }
+
+            if (segmentRecords.IsTruncated)
+            {
+                truncated = true;
+            }
+
+            records.AddRange(segmentRecords.Records);
+            if (records.Count >= maximum)
+            {
+                records = records.Take(maximum).ToList();
+                truncated = true;
+                break;
+            }
+        }
+
+        return new ConversationHistoryRange(records.OrderBy(record => record.Timestamp).ToArray(), truncated);
+    }
+
+    private async Task<HistoryPage?> ReadPageByScanAsync(
+        string path,
+        HistoryPageRequest request,
+        int pageSize,
+        CancellationToken cancellationToken)
+    {
         var selected = new List<ConversationLogRecord>(pageSize + 1);
         DateTimeOffset? oldest = null;
         DateTimeOffset? newest = null;
@@ -473,7 +593,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         {
             await foreach (var record in ReadFileAsync(path, cancellationToken).ConfigureAwait(false))
             {
-                if (record.ScopeId != request.ScopeId || record.ConversationKind != request.ConversationKind || !IrcIdentity.Equals(record.ConversationName, request.ConversationName, IrcCaseMapping.Rfc1459))
+                if (!IsConversationRecord(record, request.ScopeId, request.ConversationKind, request.ConversationName))
                 {
                     continue;
                 }
@@ -489,18 +609,11 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                     continue;
                 }
 
-                if (request.Around is not null)
-                {
-                    selected.Add(record);
-                    selected.Sort((left, right) => CompareAround(left, right, request.Around.Value));
-                    if (selected.Count > pageSize) selected.RemoveAt(selected.Count - 1);
-                }
-                else
-                {
-                    selected.Add(record);
-                    selected.Sort(preferOldest ? CompareAscending : CompareDescending);
-                    if (selected.Count > pageSize) selected.RemoveAt(selected.Count - 1);
-                }
+                selected.Add(record);
+                selected.Sort(request.Around is not null
+                    ? (left, right) => CompareAround(left, right, request.Around.Value)
+                    : preferOldest ? CompareAscending : CompareDescending);
+                if (selected.Count > pageSize) selected.RemoveAt(selected.Count - 1);
             }
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
@@ -511,7 +624,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         var records = selected.OrderByDescending(record => record.Timestamp).ToArray();
         if (records.Length == 0)
         {
-            return HistoryPage.Empty;
+            return null;
         }
 
         var pageOldest = records[^1].Timestamp;
@@ -519,15 +632,15 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         return new HistoryPage(records, oldest < pageOldest, newest > pageNewest, pageOldest, pageNewest);
     }
 
-    public async ValueTask<ConversationHistoryRange> ReadRangeAsync(HistoryExportRequest request, CancellationToken cancellationToken = default)
+    private async Task<SegmentRangeRead?> ReadRangeFromSegmentAsync(
+        string path,
+        HistoryExportRequest request,
+        int maximum,
+        CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(request);
-        await FlushAsync(cancellationToken).ConfigureAwait(false);
-        var maximum = Math.Clamp(request.MaximumRecords, 1, ConfigurationLimits.MaximumHistoryExportRecords);
-        var path = GetPath(request.ScopeId, ConversationLoggingService.BuildConversationKey(request.ConversationKind, request.ConversationName));
-        if (!File.Exists(path))
+        if (maximum <= 0)
         {
-            return new ConversationHistoryRange(Array.Empty<ConversationLogRecord>(), false);
+            return new SegmentRangeRead(Array.Empty<ConversationLogRecord>(), false);
         }
 
         var index = await GetHistoryIndexAsync(path, request.ScopeId, request.ConversationKind, request.ConversationName, cancellationToken).ConfigureAwait(false);
@@ -537,19 +650,16 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                 .Where(entry => request.From is null || entry.TimestampTicks >= request.From.Value.UtcTicks)
                 .Where(entry => request.To is null || entry.TimestampTicks <= request.To.Value.UtcTicks)
                 .ToArray();
-            var maximumIndexed = Math.Min(maximum, indexedEntries.Length);
             var indexedRecords = await ReadIndexedRecordsAsync(
                 path,
-                indexedEntries.Take(maximumIndexed),
+                indexedEntries.Take(Math.Min(maximum, indexedEntries.Length)),
                 request.ScopeId,
                 request.ConversationKind,
                 request.ConversationName,
                 cancellationToken).ConfigureAwait(false);
             if (indexedRecords is not null)
             {
-                return new ConversationHistoryRange(
-                    indexedRecords.OrderBy(record => record.Timestamp).ToArray(),
-                    indexedEntries.Length > maximum);
+                return new SegmentRangeRead(indexedRecords, indexedEntries.Length > maximum);
             }
         }
 
@@ -559,9 +669,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         {
             await foreach (var record in ReadFileAsync(path, cancellationToken).ConfigureAwait(false))
             {
-                if (record.ScopeId != request.ScopeId
-                    || record.ConversationKind != request.ConversationKind
-                    || !IrcIdentity.Equals(record.ConversationName, request.ConversationName, IrcCaseMapping.Rfc1459)
+                if (!IsConversationRecord(record, request.ScopeId, request.ConversationKind, request.ConversationName)
                     || request.From is not null && record.Timestamp < request.From.Value
                     || request.To is not null && record.Timestamp > request.To.Value)
                 {
@@ -582,8 +690,17 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             SetDiagnostic($"Conversation history export read failed safely: {exception.Message}");
         }
 
-        return new ConversationHistoryRange(records.OrderBy(record => record.Timestamp).ToArray(), truncated);
+        return new SegmentRangeRead(records, truncated);
     }
+
+    private static bool IsConversationRecord(
+        ConversationLogRecord record,
+        Guid scopeId,
+        LogConversationKind conversationKind,
+        string conversationName) =>
+        record.ScopeId == scopeId
+        && record.ConversationKind == conversationKind
+        && IrcIdentity.Equals(record.ConversationName, conversationName, IrcCaseMapping.Rfc1459);
 
     public async ValueTask<IReadOnlyList<ConversationLogSearchResult>> SearchAsync(ConversationLogQuery query, CancellationToken cancellationToken = default)
     {
@@ -768,71 +885,231 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
     {
         await FlushAsync(cancellationToken).ConfigureAwait(false);
         var removed = 0;
+        var statistics = new CleanupStatisticsAccumulator();
         if (!Directory.Exists(_root))
         {
+            Volatile.Write(ref _lastCleanupStatistics, statistics.ToRecord());
             return 0;
         }
 
-        foreach (var path in Directory.EnumerateFiles(_root, "*.jsonl", SearchOption.AllDirectories).Take(4096))
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var temporaryPath = $"{path}.{Guid.NewGuid():N}.tmp";
-            var retainedCount = 0;
-            var removedInFile = 0;
-            var readSucceeded = false;
-            try
+            foreach (var path in Directory.EnumerateFiles(_root, "*.jsonl", SearchOption.AllDirectories))
             {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (statistics.SegmentsExamined >= ConfigurationLimits.MaximumHistorySourceFiles)
                 {
-                    await using var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 8192, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                    await foreach (var record in ReadFileAsync(path, cancellationToken).ConfigureAwait(false))
-                    {
-                        if (record.Timestamp < olderThan)
-                        {
-                            removedInFile++;
-                            continue;
-                        }
+                    statistics.FilesTruncated = true;
+                    break;
+                }
 
-                        var line = JsonSerializer.SerializeToUtf8Bytes(record, JsonOptions);
-                        await stream.WriteAsync(line, cancellationToken).ConfigureAwait(false);
-                        await stream.WriteAsync("\n"u8.ToArray(), cancellationToken).ConfigureAwait(false);
-                        retainedCount++;
+                statistics.SegmentsExamined++;
+                RetentionScanResult scan;
+                try
+                {
+                    var sourceInfo = new FileInfo(path);
+                    if (!sourceInfo.Exists || sourceInfo.Length > ConfigurationLimits.MaximumHistoryFileBytes)
+                    {
+                        statistics.SegmentsSkipped++;
+                        continue;
                     }
 
-                    await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+                    scan = await ScanForRetentionAsync(path, olderThan, sourceInfo.Length, cancellationToken).ConfigureAwait(false);
+                    statistics.RecordsExamined += scan.RecordCount;
+                    statistics.BytesRead += scan.BytesRead;
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                {
+                    statistics.SegmentsSkipped++;
+                    SetDiagnostic($"Conversation history cleanup skipped a file safely: {exception.Message}");
+                    continue;
                 }
 
-                readSucceeded = true;
-                removed += removedInFile;
-                if (retainedCount == 0)
+                if (!scan.IsSafe)
                 {
-                    File.Delete(path);
-                    InvalidateHistoryIndex(path);
-                    InvalidateSearchIndex(path);
+                    statistics.SegmentsSkipped++;
+                    SetDiagnostic("Conversation history cleanup skipped a file containing malformed records safely.");
+                    continue;
                 }
-                else
+
+                if (scan.RecordCount == 0)
                 {
+                    if (scan.BytesRead == 0 && IsArchivedPath(path))
+                    {
+                        if (TryDeleteHistorySource(path))
+                        {
+                            statistics.SegmentsDeleted++;
+                        }
+                    }
+
+                    continue;
+                }
+
+                if (scan.RemovedCount == 0)
+                {
+                    continue;
+                }
+
+                if (scan.RetainedCount == 0 && IsArchivedPath(path))
+                {
+                    if (TryDeleteHistorySource(path))
+                    {
+                        removed += scan.RemovedCount;
+                        statistics.RecordsRemoved += scan.RemovedCount;
+                        statistics.SegmentsDeleted++;
+                    }
+
+                    continue;
+                }
+
+                var temporaryPath = $"{path}.{Guid.NewGuid():N}.tmp";
+                try
+                {
+                    var bytesWritten = await RewriteRetainedRecordsAsync(path, temporaryPath, olderThan, cancellationToken).ConfigureAwait(false);
                     File.Move(temporaryPath, path, true);
                     InvalidateHistoryIndex(path);
                     InvalidateSearchIndex(path);
+                    removed += scan.RemovedCount;
+                    statistics.RecordsRemoved += scan.RemovedCount;
+                    statistics.BytesRead += scan.BytesRead;
+                    statistics.BytesWritten += bytesWritten;
+                    statistics.SegmentsRewritten++;
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                {
+                    statistics.SegmentsSkipped++;
+                    SetDiagnostic($"Conversation history cleanup skipped a file safely: {exception.Message}");
+                }
+                finally
+                {
+                    try
+                    {
+                        if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+                    }
+                    catch (IOException)
+                    {
+                        SetDiagnostic("Conversation history cleanup temporary-file removal was deferred safely.");
+                    }
+                    catch (UnauthorizedAccessException)
+                    {
+                        SetDiagnostic("Conversation history cleanup temporary-file removal was deferred safely.");
+                    }
                 }
             }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-            {
-                SetDiagnostic($"Conversation history cleanup skipped a file safely: {exception.Message}");
-            }
-            finally
-            {
-                if (File.Exists(temporaryPath)) try { File.Delete(temporaryPath); } catch { }
-            }
-
-            if (!readSucceeded)
-            {
-                continue;
-            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            SetDiagnostic($"Conversation history cleanup enumeration failed safely: {exception.Message}");
+        }
+        finally
+        {
+            Volatile.Write(ref _lastCleanupStatistics, statistics.ToRecord());
         }
 
         return removed;
     }
+
+    private async Task<RetentionScanResult> ScanForRetentionAsync(
+        string path,
+        DateTimeOffset olderThan,
+        long sourceLength,
+        CancellationToken cancellationToken)
+    {
+        var recordCount = 0;
+        var removedCount = 0;
+        var retainedCount = 0;
+        var safe = true;
+        using var reader = new StreamReader(path, Encoding.UTF8, true);
+        while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+        {
+            if (line.Length == 0 || line.Length > _maximumRecordBytes)
+            {
+                safe = false;
+                continue;
+            }
+
+            ConversationLogRecord? record;
+            try
+            {
+                record = JsonSerializer.Deserialize<ConversationLogRecord>(line, JsonOptions);
+            }
+            catch (JsonException)
+            {
+                safe = false;
+                continue;
+            }
+
+            if (!ConversationLogRecordValidation.IsReadable(record)
+                || record!.Text.Length > ConfigurationLimits.MaximumLogRecordBytes)
+            {
+                safe = false;
+                continue;
+            }
+
+            recordCount++;
+            if (record.Timestamp < olderThan)
+            {
+                removedCount++;
+            }
+            else
+            {
+                retainedCount++;
+            }
+        }
+
+        return new RetentionScanResult(safe, recordCount, removedCount, retainedCount, sourceLength);
+    }
+
+    private async Task<long> RewriteRetainedRecordsAsync(
+        string sourcePath,
+        string temporaryPath,
+        DateTimeOffset olderThan,
+        CancellationToken cancellationToken)
+    {
+        var bytesWritten = 0L;
+        await using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 8192, FileOptions.Asynchronous | FileOptions.SequentialScan))
+        {
+            await foreach (var record in ReadFileAsync(sourcePath, cancellationToken).ConfigureAwait(false))
+            {
+                if (record.Timestamp < olderThan)
+                {
+                    continue;
+                }
+
+                var line = JsonSerializer.SerializeToUtf8Bytes(record, JsonOptions);
+                await stream.WriteAsync(line, cancellationToken).ConfigureAwait(false);
+                await stream.WriteAsync("\n"u8.ToArray(), cancellationToken).ConfigureAwait(false);
+                bytesWritten += line.Length + 1L;
+            }
+
+            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        return bytesWritten;
+    }
+
+    private bool TryDeleteHistorySource(string path)
+    {
+        try
+        {
+            File.Delete(path);
+            InvalidateHistoryIndex(path);
+            InvalidateSearchIndex(path);
+            return true;
+        }
+        catch (IOException exception)
+        {
+            SetDiagnostic($"Conversation history cleanup could not delete a segment safely: {exception.Message}");
+            return false;
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            SetDiagnostic($"Conversation history cleanup could not delete a segment safely: {exception.Message}");
+            return false;
+        }
+    }
+
+    private static bool IsArchivedPath(string path) => Path.GetFileNameWithoutExtension(path).Contains(".s", StringComparison.OrdinalIgnoreCase);
 
     public async Task FlushAsync(CancellationToken cancellationToken = default)
     {
@@ -868,22 +1145,53 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
 
                 try
                 {
-                    var path = GetPath(pending.Record.ScopeId, pending.Record.ConversationKey);
+                    var conversationKey = string.IsNullOrWhiteSpace(pending.Record.ConversationKey)
+                        ? ConversationLoggingService.BuildConversationKey(pending.Record.ConversationKind, pending.Record.ConversationName)
+                        : pending.Record.ConversationKey;
+                    var path = GetPath(pending.Record.ScopeId, conversationKey);
                     Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                     var line = JsonSerializer.SerializeToUtf8Bytes(pending.Record, JsonOptions);
-                    await using var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read, 8192, FileOptions.Asynchronous | FileOptions.SequentialScan);
                     var requiredBytes = (long)line.Length + 1;
-                    if (stream.Length > ConfigurationLimits.MaximumHistoryFileBytes
-                        || requiredBytes > ConfigurationLimits.MaximumHistoryFileBytes - stream.Length)
+                    if (requiredBytes > ConfigurationLimits.MaximumHistoryFileBytes)
                     {
                         SetDiagnostic("Conversation history file reached the supported 256 MiB bound; the new record was not persisted.");
                         pending.Completion.TrySetResult(false);
                         continue;
                     }
 
-                    await stream.WriteAsync(line).ConfigureAwait(false);
-                    await stream.WriteAsync("\n"u8.ToArray()).ConfigureAwait(false);
-                    await stream.FlushAsync().ConfigureAwait(false);
+                    FileStream? stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read, 8192, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                    try
+                    {
+                        if (stream.Length > ConfigurationLimits.MaximumHistoryFileBytes
+                            || requiredBytes > ConfigurationLimits.MaximumHistoryFileBytes - stream.Length)
+                        {
+                            SetDiagnostic("Conversation history file reached the supported 256 MiB bound; the new record was not persisted.");
+                            pending.Completion.TrySetResult(false);
+                            continue;
+                        }
+
+                        if (stream.Length > 0
+                            && (stream.Length >= _maximumSegmentBytes
+                                || requiredBytes > _maximumSegmentBytes - stream.Length))
+                        {
+                            await stream.DisposeAsync().ConfigureAwait(false);
+                            stream = null;
+                            RotateActiveSegment(path);
+                            stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read, 8192, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                        }
+
+                        await stream!.WriteAsync(line).ConfigureAwait(false);
+                        await stream.WriteAsync("\n"u8.ToArray()).ConfigureAwait(false);
+                        await stream.FlushAsync().ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        if (stream is not null)
+                        {
+                            await stream.DisposeAsync().ConfigureAwait(false);
+                        }
+                    }
+
                     lock (_historyIndexGate)
                     {
                         _historyIndexes.Remove(path);
@@ -943,6 +1251,94 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         return Path.Combine(_root, scopeId.ToString("N"), $"{hash}.jsonl");
     }
 
+    private string[] GetConversationPaths(Guid scopeId, string conversationKey)
+    {
+        var activePath = GetPath(scopeId, conversationKey);
+        var directory = Path.GetDirectoryName(activePath)!;
+        if (!Directory.Exists(directory))
+        {
+            return Array.Empty<string>();
+        }
+
+        var activeName = Path.GetFileName(activePath);
+        var archivePrefix = Path.GetFileNameWithoutExtension(activePath) + ".s";
+        var paths = new List<(int Sequence, string Path)>();
+        try
+        {
+            foreach (var path in Directory.EnumerateFiles(directory, "*.jsonl", SearchOption.TopDirectoryOnly))
+            {
+                var name = Path.GetFileName(path);
+                if (string.Equals(name, activeName, StringComparison.OrdinalIgnoreCase))
+                {
+                    paths.Add((int.MaxValue, path));
+                    continue;
+                }
+
+                if (!name.StartsWith(archivePrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var suffix = name[archivePrefix.Length..^".jsonl".Length];
+                if (suffix.Length > 0 && int.TryParse(suffix, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var sequence) && sequence >= 0)
+                {
+                    paths.Add((sequence, path));
+                }
+            }
+        }
+        catch (IOException exception)
+        {
+            SetDiagnostic($"Conversation history source discovery failed safely: {exception.Message}");
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            SetDiagnostic($"Conversation history source discovery failed safely: {exception.Message}");
+        }
+
+        if (paths.All(item => !string.Equals(item.Path, activePath, StringComparison.OrdinalIgnoreCase)) && File.Exists(activePath))
+        {
+            paths.Add((int.MaxValue, activePath));
+        }
+
+        return paths
+            .OrderBy(item => item.Sequence)
+            .ThenBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
+            .Select(item => item.Path)
+            .Take(ConfigurationLimits.MaximumHistorySourceFiles)
+            .ToArray();
+    }
+
+    private void RotateActiveSegment(string activePath)
+    {
+        InvalidateHistoryIndex(activePath);
+        InvalidateSearchIndex(activePath);
+        var directory = Path.GetDirectoryName(activePath)!;
+        var baseName = Path.GetFileNameWithoutExtension(activePath);
+        var nextSequence = 0;
+        foreach (var path in Directory.EnumerateFiles(directory, $"{baseName}.s*.jsonl", SearchOption.TopDirectoryOnly))
+        {
+            var name = Path.GetFileName(path);
+            var prefix = baseName + ".s";
+            var suffix = name[prefix.Length..^".jsonl".Length];
+            if (int.TryParse(suffix, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var sequence))
+            {
+                nextSequence = Math.Max(nextSequence, sequence + 1);
+            }
+        }
+
+        var archivePath = Path.Combine(directory, $"{baseName}.s{nextSequence:D8}.jsonl");
+        while (File.Exists(archivePath))
+        {
+            nextSequence++;
+            archivePath = Path.Combine(directory, $"{baseName}.s{nextSequence:D8}.jsonl");
+        }
+
+        File.Move(activePath, archivePath);
+        using (File.Create(activePath))
+        {
+        }
+    }
+
     private IEnumerable<string> EnumerateSearchPaths(ConversationLogQuery query, out bool filesTruncated)
     {
         filesTruncated = false;
@@ -951,7 +1347,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             && query.ConversationKind is LogConversationKind conversationKind
             && !string.IsNullOrWhiteSpace(query.ConversationName))
         {
-            return [GetPath(conversationScope, ConversationLoggingService.BuildConversationKey(conversationKind, query.ConversationName))];
+            return GetConversationPaths(conversationScope, ConversationLoggingService.BuildConversationKey(conversationKind, query.ConversationName));
         }
 
         var knownScope = query.HistoryScopeId ?? query.ProfileId;
@@ -963,9 +1359,12 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             return [];
         }
 
-        var paths = Directory.EnumerateFiles(searchRoot, "*.jsonl", SearchOption.AllDirectories).Take(4097).ToArray();
-        filesTruncated = paths.Length > 4096;
-        return paths.Take(4096);
+        var paths = Directory.EnumerateFiles(searchRoot, "*.jsonl", SearchOption.AllDirectories)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .Take(ConfigurationLimits.MaximumHistorySourceFiles + 1)
+            .ToArray();
+        filesTruncated = paths.Length > ConfigurationLimits.MaximumHistorySourceFiles;
+        return paths.Take(ConfigurationLimits.MaximumHistorySourceFiles);
     }
 
     private async Task<SearchIndexLoadResult?> GetSearchIndexAsync(string path, CancellationToken cancellationToken)
@@ -987,7 +1386,13 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                     && cached.SourceLastWriteTicks == sourceInfo.LastWriteTimeUtc.Ticks
                     && JsonlSearchIndex.IsSidecarCurrent(JsonlSearchIndex.GetSidecarPath(path), cached))
                 {
-                    return new SearchIndexLoadResult(cached, 0);
+                    if (JsonlSearchIndex.TryLoad(path, out var validated) && validated is not null)
+                    {
+                        _searchIndexes[path] = validated;
+                        return new SearchIndexLoadResult(validated, 0);
+                    }
+
+                    _searchIndexes.Remove(path);
                 }
             }
 
@@ -1079,6 +1484,32 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
     private sealed record PendingWrite(ConversationLogRecord? Record, TaskCompletionSource<bool> Completion);
     private sealed record LocatedConversationLogRecord(ConversationLogRecord Record, long Offset, int Length);
     private sealed record SearchIndexLoadResult(JsonlSearchIndexSnapshot Snapshot, long BuildMilliseconds);
+    private sealed record SegmentRangeRead(IReadOnlyList<ConversationLogRecord> Records, bool IsTruncated);
+    private sealed record RetentionScanResult(bool IsSafe, int RecordCount, int RemovedCount, int RetainedCount, long BytesRead);
+
+    private sealed class CleanupStatisticsAccumulator
+    {
+        public int SegmentsExamined { get; set; }
+        public int SegmentsDeleted { get; set; }
+        public int SegmentsRewritten { get; set; }
+        public int SegmentsSkipped { get; set; }
+        public long RecordsExamined { get; set; }
+        public long RecordsRemoved { get; set; }
+        public long BytesRead { get; set; }
+        public long BytesWritten { get; set; }
+        public bool FilesTruncated { get; set; }
+
+        public ConversationLogCleanupStatistics ToRecord() => new(
+            SegmentsExamined,
+            SegmentsDeleted,
+            SegmentsRewritten,
+            SegmentsSkipped,
+            RecordsExamined,
+            RecordsRemoved,
+            BytesRead,
+            BytesWritten,
+            FilesTruncated);
+    }
 
     private async Task<HistoryPage?> TryReadIndexedPageAsync(
         string path,

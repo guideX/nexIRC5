@@ -1,3 +1,4 @@
+using System.IO;
 using nexIRC.Application;
 using nexIRC.Core.Networking;
 using nexIRC.Core.Session;
@@ -147,7 +148,7 @@ public sealed class DemoScenario
                 await logs.AppendAsync(record).ConfigureAwait(true);
             }
 
-            for (var index = 0; index < 5_000; index++)
+            for (var index = 0; index < 2_000; index++)
             {
                 await logs.AppendAsync(new ConversationLogRecord
                 {
@@ -161,10 +162,17 @@ public sealed class DemoScenario
                     Sender = index % 2 == 0 ? "Mira" : "Rook",
                     MessageKind = LogMessageKind.Message,
                     Direction = LogDirection.Incoming,
-                    Text = $"Demo history page record {index + 1:000}; this is fake deterministic workspace data."
+                    Text = index == 1_999
+                        ? "Demo history archive segment marker; this old record remains searchable."
+                        : $"Demo history page record {index + 1:000}; this is fake deterministic workspace data."
                 }).ConfigureAwait(true);
             }
             await logs.FlushAsync().ConfigureAwait(true);
+            if (logs is JsonlConversationLogStore jsonLogs
+                && Directory.EnumerateFiles(jsonLogs.RootPath, "*.jsonl", SearchOption.AllDirectories).Count() < 2)
+            {
+                throw new InvalidOperationException("The deterministic demo did not rotate its segmented history.");
+            }
             var currentConversationResults = await logs.SearchDetailedAsync(new ConversationLogQuery
             {
                 Scope = ConversationLogSearchScope.CurrentConversation,
@@ -183,8 +191,19 @@ public sealed class DemoScenario
                 Text = "same-target marker",
                 MaximumResults = 10
             }).ConfigureAwait(true);
+            var archivedResults = await logs.SearchDetailedAsync(new ConversationLogQuery
+            {
+                Scope = ConversationLogSearchScope.CurrentConversation,
+                HistoryScopeId = historyScope,
+                NetworkId = alpha.Id,
+                ConversationKind = LogConversationKind.Channel,
+                ConversationName = "#alpha",
+                Text = "archive segment marker",
+                MaximumResults = 10
+            }).ConfigureAwait(true);
             if (currentConversationResults.Results.Count == 0
-                || crossConversationResults.Results.Select(result => result.NetworkId).Distinct().Count() != 2)
+                || crossConversationResults.Results.Select(result => result.NetworkId).Distinct().Count() != 2
+                || archivedResults.Results.Count != 1)
             {
                 throw new InvalidOperationException("The deterministic demo history search scenarios did not return the expected records.");
             }

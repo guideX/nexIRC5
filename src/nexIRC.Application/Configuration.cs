@@ -37,6 +37,8 @@ public static class ConfigurationLimits
     public const int MaximumHistoryContextEntries = 100;
     public const int MaximumHistoryExportRecords = 10_000;
     public const long MaximumHistoryFileBytes = 256L * 1024 * 1024;
+    public const long DefaultHistorySegmentBytes = 64L * 1024 * 1024;
+    public const int MaximumHistorySourceFiles = 100_000;
     public const int MaximumHistoryIndexEntries = 1_000_000;
     public const int MinimumHistoryIndexFileBytes = 1 * 1024 * 1024;
     public const int HistorySearchIndexBlockRecords = 4096;

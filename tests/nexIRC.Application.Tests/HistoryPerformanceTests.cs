@@ -116,6 +116,100 @@ public sealed class HistoryPerformanceTests
     }
 
     [Fact]
+    [Trait("Category", "Performance")]
+    public async Task JsonlSegmentedHistoryScaleReportIsDeterministicWhenExplicitlyEnabled()
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("NEXIRC_RUN_HISTORY_PERFORMANCE"), "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var cases = new[]
+        {
+            new SegmentedBenchmarkCase(10_000, 1),
+            new SegmentedBenchmarkCase(10_000, 4),
+            new SegmentedBenchmarkCase(10_000, 16),
+            new SegmentedBenchmarkCase(10_000, 64),
+            new SegmentedBenchmarkCase(10_000, 256),
+            new SegmentedBenchmarkCase(100_000, 1),
+            new SegmentedBenchmarkCase(100_000, 4),
+            new SegmentedBenchmarkCase(100_000, 16),
+            new SegmentedBenchmarkCase(500_000, 1),
+            new SegmentedBenchmarkCase(500_000, 4),
+            // One 431 MB generated source would intentionally cross the 256 MiB
+            // reader boundary, so the million-record minimum is two sources.
+            new SegmentedBenchmarkCase(1_000_000, 2),
+            new SegmentedBenchmarkCase(1_000_000, 4)
+        };
+
+        foreach (var benchmarkCase in cases)
+        {
+            var directory = Directory.CreateTempSubdirectory($"nexirc-history-segmented-{benchmarkCase.RecordCount}-{benchmarkCase.SegmentCount}-");
+            try
+            {
+                var scope = Guid.Parse("00000000-0000-0000-0000-000000000201");
+                await WriteSegmentedDatasetAsync(directory.FullName, scope, benchmarkCase.RecordCount, benchmarkCase.SegmentCount, "#segmented", includeMarkers: true);
+                await using var store = new JsonlConversationLogStore(directory.FullName);
+                var request = new HistoryPageRequest
+                {
+                    ScopeId = scope,
+                    ConversationKind = LogConversationKind.Channel,
+                    ConversationName = "#segmented",
+                    PageSize = 100
+                };
+                var measurements = new List<Measurement>();
+                await MeasureAsync("cold-newest", () => store.ReadPageWindowAsync(request), measurements);
+                await MeasureAsync("warm-newest", () => store.ReadPageWindowAsync(request), measurements);
+                var newest = await store.ReadPageWindowAsync(request);
+                var oldest = await store.ReadPageWindowAsync(request with { Oldest = true });
+                await MeasureAsync("timestamp-navigation", () => store.ReadPageWindowAsync(request with
+                {
+                    Around = DateTimeOffset.UnixEpoch.AddMinutes(benchmarkCase.RecordCount / 2),
+                    AroundWindow = TimeSpan.FromMinutes(1)
+                }), measurements);
+                await MeasureAsync("bounded-export", () => store.ReadRangeAsync(new HistoryExportRequest
+                {
+                    ScopeId = scope,
+                    ConversationKind = LogConversationKind.Channel,
+                    ConversationName = "#segmented",
+                    MaximumRecords = 500
+                }), measurements);
+                await MeasureSearchAsync("selective-cold-index", store, Search(scope, "#segmented", "middle-marker"), measurements);
+                await MeasureSearchAsync("selective-warm-index", store, Search(scope, "#segmented", "middle-marker"), measurements);
+                await MeasureSearchAsync("broad-common", store, Search(scope, "#segmented", "benchmark"), measurements);
+                await MeasureSearchAsync("segment-discovery-prune", store, Search(scope, "#segmented", "benchmark") with
+                {
+                    From = DateTimeOffset.UnixEpoch.AddMinutes(benchmarkCase.RecordCount + 1),
+                    To = DateTimeOffset.UnixEpoch.AddMinutes(benchmarkCase.RecordCount + 2)
+                }, measurements);
+
+                var fileBytes = Directory.EnumerateFiles(directory.FullName, "*.jsonl", SearchOption.AllDirectories)
+                    .Sum(path => new FileInfo(path).Length);
+                var sourceCount = Directory.EnumerateFiles(directory.FullName, "*.jsonl", SearchOption.AllDirectories).Count();
+                if (benchmarkCase is { RecordCount: 100_000, SegmentCount: 16 })
+                {
+                    var stopwatch = Stopwatch.StartNew();
+                    var retentionRemoved = await store.CleanupAsync(DateTimeOffset.UnixEpoch.AddMinutes(25_123));
+                    stopwatch.Stop();
+                    Console.WriteLine($"history-segmented-retention records={benchmarkCase.RecordCount} segments={benchmarkCase.SegmentCount} milliseconds={stopwatch.ElapsedMilliseconds} removed={retentionRemoved} examined={store.LastCleanupStatistics.RecordsExamined} deleted={store.LastCleanupStatistics.SegmentsDeleted} rewritten={store.LastCleanupStatistics.SegmentsRewritten} bytesRead={store.LastCleanupStatistics.BytesRead} bytesWritten={store.LastCleanupStatistics.BytesWritten}");
+                }
+
+                Console.WriteLine($"history-segmented-performance records={benchmarkCase.RecordCount} logicalConversations=1 segments={sourceCount} bytes={fileBytes} "
+                    + string.Join(' ', measurements.Select(item => $"{item.Name}={item.Milliseconds}ms/{item.Count}/examined{item.RecordsExamined}/files{item.FilesExamined}/matches{item.MatchingRecords}/skipped{item.RecordsSkippedByIndex}/index{item.IndexFilesUsed}/built{item.IndexFilesBuilt}/build{item.IndexBuildMilliseconds}ms")));
+                _ = newest;
+                _ = oldest;
+            }
+            finally
+            {
+                Directory.Delete(directory.FullName, recursive: true);
+            }
+        }
+
+        await MeasureActualRotationAsync();
+        await MeasureManyConversationDiscoveryAsync();
+    }
+
+    [Fact]
     public async Task JsonlHistoryIndexRebuildsAfterCorruptionAndTruncatedTail()
     {
         var directory = Directory.CreateTempSubdirectory("nexirc-history-index-");
@@ -292,6 +386,114 @@ public sealed class HistoryPerformanceTests
         await stream.FlushAsync();
     }
 
+    private static async Task WriteSegmentedDatasetAsync(
+        string root,
+        Guid scope,
+        int recordCount,
+        int segmentCount,
+        string conversationName,
+        bool includeMarkers)
+    {
+        var basePath = GetPath(root, scope, LogConversationKind.Channel, conversationName);
+        var directory = Path.GetDirectoryName(basePath)!;
+        Directory.CreateDirectory(directory);
+        var baseName = Path.GetFileNameWithoutExtension(basePath);
+        var baseSegmentSize = recordCount / segmentCount;
+        var remainder = recordCount % segmentCount;
+        var startIndex = 0;
+        for (var segment = 0; segment < segmentCount; segment++)
+        {
+            var count = baseSegmentSize + (segment < remainder ? 1 : 0);
+            var path = segment == segmentCount - 1
+                ? basePath
+                : Path.Combine(directory, $"{baseName}.s{segment:D8}.jsonl");
+            await WriteDatasetAsync(path, scope, count, conversationName, startIndex, includeMarkers);
+            startIndex += count;
+        }
+    }
+
+    private static async Task MeasureActualRotationAsync()
+    {
+        var directory = Directory.CreateTempSubdirectory("nexirc-history-rotation-perf-");
+        try
+        {
+            var scope = Guid.Parse("00000000-0000-0000-0000-000000000202");
+            await using var store = new JsonlConversationLogStore(directory.FullName, maximumSegmentBytes: 16 * 1024);
+            var stopwatch = Stopwatch.StartNew();
+            for (var index = 0; index < 10_000; index++)
+            {
+                await store.AppendAsync(new ConversationLogRecord
+                {
+                    Timestamp = DateTimeOffset.UnixEpoch.AddMinutes(index),
+                    NetworkId = scope,
+                    ScopeId = scope,
+                    ProfileId = scope,
+                    ConversationKind = LogConversationKind.Channel,
+                    ConversationName = "#rotation",
+                    ConversationKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, "#rotation"),
+                    Sender = "Mira",
+                    MessageKind = LogMessageKind.Message,
+                    Direction = LogDirection.Incoming,
+                    Text = $"rotation benchmark record {index}"
+                });
+            }
+
+            await store.FlushAsync();
+            stopwatch.Stop();
+            var sourceCount = Directory.EnumerateFiles(directory.FullName, "*.jsonl", SearchOption.AllDirectories).Count();
+            Console.WriteLine($"history-segmented-rotation records=10000 segments={sourceCount} milliseconds={stopwatch.ElapsedMilliseconds}");
+        }
+        finally
+        {
+            Directory.Delete(directory.FullName, recursive: true);
+        }
+    }
+
+    private static async Task MeasureManyConversationDiscoveryAsync()
+    {
+        var directory = Directory.CreateTempSubdirectory("nexirc-history-many-conversations-perf-");
+        try
+        {
+            var alpha = Guid.Parse("00000000-0000-0000-0000-000000000203");
+            var beta = Guid.Parse("00000000-0000-0000-0000-000000000204");
+            for (var network = 0; network < 2; network++)
+            {
+                var scope = network == 0 ? alpha : beta;
+                for (var conversation = 0; conversation < 32; conversation++)
+                {
+                    var name = conversation == 0 ? "#room" : $"#room-{conversation:00}";
+                    await WriteSegmentedDatasetAsync(directory.FullName, scope, 1_000, 4, name, includeMarkers: true);
+                }
+            }
+
+            await using var store = new JsonlConversationLogStore(directory.FullName);
+            var all = await store.SearchDetailedAsync(new ConversationLogQuery { Text = "middle-marker", MaximumResults = 10 });
+            var currentNetwork = await store.SearchDetailedAsync(new ConversationLogQuery
+            {
+                Scope = ConversationLogSearchScope.CurrentNetwork,
+                HistoryScopeId = alpha,
+                NetworkId = alpha,
+                Text = "middle-marker",
+                MaximumResults = 10
+            });
+            var duplicate = await store.SearchDetailedAsync(new ConversationLogQuery
+            {
+                Scope = ConversationLogSearchScope.CurrentConversation,
+                HistoryScopeId = alpha,
+                NetworkId = alpha,
+                ConversationKind = LogConversationKind.Channel,
+                ConversationName = "#ROOM",
+                Text = "middle-marker",
+                MaximumResults = 10
+            });
+            Console.WriteLine($"history-segmented-many-conversations logicalConversations=64 segments=256 bytes={Directory.EnumerateFiles(directory.FullName, "*.jsonl", SearchOption.AllDirectories).Sum(path => new FileInfo(path).Length)} all={all.Statistics.FilesExamined}files/{all.Statistics.RecordsExamined}examined/{all.Statistics.ResultsProduced}results currentNetwork={currentNetwork.Statistics.FilesExamined}files/{currentNetwork.Statistics.RecordsExamined}examined duplicateNetwork={duplicate.Statistics.FilesExamined}files/{duplicate.Statistics.RecordsExamined}examined");
+        }
+        finally
+        {
+            Directory.Delete(directory.FullName, recursive: true);
+        }
+    }
+
     private static string GetPath(string root, Guid scope, LogConversationKind kind, string name)
     {
         var key = ConversationLoggingService.BuildConversationKey(kind, name);
@@ -317,4 +519,6 @@ public sealed class HistoryPerformanceTests
         int IndexFilesUsed = 0,
         long IndexBuildMilliseconds = 0,
         int IndexFilesBuilt = 0);
+
+    private sealed record SegmentedBenchmarkCase(int RecordCount, int SegmentCount);
 }

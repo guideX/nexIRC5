@@ -10,6 +10,8 @@ namespace nexIRC.Desktop;
 
 public partial class App : System.Windows.Application
 {
+    private string? _demoHistoryRoot;
+
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
@@ -43,7 +45,8 @@ public partial class App : System.Windows.Application
                 }
             }));
             credentials = new ProfileCredentialService(new InMemoryProfileCredentialStore());
-            logStore = new InMemoryConversationLogStore();
+            _demoHistoryRoot = Directory.CreateTempSubdirectory("nexirc5-demo-history-").FullName;
+            logStore = new JsonlConversationLogStore(_demoHistoryRoot, maximumSegmentBytes: 32 * 1024);
         }
         else
         {
@@ -80,6 +83,23 @@ public partial class App : System.Windows.Application
 
             await window.ViewModel.RestoreProfilesAsync().ConfigureAwait(true);
         }
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        if (_demoHistoryRoot is { } historyRoot)
+        {
+            try
+            {
+                if (Directory.Exists(historyRoot)) Directory.Delete(historyRoot, recursive: true);
+            }
+            catch
+            {
+                // Demo history is disposable and cannot affect normal shutdown.
+            }
+        }
+
+        base.OnExit(e);
     }
 
     private static async Task CleanupLogsAsync(IConversationLogStore logStore, ConfigurationService configuration)
