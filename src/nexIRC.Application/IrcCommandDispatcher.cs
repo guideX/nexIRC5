@@ -1,4 +1,5 @@
 using nexIRC.Core.Networking;
+using nexIRC.Core.Protocol;
 using nexIRC.Core.Session;
 
 namespace nexIRC.Application;
@@ -20,7 +21,7 @@ public sealed class IrcCommandDispatcher
     [
         "server", "join", "part", "msg", "query", "q", "nick", "me", "quit",
         "disconnect", "whois", "list", "notice", "ctcp", "op", "deop", "voice",
-        "devoice", "kick", "mode", "topic", "clear", "close", "raw", "quote"
+        "devoice", "kick", "mode", "topic", "clear", "close", "raw", "quote", "help"
     ];
 
     private readonly NetworkSessionManager _sessions;
@@ -29,6 +30,9 @@ public sealed class IrcCommandDispatcher
     {
         _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
     }
+
+    public static bool IsBuiltInCommand(string command) =>
+        SupportedCommands.Contains(command.Trim().TrimStart('/'), StringComparer.OrdinalIgnoreCase);
 
     public async ValueTask<CommandDispatchResult> DispatchAsync(
         NetworkWorkspace? network,
@@ -81,6 +85,20 @@ public sealed class IrcCommandDispatcher
         var arguments = separator < 0 ? string.Empty : commandLine[(separator + 1)..].Trim();
         var parts = arguments.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
+        if (!IsBuiltInCommand(command))
+        {
+            var expanded = AliasExpander.Expand(input, _sessions.Configuration?.Aliases ?? Array.Empty<AliasDefinition>());
+            if (!expanded.Succeeded)
+            {
+                return CommandDispatchResult.Failure(expanded.Error ?? "Alias expansion failed.", activeView);
+            }
+
+            if (!string.Equals(expanded.Input, input, StringComparison.Ordinal))
+            {
+                return await DispatchAsync(network, activeView, expanded.Input, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
         try
         {
             switch (command)
@@ -123,6 +141,8 @@ public sealed class IrcCommandDispatcher
                 case "CLEAR":
                     activeView.ClearEntries();
                     return CommandDispatchResult.Success("Local view cleared.", activeView);
+                case "HELP":
+                    return Help(network, activeView);
                 case "CLOSE":
                     return _sessions.CloseView(activeView.Id)
                         ? CommandDispatchResult.Success("Local view closed.", network.StatusView)
@@ -143,7 +163,7 @@ public sealed class IrcCommandDispatcher
                     }
 
                     await network.Session.SendRawCommandAsync(arguments, cancellationToken).ConfigureAwait(false);
-                    _sessions.AppendLocal(network.StatusView, IrcEventPresentation.CreateLocalCommand($"> {arguments}"));
+                    _sessions.AppendLocal(network.StatusView, IrcEventPresentation.CreateLocalCommand($"> {IrcSensitiveData.RedactLine(arguments)}"));
                     return CommandDispatchResult.Success("Raw command sent.", activeView);
                 default:
                     return CommandDispatchResult.Failure($"Unknown command: /{command.ToLowerInvariant()}.", activeView);
@@ -193,6 +213,7 @@ public sealed class IrcCommandDispatcher
 
         var view = _sessions.EnsureChannel(network.Id, parts[0]);
         _sessions.ActivateView(view.Id);
+        _sessions.RecordRecent(network, DestinationKind.Channel, parts[0]);
         await network.Session.JoinChannelAsync(parts[0], cancellationToken).ConfigureAwait(false);
         return CommandDispatchResult.Success($"Joining {parts[0]}.", view);
     }
@@ -210,9 +231,8 @@ public sealed class IrcCommandDispatcher
             return CommandDispatchResult.Failure("Usage: /part [#channel] [reason]", activeView);
         }
 
-        var typedChannel = arguments.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault();
-        var reason = typedChannel is not null
-            && IrcIdentity.Equals(typedChannel, channel, network.Snapshot.Features.CaseMapping)
+        var reason = parts.Length > 1
+            && IrcIdentity.Equals(parts[0], channel, network.Snapshot.Features.CaseMapping)
             ? arguments[channel.Length..].Trim()
             : string.Empty;
         await network.Session.PartChannelAsync(channel, string.IsNullOrWhiteSpace(reason) ? null : reason, cancellationToken).ConfigureAwait(false);
@@ -229,6 +249,7 @@ public sealed class IrcCommandDispatcher
 
         var view = _sessions.EnsureQuery(network.Id, target);
         _sessions.ActivateView(view.Id);
+        _sessions.RecordRecent(network, DestinationKind.Query, target);
         await network.Session.SendCommandAsync("PRIVMSG", [target], text, cancellationToken).ConfigureAwait(false);
         _sessions.AppendLocal(view, IrcEventPresentation.CreateLocalMessage(network.Session.Snapshot.Nickname, text, OutgoingMessageKind.PrivateMessage));
         return CommandDispatchResult.Success($"Message sent to {target}.", view);
@@ -243,6 +264,7 @@ public sealed class IrcCommandDispatcher
 
         var view = _sessions.EnsureQuery(network.Id, parts[0]);
         _sessions.ActivateView(view.Id);
+        _sessions.RecordRecent(network, DestinationKind.Query, parts[0]);
         return CommandDispatchResult.Success($"Query opened for {parts[0]}.", view);
     }
 
@@ -419,5 +441,16 @@ public sealed class IrcCommandDispatcher
         var target = arguments[..separator];
         var text = arguments[(separator + 1)..].Trim();
         return string.IsNullOrWhiteSpace(text) ? (null, null) : (target, text);
+    }
+
+    private CommandDispatchResult Help(NetworkWorkspace network, WorkspaceView activeView)
+    {
+        var aliases = _sessions.Configuration?.Aliases.Where(alias => alias.IsEnabled).OrderBy(alias => alias.Name, StringComparer.OrdinalIgnoreCase).ToArray() ?? [];
+        var text = aliases.Length == 0
+            ? "Built-in commands: " + string.Join(", ", SupportedCommands.Select(command => "/" + command))
+            : "Built-in commands: " + string.Join(", ", SupportedCommands.Select(command => "/" + command))
+                + " · User aliases: " + string.Join(", ", aliases.Select(alias => $"/{alias.Name} → {alias.Expansion}"));
+        _sessions.AppendLocal(network.StatusView, IrcEventPresentation.CreateLocalCommand(text));
+        return CommandDispatchResult.Success(text, activeView);
     }
 }

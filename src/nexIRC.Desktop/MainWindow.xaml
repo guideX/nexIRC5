@@ -10,7 +10,7 @@
         MinHeight="560"
         WindowStartupLocation="CenterScreen"
         Background="#F5F6F8"
-        Closing="OnClosing">
+        Closing="OnClosing" Loaded="OnLoaded">
     <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BooleanToVisibility" />
         <Style x:Key="PaneHeader" TargetType="TextBlock">
@@ -233,6 +233,9 @@
                 <MenuItem Header="Highlight custom words" IsCheckable="True" IsChecked="{Binding HighlightPolicy.HighlightCustomWords, Mode=TwoWay}" />
                 <Separator />
                 <MenuItem Header="Preferences…" Click="OnPreferencesClick" />
+                <MenuItem Header="Favorites and recents…" Click="OnFavoritesClick" />
+                <MenuItem Header="Aliases and custom commands…" Click="OnAliasesClick" />
+                <MenuItem Header="IRC history and search…" Click="OnLogsClick" />
             </MenuItem>
             <MenuItem Header="_Window">
                 <MenuItem Header="_Next View" Command="{Binding NextViewCommand}" />
@@ -258,12 +261,12 @@
         <StatusBar DockPanel.Dock="Bottom" Visibility="{Binding IsStatusBarVisible, Converter={StaticResource BooleanToVisibility}}">
             <StatusBarItem Content="{Binding StatusText}" />
             <Separator />
-            <StatusBarItem Content="nexIRC 5 · Phase 1E" />
+            <StatusBarItem Content="nexIRC 5 · Phase 1F" />
         </StatusBar>
 
         <Grid>
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="260" />
+                <ColumnDefinition x:Name="NavigationColumn" Width="260" />
                 <ColumnDefinition Width="5" />
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>

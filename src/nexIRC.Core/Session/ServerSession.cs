@@ -438,9 +438,29 @@ public sealed class ServerSession : IAsyncDisposable
             await writer.WriteAsync(command, cancellationToken).ConfigureAwait(false);
         }
 
-        if (_options.Password is not null)
+        var password = _options.Password;
+        if (password is null && _options.PasswordProvider is not null)
         {
-            await writer.WriteAsync(new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build("PASS", trailingParameter: _options.Password), cancellationToken).ConfigureAwait(false);
+            try
+            {
+                password = await _options.PasswordProvider.GetPasswordAsync(_options.Endpoint, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch
+            {
+                // A vault/provider failure must not take down the session or
+                // cause a plaintext fallback. Registration continues without
+                // PASS and the provider remains responsible for diagnostics.
+                password = null;
+            }
+        }
+
+        if (!string.IsNullOrEmpty(password))
+        {
+            await writer.WriteAsync(new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build("PASS", trailingParameter: password), cancellationToken).ConfigureAwait(false);
         }
 
         SetState(ServerSessionState.CapNegotiation);

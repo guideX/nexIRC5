@@ -14,6 +14,7 @@ namespace nexIRC.Application;
 public static class ConfigurationLimits
 {
     public const int MaximumFileBytes = 1_048_576;
+    public const int MaximumExportFileBytes = 1_048_576;
     public const int MaximumProfiles = 64;
     public const int MaximumStringLength = 256;
     public const int MaximumRealNameLength = 512;
@@ -21,6 +22,18 @@ public static class ConfigurationLimits
     public const int MaximumAlternateNicknames = 8;
     public const int MaximumHighlightWords = 64;
     public const int MaximumChannelLength = 200;
+    public const int MaximumAliases = 128;
+    public const int MaximumAliasNameLength = 32;
+    public const int MaximumAliasExpansionLength = 1024;
+    public const int MaximumAliasRecursionDepth = 8;
+    public const int MaximumFavoritesPerProfile = 128;
+    public const int MaximumRecentChannelsPerProfile = 50;
+    public const int MaximumRecentQueriesPerProfile = 50;
+    public const int MaximumSearchResults = 500;
+    public const int MaximumSearchQueryLength = 256;
+    public const int MaximumHistoryPageSize = 100;
+    public const int MaximumLogRecordBytes = 32_768;
+    public const int MaximumNotificationCoalescingEntries = 256;
 }
 
 public static class ConfigurationSchema
@@ -53,6 +66,37 @@ public sealed record ApplicationPreferences
     public bool IsStatusBarVisible { get; init; } = true;
 
     public Guid? LastSelectedNetworkProfileId { get; init; }
+
+    public bool ConversationLoggingEnabled { get; init; }
+
+    public bool PrivateMessageLoggingEnabled { get; init; }
+
+    public bool StatusLoggingEnabled { get; init; }
+
+    public int LogRetentionDays { get; init; } = 30;
+
+    public ViewStatePreferences ViewState { get; init; } = new();
+}
+
+public sealed record ViewStatePreferences
+{
+    public double WindowWidth { get; init; } = 1180;
+
+    public double WindowHeight { get; init; } = 760;
+
+    public double? WindowLeft { get; init; }
+
+    public double? WindowTop { get; init; }
+
+    public bool IsMaximized { get; init; }
+
+    public double NavigationPaneWidth { get; init; } = 260;
+
+    public double MemberPaneWidth { get; init; } = 220;
+
+    public string? LastLogSearchQuery { get; init; }
+
+    public string? LastLogConversation { get; init; }
 }
 
 /// <summary>
@@ -88,7 +132,15 @@ public sealed record NetworkProfile
 
     public int ReconnectMaximumAttempts { get; init; } = 3;
 
-    public NetworkConnectionOptions ToConnectionOptions()
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public SaslAuthenticationPolicy SaslPolicy { get; init; } = SaslAuthenticationPolicy.Disabled;
+
+    public string? SaslUsername { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool ServerPasswordEnabled { get; init; }
+
+    public NetworkConnectionOptions ToConnectionOptions(IProfileCredentialStore? credentialStore = null)
     {
         var profile = ConfigurationValidator.NormalizeProfile(this)
             ?? throw new ArgumentException("The network profile is missing a valid host or nickname.", nameof(NetworkProfile));
@@ -106,7 +158,14 @@ public sealed record NetworkProfile
             RealName = profile.RealName,
             DesiredChannels = (profile.AutoJoinChannels ?? []).ToHashSet(IrcCaseMappingComparer.For(IrcCaseMapping.Rfc1459)),
             AutoConnect = profile.AutoConnect,
-            Reconnect = new ReconnectPolicy(profile.ReconnectEnabled, Math.Clamp(profile.ReconnectMaximumAttempts, 1, 10))
+            Reconnect = new ReconnectPolicy(profile.ReconnectEnabled, Math.Clamp(profile.ReconnectMaximumAttempts, 1, 10)),
+            SaslPolicy = profile.SaslPolicy,
+            SaslCredentialProvider = profile.SaslPolicy == SaslAuthenticationPolicy.Disabled || credentialStore is null
+                ? null
+                : new ProfileSaslCredentialProvider(profile.Id, credentialStore),
+            PasswordProvider = profile.ServerPasswordEnabled && credentialStore is not null
+                ? new ProfileServerPasswordProvider(profile.Id, credentialStore)
+                : null
         };
     }
 }
@@ -118,6 +177,12 @@ public sealed record NexIrcConfiguration
     public ApplicationPreferences Preferences { get; init; } = new();
 
     public List<NetworkProfile> Profiles { get; init; } = [];
+
+    public List<FavoriteDestination> Favorites { get; init; } = [];
+
+    public List<RecentDestination> RecentDestinations { get; init; } = [];
+
+    public List<AliasDefinition> Aliases { get; init; } = [];
 }
 
 public sealed record ConfigurationLoadResult(
@@ -210,6 +275,142 @@ public sealed class ConfigurationService
         lock (_gate)
         {
             _configuration = ConfigurationValidator.Normalize(_configuration with { Preferences = preferences });
+        }
+    }
+
+    public IReadOnlyList<FavoriteDestination> Favorites => Current.Favorites;
+
+    public IReadOnlyList<RecentDestination> RecentDestinations => Current.RecentDestinations;
+
+    public IReadOnlyList<AliasDefinition> Aliases => Current.Aliases;
+
+    public bool AddOrUpdateFavorite(FavoriteDestination favorite)
+    {
+        var normalized = NavigationValidator.NormalizeFavorite(favorite);
+        if (normalized is null)
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            var favorites = _configuration.Favorites.ToList();
+            var existing = favorites.FindIndex(item => item.Id == normalized.Id);
+            if (existing >= 0)
+            {
+                favorites[existing] = normalized;
+            }
+            else
+            {
+                if (favorites.Count(item => item.ScopeId == normalized.ScopeId) >= ConfigurationLimits.MaximumFavoritesPerProfile)
+                {
+                    return false;
+                }
+
+                if (favorites.Any(item => NavigationValidator.SameDestination(item, normalized)))
+                {
+                    return true;
+                }
+
+                favorites.Add(normalized);
+            }
+
+            _configuration = _configuration with { Favorites = favorites };
+            return true;
+        }
+    }
+
+    public bool RemoveFavorite(Guid favoriteId)
+    {
+        lock (_gate)
+        {
+            var favorites = _configuration.Favorites.Where(item => item.Id != favoriteId).ToList();
+            if (favorites.Count == _configuration.Favorites.Count)
+            {
+                return false;
+            }
+
+            _configuration = _configuration with { Favorites = favorites };
+            return true;
+        }
+    }
+
+    public void RecordRecent(RecentDestination destination)
+    {
+        var normalized = NavigationValidator.NormalizeRecent(destination);
+        if (normalized is null)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            var recents = _configuration.RecentDestinations
+                .Where(item => !NavigationValidator.SameDestination(item, normalized))
+                .Append(normalized)
+                .OrderByDescending(item => item.LastOpened)
+                .ToList();
+            recents = NavigationValidator.BoundRecents(recents);
+            _configuration = _configuration with { RecentDestinations = recents };
+        }
+    }
+
+    public void ClearRecent(Guid? scopeId = null)
+    {
+        lock (_gate)
+        {
+            _configuration = _configuration with
+            {
+                RecentDestinations = scopeId is Guid id
+                    ? _configuration.RecentDestinations.Where(item => item.ScopeId != id).ToList()
+                    : []
+            };
+        }
+    }
+
+    public bool AddOrUpdateAlias(AliasDefinition alias)
+    {
+        var normalized = AliasValidator.Normalize(alias);
+        if (normalized is null || IrcCommandDispatcher.IsBuiltInCommand(normalized.Name))
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            var aliases = _configuration.Aliases.ToList();
+            var existing = aliases.FindIndex(item => string.Equals(item.Name, normalized.Name, StringComparison.OrdinalIgnoreCase));
+            if (existing >= 0)
+            {
+                aliases[existing] = normalized with { Id = aliases[existing].Id };
+            }
+            else
+            {
+                if (aliases.Count >= ConfigurationLimits.MaximumAliases)
+                {
+                    return false;
+                }
+
+                aliases.Add(normalized);
+            }
+
+            _configuration = _configuration with { Aliases = aliases };
+            return true;
+        }
+    }
+
+    public bool RemoveAlias(Guid aliasId)
+    {
+        lock (_gate)
+        {
+            var aliases = _configuration.Aliases.Where(item => item.Id != aliasId).ToList();
+            if (aliases.Count == _configuration.Aliases.Count)
+            {
+                return false;
+            }
+
+            _configuration = _configuration with { Aliases = aliases };
+            return true;
         }
     }
 
@@ -505,15 +706,36 @@ public static class ConfigurationValidator
         Guid? selected = preferences.LastSelectedNetworkProfileId is Guid selectedId && profileIds.Contains(selectedId)
             ? selectedId
             : null;
+        var viewState = ViewStateValidator.Normalize(preferences.ViewState);
+        var favorites = NavigationValidator.NormalizeFavorites(configuration.Favorites);
+        var recents = NavigationValidator.BoundRecents((configuration.RecentDestinations ?? [])
+            .Select(NavigationValidator.NormalizeRecent)
+            .Where(static value => value is not null)
+            .Select(static value => value!)
+            .OrderByDescending(static item => item.LastOpened));
+        var aliases = (configuration.Aliases ?? [])
+            .Select(AliasValidator.Normalize)
+            .Where(static value => value is not null)
+            .Select(static value => value!)
+            .Where(alias => !IrcCommandDispatcher.IsBuiltInCommand(alias.Name))
+            .GroupBy(alias => alias.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .Take(ConfigurationLimits.MaximumAliases)
+            .ToList();
         return new NexIrcConfiguration
         {
             SchemaVersion = ConfigurationSchema.CurrentVersion,
             Preferences = preferences with
             {
                 CustomHighlightWords = words,
-                LastSelectedNetworkProfileId = selected
+                LastSelectedNetworkProfileId = selected,
+                LogRetentionDays = Math.Clamp(preferences.LogRetentionDays, 1, 3650),
+                ViewState = viewState
             },
-            Profiles = profiles
+            Profiles = profiles,
+            Favorites = favorites,
+            RecentDestinations = recents,
+            Aliases = aliases
         };
     }
 
@@ -545,7 +767,9 @@ public static class ConfigurationValidator
             Username = NormalizeValue(profile.Username, "nexirc", ConfigurationLimits.MaximumStringLength),
             RealName = NormalizeValue(profile.RealName, "nexIRC 5", ConfigurationLimits.MaximumRealNameLength),
             AutoJoinChannels = channels,
-            ReconnectMaximumAttempts = Math.Clamp(profile.ReconnectMaximumAttempts, 1, 10)
+            ReconnectMaximumAttempts = Math.Clamp(profile.ReconnectMaximumAttempts, 1, 10),
+            SaslPolicy = Enum.IsDefined(profile.SaslPolicy) ? profile.SaslPolicy : SaslAuthenticationPolicy.Disabled,
+            SaslUsername = NormalizeOptionalValue(profile.SaslUsername, ConfigurationLimits.MaximumStringLength)
         };
     }
 
@@ -590,6 +814,14 @@ public static class ConfigurationValidator
     {
         var normalized = value?.Trim() ?? string.Empty;
         return normalized.Length > 0 && normalized.Length <= maximumLength && !normalized.Any(IsLineBreak) ? normalized : fallback;
+    }
+
+    private static string? NormalizeOptionalValue(string? value, int maximumLength)
+    {
+        var normalized = value?.Trim();
+        return string.IsNullOrWhiteSpace(normalized) || normalized.Length > maximumLength || normalized.Any(IsLineBreak)
+            ? null
+            : normalized;
     }
 
     private static bool IsLineBreak(char character) => character is '\r' or '\n';

@@ -14,7 +14,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private readonly HashSet<Task> _pendingDispatches = [];
     private readonly object _operationsGate = new();
     private readonly Dictionary<Guid, NetworkOperationState> _operations = [];
+    private readonly ConversationLoggingService? _logging;
+    private readonly IConversationLogStore? _logStore;
+    private readonly NotificationCoalescer _notificationCoalescer = new();
     private readonly bool _ownsNotifications;
+    private readonly bool _ownsLogStore;
     private long _operationSequence;
     private bool _disposed;
 
@@ -25,7 +29,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         IWorkspaceDispatcher? dispatcher = null,
         IIrcNotificationService? notifications = null,
         HighlightActivityPolicy? highlightPolicy = null,
-        ConfigurationService? configuration = null)
+        ConfigurationService? configuration = null,
+        IConversationLogStore? logStore = null,
+        ConversationLoggingService? logging = null)
     {
         _transportFactory = transportFactory ?? throw new ArgumentNullException(nameof(transportFactory));
         _dispatcher = dispatcher ?? new ImmediateWorkspaceDispatcher();
@@ -33,6 +39,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         _ownsNotifications = notifications is null;
         HighlightPolicy = highlightPolicy ?? new HighlightActivityPolicy();
         Configuration = configuration;
+        _logStore = logStore;
+        _logging = logging ?? (logStore is not null && configuration is not null
+            ? new ConversationLoggingService(logStore, () => configuration.Preferences)
+            : null);
+        _ownsLogStore = logStore is not null;
         if (configuration is not null)
         {
             ApplyPreferences(configuration.Preferences);
@@ -50,6 +61,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     public HighlightActivityPolicy HighlightPolicy { get; }
 
     public ConfigurationService? Configuration { get; }
+
+    public IConversationLogStore? LogStore => _logStore;
+
+    public ConversationLoggingService? Logging => _logging;
 
     public void ApplyPreferences(ApplicationPreferences preferences)
     {
@@ -349,6 +364,119 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         return true;
     }
 
+    public IReadOnlyList<FavoriteDestination> Favorites(Guid networkId, DestinationKind? kind = null)
+    {
+        var workspace = GetWorkspace(networkId);
+        if (Configuration is null)
+        {
+            return Array.Empty<FavoriteDestination>();
+        }
+
+        var scope = workspace.ProfileId ?? workspace.Id;
+        return Configuration.Favorites.Where(item => item.ScopeId == scope && (kind is null || item.Kind == kind)).ToArray();
+    }
+
+    public IReadOnlyList<RecentDestination> RecentDestinations(Guid networkId, DestinationKind? kind = null)
+    {
+        var workspace = GetWorkspace(networkId);
+        if (Configuration is null)
+        {
+            return Array.Empty<RecentDestination>();
+        }
+
+        var scope = workspace.ProfileId ?? workspace.Id;
+        return Configuration.RecentDestinations.Where(item => item.ScopeId == scope && (kind is null || item.Kind == kind)).OrderByDescending(item => item.LastOpened).ToArray();
+    }
+
+    public bool AddFavorite(Guid networkId, DestinationKind kind, string name, string? label = null)
+    {
+        var workspace = GetWorkspace(networkId);
+        if (Configuration is null)
+        {
+            return false;
+        }
+
+        var added = Configuration.AddOrUpdateFavorite(new FavoriteDestination
+        {
+            ScopeId = workspace.ProfileId ?? workspace.Id,
+            Kind = kind,
+            Name = name,
+            Label = label
+        });
+        if (added)
+        {
+            SaveConfigurationInBackground();
+        }
+
+        return added;
+    }
+
+    public bool RemoveFavorite(Guid favoriteId)
+    {
+        if (Configuration is null)
+        {
+            return false;
+        }
+
+        var removed = Configuration.RemoveFavorite(favoriteId);
+        if (removed) SaveConfigurationInBackground();
+        return removed;
+    }
+
+    public void ClearRecent(Guid networkId)
+    {
+        if (Configuration is null || !TryGet(networkId, out var workspace) || workspace is null)
+        {
+            return;
+        }
+
+        Configuration.ClearRecent(workspace.ProfileId ?? workspace.Id);
+        SaveConfigurationInBackground();
+    }
+
+    public void RecordRecent(NetworkWorkspace workspace, DestinationKind kind, string name)
+    {
+        if (Configuration is null)
+        {
+            return;
+        }
+
+        Configuration.RecordRecent(new RecentDestination
+        {
+            ScopeId = workspace.ProfileId ?? workspace.Id,
+            Kind = kind,
+            Name = name,
+            LastOpened = DateTimeOffset.UtcNow
+        });
+        SaveConfigurationInBackground();
+    }
+
+    public bool ActivateNotification(IrcNotification notification)
+    {
+        ArgumentNullException.ThrowIfNull(notification);
+        if (TryGetView(notification.ViewId, out var workspace, out var view) && workspace is not null && view is not null)
+        {
+            ActivateView(view.Id);
+            return true;
+        }
+
+        if (notification.Activation is { } target
+            && target.ProfileId is Guid profileId
+            && Networks.FirstOrDefault(item => item.ProfileId == profileId) is { } profileWorkspace)
+        {
+            WorkspaceView targetView = target.ViewKind switch
+            {
+                WorkspaceViewKind.Channel when !string.IsNullOrWhiteSpace(target.ConversationName) => profileWorkspace.EnsureChannel(target.ConversationName),
+                WorkspaceViewKind.Query when !string.IsNullOrWhiteSpace(target.ConversationName) => profileWorkspace.EnsureQuery(target.ConversationName),
+                _ => profileWorkspace.StatusView
+            };
+            ActivateView(targetView.Id);
+            return true;
+        }
+
+        return false;
+    }
+
     public async ValueTask ConnectAsync(Guid networkId, CancellationToken cancellationToken = default)
     {
         var entry = GetEntry(networkId);
@@ -406,10 +534,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         await StopEntryAsync(entry, "nexIRC network removed").ConfigureAwait(false);
-        if (entry.Options.SaslCredentialProvider is IDisposable disposable)
-        {
-            disposable.Dispose();
-        }
+        DisposeCredentialProviders(entry.Options);
     }
 
     public async ValueTask DisposeAsync()
@@ -430,10 +555,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         foreach (var entry in entries)
         {
             await StopEntryAsync(entry, "nexIRC shutting down").ConfigureAwait(false);
-            if (entry.Options.SaslCredentialProvider is IDisposable disposable)
-            {
-                disposable.Dispose();
-            }
+            DisposeCredentialProviders(entry.Options);
         }
 
         Task[] pending;
@@ -448,9 +570,21 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         {
             Notifications.Dispose();
         }
+
+        if (_ownsLogStore && _logStore is not null)
+        {
+            await _logStore.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
-    internal void AppendLocal(WorkspaceView view, TranscriptEntry entry) => view.Append(entry, markActivity: false);
+    internal void AppendLocal(WorkspaceView view, TranscriptEntry entry)
+    {
+        view.Append(entry, markActivity: false);
+        if (TryGet(view.NetworkId, out var workspace) && workspace is not null)
+        {
+            _logging?.Record(workspace.Id, workspace.ProfileId, view, entry);
+        }
+    }
 
     internal WhoisView? RouteWhoisEvent(NetworkWorkspace workspace, IrcWhoisEvent item)
     {
@@ -816,6 +950,19 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         entry.Workspace.ApplySnapshot(entry.Session.Snapshot);
     }
 
+    private static void DisposeCredentialProviders(NetworkConnectionOptions options)
+    {
+        if (options.SaslCredentialProvider is IDisposable saslProvider)
+        {
+            saslProvider.Dispose();
+        }
+
+        if (options.PasswordProvider is IDisposable passwordProvider)
+        {
+            passwordProvider.Dispose();
+        }
+    }
+
     private void ReplaceSession(SessionEntry entry)
     {
         entry.Session = new ServerSession(entry.Options.ToSessionOptions(), _transportFactory);
@@ -1101,6 +1248,16 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         view.Append(entry, markActivity: false);
+        if (view is ChannelView channel && semanticEvent is IrcJoinEvent)
+        {
+            RecordRecent(GetWorkspace(view.NetworkId), DestinationKind.Channel, channel.Channel);
+        }
+        else if (view is QueryView query && view.EntriesSnapshot.Count == 1 && semanticEvent is IrcQueryMessageEvent or IrcCtcpEvent)
+        {
+            RecordRecent(GetWorkspace(view.NetworkId), DestinationKind.Query, query.Nickname);
+        }
+
+        _logging?.Record(view.NetworkId, GetWorkspace(view.NetworkId).ProfileId, view, entry);
         if (!view.IsActive && effectiveActivity != WorkspaceActivity.None)
         {
             view.MarkActivity(effectiveActivity);
@@ -1117,7 +1274,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             }
         }
 
-        Notifications.Publish(new IrcNotification(
+        var notification = new IrcNotification(
             view.NetworkId,
             view.Id,
             view.Kind,
@@ -1128,7 +1285,28 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             entry.Timestamp,
             view.IsActive,
             semanticEvent.GetType().Name,
-            isOwnMessage));
+            isOwnMessage,
+            new NotificationActivationTarget(
+                view.NetworkId,
+                TryGet(view.NetworkId, out var targetWorkspace) ? targetWorkspace?.ProfileId : null,
+                view.Id,
+                view.Kind,
+                view is ChannelView targetChannel ? targetChannel.Channel : view is QueryView targetQuery ? targetQuery.Nickname : view.Title));
+        if (_notificationCoalescer.ShouldPublish(notification))
+        {
+            Notifications.Publish(notification);
+        }
+    }
+
+    private void SaveConfigurationInBackground()
+    {
+        if (Configuration is null) return;
+        _ = SaveConfigurationAsync();
+    }
+
+    private async Task SaveConfigurationAsync()
+    {
+        try { if (Configuration is not null) await Configuration.SaveAsync().ConfigureAwait(false); } catch { }
     }
 
     private static string FormatStateTransition(SessionStateChangedEvent change, ServerSessionSnapshot snapshot)

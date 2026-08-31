@@ -30,6 +30,17 @@
                         <CheckBox x:Name="ConnectionNotificationsBox" Content="Notify when a connection fails" />
                     </StackPanel>
                 </GroupBox>
+                <GroupBox Header="Conversation history" Padding="10" Margin="0,0,0,10">
+                    <StackPanel>
+                        <CheckBox x:Name="ConversationLoggingBox" Content="Enable persistent conversation logging" Margin="0,2,0,7" />
+                        <CheckBox x:Name="PrivateLoggingBox" Content="Log private conversations" Margin="0,0,0,7" />
+                        <CheckBox x:Name="StatusLoggingBox" Content="Log network/status messages" Margin="0,0,0,7" />
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="Retention days" VerticalAlignment="Center" />
+                            <TextBox x:Name="RetentionDaysBox" Width="70" Margin="12,0,0,0" />
+                        </StackPanel>
+                    </StackPanel>
+                </GroupBox>
                 <TextBlock Text="Notifications use an optional Windows taskbar balloon adapter. They never store credentials." Foreground="#64748B" TextWrapping="Wrap" />
             </StackPanel>
         </ScrollViewer>

@@ -19,6 +19,10 @@ public partial class PreferencesWindow : Window
         HighlightNotificationsBox.IsChecked = preferences.HighlightNotifications;
         PrivateMessageNotificationsBox.IsChecked = preferences.PrivateMessageNotifications;
         ConnectionNotificationsBox.IsChecked = preferences.ConnectionNotifications;
+        ConversationLoggingBox.IsChecked = preferences.ConversationLoggingEnabled;
+        PrivateLoggingBox.IsChecked = preferences.PrivateMessageLoggingEnabled;
+        StatusLoggingBox.IsChecked = preferences.StatusLoggingEnabled;
+        RetentionDaysBox.Text = preferences.LogRetentionDays.ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
 
     private async void OnSaveClick(object sender, RoutedEventArgs e)
@@ -31,7 +35,11 @@ public partial class PreferencesWindow : Window
             NotificationsEnabled = NotificationsBox.IsChecked == true,
             HighlightNotifications = HighlightNotificationsBox.IsChecked == true,
             PrivateMessageNotifications = PrivateMessageNotificationsBox.IsChecked == true,
-            ConnectionNotifications = ConnectionNotificationsBox.IsChecked == true
+            ConnectionNotifications = ConnectionNotificationsBox.IsChecked == true,
+            ConversationLoggingEnabled = ConversationLoggingBox.IsChecked == true,
+            PrivateMessageLoggingEnabled = PrivateLoggingBox.IsChecked == true,
+            StatusLoggingEnabled = StatusLoggingBox.IsChecked == true,
+            LogRetentionDays = int.TryParse(RetentionDaysBox.Text, out var retention) ? retention : 30
         };
         await _viewModel.ApplyPreferencesAsync(preferences);
         DialogResult = true;

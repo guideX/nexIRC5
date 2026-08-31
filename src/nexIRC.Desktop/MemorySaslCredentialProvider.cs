@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using nexIRC.Core.Networking;
+using nexIRC.Core.Session;
 using nexIRC.Core.State;
 
 namespace nexIRC.Desktop;
@@ -33,6 +34,35 @@ public sealed class MemorySaslCredentialProvider : ISaslCredentialProvider, IDis
         {
             copy = string.Empty;
         }
+    }
+
+    public void Dispose()
+    {
+        if (_password is null)
+        {
+            return;
+        }
+
+        CryptographicOperations.ZeroMemory(System.Runtime.InteropServices.MemoryMarshal.AsBytes(_password.AsSpan()));
+        _password = null;
+    }
+}
+
+public sealed class MemoryServerPasswordProvider : IServerPasswordProvider, IDisposable
+{
+    private char[]? _password;
+
+    public MemoryServerPasswordProvider(string password)
+    {
+        ArgumentNullException.ThrowIfNull(password);
+        _password = password.ToCharArray();
+    }
+
+    public ValueTask<string?> GetPasswordAsync(IrcEndpoint endpoint, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var password = _password ?? throw new ObjectDisposedException(nameof(MemoryServerPasswordProvider));
+        return ValueTask.FromResult<string?>(new string(password));
     }
 
     public void Dispose()

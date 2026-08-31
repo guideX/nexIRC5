@@ -196,3 +196,8 @@ clean `Registered -> Disconnected` transition; live LIST/WHOIS were not sent.
 Phase 1F should build on this foundation with secure secret-provider
 integration, profile import/export, favorites/recent destinations and deeper
 notification/view routing while retaining the network-scoped operation model.
+
+## Phase 1F cross-reference
+
+Phase 1F implements that follow-up in
+[Phase1F-Secure-Identity-Logging-Search-Favorites-And-Aliases.md](Phase1F-Secure-Identity-Logging-Search-Favorites-And-Aliases.md): secure profile-scoped credentials, bounded conversation history and search, favorites and MRU destinations, aliases, notification activation targets, and validated view-state persistence.

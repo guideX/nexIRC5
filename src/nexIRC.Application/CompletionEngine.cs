@@ -14,7 +14,13 @@ public sealed record CompletionResult(string Text, int CaretIndex, bool Complete
 /// </summary>
 public sealed class CompletionEngine
 {
+    private readonly Func<IReadOnlyList<AliasDefinition>> _aliases;
     private CompletionCycle? _cycle;
+
+    public CompletionEngine(Func<IReadOnlyList<AliasDefinition>>? aliases = null)
+    {
+        _aliases = aliases ?? (() => Array.Empty<AliasDefinition>());
+    }
 
     public CompletionResult Complete(
         string input,
@@ -52,8 +58,10 @@ public sealed class CompletionEngine
         {
             var commandPrefix = token[1..];
             var commands = IrcCommandDispatcher.SupportedCommands
+                .Concat(_aliases().Where(alias => alias.IsEnabled && !IrcCommandDispatcher.IsBuiltInCommand(alias.Name)).Select(alias => alias.Name))
                 .Where(command => command.StartsWith(commandPrefix, StringComparison.OrdinalIgnoreCase))
                 .Select(static command => "/" + command.ToLowerInvariant())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
             return Replace(input, tokenStart, tokenEnd, commands, caretIndex, "command", network, activeView, token);
         }

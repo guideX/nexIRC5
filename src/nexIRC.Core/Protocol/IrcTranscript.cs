@@ -51,12 +51,23 @@ public sealed record IrcTranscriptEntry(
 /// </summary>
 public static class IrcSensitiveData
 {
+    public static bool IsSensitiveCommandLine(string line)
+    {
+        ArgumentNullException.ThrowIfNull(line);
+        var withoutLineEnd = line.TrimStart();
+        var separator = withoutLineEnd.IndexOfAny([' ', '\t']);
+        var command = separator < 0 ? withoutLineEnd : withoutLineEnd[..separator];
+        return command.Equals("PASS", StringComparison.OrdinalIgnoreCase)
+            || command.Equals("AUTHENTICATE", StringComparison.OrdinalIgnoreCase);
+    }
+
     public static string RedactLine(string line)
     {
         ArgumentNullException.ThrowIfNull(line);
         var withoutLineEnd = line.TrimEnd('\r', '\n');
-        var separator = withoutLineEnd.IndexOf(' ');
-        var command = separator < 0 ? withoutLineEnd : withoutLineEnd[..separator];
+        var normalized = withoutLineEnd.TrimStart();
+        var separator = normalized.IndexOfAny([' ', '\t']);
+        var command = separator < 0 ? normalized : normalized[..separator];
         if (command.Equals("PASS", StringComparison.OrdinalIgnoreCase))
         {
             return "PASS :<redacted>";
@@ -67,7 +78,7 @@ public static class IrcSensitiveData
             return withoutLineEnd;
         }
 
-        var payload = separator < 0 ? string.Empty : withoutLineEnd[(separator + 1)..].TrimStart();
+        var payload = separator < 0 ? string.Empty : normalized[(separator + 1)..].TrimStart();
         if (payload.Equals("+", StringComparison.Ordinal))
         {
             return "AUTHENTICATE +";

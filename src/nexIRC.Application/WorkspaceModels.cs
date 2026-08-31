@@ -154,6 +154,8 @@ public sealed record NetworkConnectionOptions
 
     public ISaslCredentialProvider? SaslCredentialProvider { get; init; }
 
+    public IServerPasswordProvider? PasswordProvider { get; init; }
+
     public IReadOnlyList<ISaslMechanism> SaslMechanisms { get; init; } = [new SaslPlainMechanism()];
 
     public SaslAuthenticationPolicy SaslPolicy { get; init; } = SaslAuthenticationPolicy.Disabled;
@@ -173,6 +175,7 @@ public sealed record NetworkConnectionOptions
         ManualNetworkName = ManualNetworkName,
         ManualIrcd = ManualIrcd,
         SaslCredentialProvider = SaslCredentialProvider,
+        PasswordProvider = PasswordProvider,
         SaslMechanisms = SaslMechanisms,
         SaslPolicy = SaslPolicy
     };

@@ -23,7 +23,59 @@ public sealed record IrcNotification(
     DateTimeOffset Timestamp,
     bool IsViewActive,
     string SemanticSource,
-    bool IsOwnMessage = false);
+    bool IsOwnMessage = false,
+    NotificationActivationTarget? Activation = null);
+
+public sealed record NotificationActivationTarget(
+    Guid NetworkId,
+    Guid? ProfileId,
+    Guid ViewId,
+    WorkspaceViewKind ViewKind,
+    string ConversationName);
+
+public sealed class NotificationCoalescer
+{
+    private readonly object _gate = new();
+    private readonly Dictionary<(Guid NetworkId, Guid ViewId, IrcNotificationType Type), DateTimeOffset> _recent = [];
+    private readonly TimeSpan _window;
+
+    public NotificationCoalescer(TimeSpan? window = null)
+    {
+        _window = window ?? TimeSpan.FromSeconds(3);
+    }
+
+    public bool ShouldPublish(IrcNotification notification)
+    {
+        if (notification.IsViewActive || notification.IsOwnMessage || notification.Type is not (IrcNotificationType.Highlight or IrcNotificationType.PrivateMessage))
+        {
+            return true;
+        }
+
+        var now = notification.Timestamp;
+        lock (_gate)
+        {
+            foreach (var staleKey in _recent.Where(item => now - item.Value > _window).Select(item => item.Key).Take(32).ToArray())
+            {
+                _recent.Remove(staleKey);
+            }
+
+            var key = (notification.NetworkId, notification.ViewId, notification.Type);
+            if (_recent.TryGetValue(key, out var previous) && now - previous < _window)
+            {
+                return false;
+            }
+
+            if (_recent.Count >= ConfigurationLimits.MaximumNotificationCoalescingEntries)
+            {
+                var oldest = _recent.OrderBy(item => item.Value).First().Key;
+                _recent.Remove(oldest);
+            }
+
+            _recent[key] = now;
+            return true;
+        }
+    }
+}
 
 public interface IIrcNotificationService : IDisposable
 {

@@ -9,6 +9,9 @@
         WindowStartupLocation="CenterOwner">
     <DockPanel Margin="16">
         <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
+            <Button Content="Export selected…" Click="OnExportSelectedClick" Padding="12,6" Margin="0,0,8,0" />
+            <Button Content="Export all…" Click="OnExportAllClick" Padding="12,6" Margin="0,0,8,0" />
+            <Button Content="Import…" Click="OnImportClick" Padding="12,6" Margin="0,0,8,0" />
             <Button Content="Close" IsCancel="True" Padding="16,6" />
         </StackPanel>
         <Grid>
@@ -43,6 +46,28 @@
                     <TextBox x:Name="UsernameBox" Margin="0,3,0,8" />
                     <TextBlock Text="Real name" Foreground="#475569" />
                     <TextBox x:Name="RealNameBox" Margin="0,3,0,8" />
+                    <GroupBox Header="SASL authentication" Padding="8" Margin="0,2,0,10">
+                        <StackPanel>
+                            <TextBlock Text="Policy" Foreground="#475569" />
+                            <ComboBox x:Name="SaslPolicyBox" Margin="0,3,0,7" />
+                            <TextBlock Text="SASL username (defaults to nickname)" Foreground="#475569" />
+                            <TextBox x:Name="SaslUsernameBox" Margin="0,3,0,7" />
+                            <TextBlock x:Name="CredentialStateText" Text="No credential status loaded." Foreground="#475569" TextWrapping="Wrap" />
+                            <PasswordBox x:Name="SaslPasswordBox" Margin="0,5,0,5" ToolTip="Leave blank to preserve the stored credential." />
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="New password" VerticalAlignment="Center" Foreground="#475569" />
+                                <CheckBox x:Name="ClearCredentialBox" Content="Clear stored credential" Margin="16,0,0,0" />
+                            </StackPanel>
+                        </StackPanel>
+                    </GroupBox>
+                    <GroupBox Header="Server password (PASS)" Padding="8" Margin="0,0,0,10">
+                        <StackPanel>
+                            <CheckBox x:Name="ServerPasswordEnabledBox" Content="Send the stored server password during registration" />
+                            <TextBlock x:Name="ServerPasswordStateText" Text="No server password status loaded." Foreground="#475569" TextWrapping="Wrap" Margin="0,6,0,0" />
+                            <PasswordBox x:Name="ServerPasswordBox" Margin="0,5,0,5" ToolTip="Leave blank to preserve the stored password." />
+                            <CheckBox x:Name="ClearServerPasswordBox" Content="Clear stored server password" />
+                        </StackPanel>
+                    </GroupBox>
                     <TextBlock Text="Auto-join channels (comma, space, or newline separated)" Foreground="#475569" />
                     <TextBox x:Name="ChannelsBox" Height="52" AcceptsReturn="True" TextWrapping="Wrap" Margin="0,3,0,8" />
                     <StackPanel Orientation="Horizontal" Margin="0,3,0,12">

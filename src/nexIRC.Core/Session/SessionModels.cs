@@ -83,6 +83,8 @@ public sealed class ServerSessionOptions
 
     public string? Password { get; init; }
 
+    public IServerPasswordProvider? PasswordProvider { get; init; }
+
     public string? AlternateNickname { get; init; }
 
     /// <summary>
@@ -114,6 +116,11 @@ public sealed class ServerSessionOptions
     public IReadOnlyList<ISaslMechanism> SaslMechanisms { get; init; } = [new SaslPlainMechanism()];
 
     public SaslAuthenticationPolicy SaslPolicy { get; init; } = SaslAuthenticationPolicy.Disabled;
+}
+
+public interface IServerPasswordProvider
+{
+    ValueTask<string?> GetPasswordAsync(IrcEndpoint endpoint, CancellationToken cancellationToken = default);
 }
 
 public sealed record RawIrcLineEvent(

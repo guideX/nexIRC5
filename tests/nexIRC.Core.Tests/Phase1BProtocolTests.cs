@@ -146,5 +146,12 @@ public sealed class Phase1BProtocolTests
         Assert.Equal("AUTHENTICATE <redacted>\r\n", Encoding.UTF8.GetString(entry.RawBytes.Span));
     }
 
+    [Fact]
+    public void SensitiveCommandRedactionHandlesWhitespaceAndTabs()
+    {
+        Assert.Equal("PASS :<redacted>", IrcSensitiveData.RedactLine("  PASS\tprivate-secret\r\n"));
+        Assert.Equal("AUTHENTICATE <redacted>", IrcSensitiveData.RedactLine(" AUTHENTICATE\tprivate-secret"));
+    }
+
     private static IrcMessage Parse(string line) => IrcMessageParser.Parse(line).Message!;
 }

@@ -16,18 +16,22 @@ public sealed class DesktopNotificationAdapter : IDisposable
     private readonly Func<ApplicationPreferences> _preferences;
     private readonly NotifyIcon _icon;
     private readonly IDisposable _subscription;
+    private readonly Action<IrcNotification>? _activate;
+    private IrcNotification? _lastNotification;
     private int _disposed;
 
-    public DesktopNotificationAdapter(IIrcNotificationService notifications, Func<ApplicationPreferences> preferences)
+    public DesktopNotificationAdapter(IIrcNotificationService notifications, Func<ApplicationPreferences> preferences, Action<IrcNotification>? activate = null)
     {
         ArgumentNullException.ThrowIfNull(notifications);
         _preferences = preferences ?? throw new ArgumentNullException(nameof(preferences));
+        _activate = activate;
         _icon = new NotifyIcon
         {
             Icon = SystemIcons.Application,
             Text = "nexIRC 5",
             Visible = true
         };
+        _icon.BalloonTipClicked += OnBalloonTipClicked;
         _subscription = notifications.Subscribe(OnNotification);
     }
 
@@ -39,6 +43,7 @@ public sealed class DesktopNotificationAdapter : IDisposable
         }
 
         _subscription.Dispose();
+        _icon.BalloonTipClicked -= OnBalloonTipClicked;
         _icon.Visible = false;
         _icon.Dispose();
     }
@@ -83,6 +88,7 @@ public sealed class DesktopNotificationAdapter : IDisposable
             _ => "nexIRC connection"
         };
         var summary = notification.Summary.Length > 240 ? notification.Summary[..240] : notification.Summary;
+        _lastNotification = notification;
         try
         {
             _icon.ShowBalloonTip(3500, title, summary, notification.Type == IrcNotificationType.Error ? ToolTipIcon.Error : ToolTipIcon.Info);
@@ -90,6 +96,14 @@ public sealed class DesktopNotificationAdapter : IDisposable
         catch
         {
             // OS notification failures are an optional presentation concern.
+        }
+    }
+
+    private void OnBalloonTipClicked(object? sender, EventArgs e)
+    {
+        if (_lastNotification is { } notification)
+        {
+            try { _activate?.Invoke(notification); } catch { }
         }
     }
 }

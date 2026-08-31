@@ -17,21 +17,31 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private bool _isStatusBarVisible = true;
     private bool _shutdownStarted;
     private readonly DesktopNotificationAdapter? _notificationAdapter;
+    private readonly System.Windows.Threading.Dispatcher _uiDispatcher;
+    private readonly Dictionary<Guid, MemorySaslCredentialProvider> _sessionCredentials = [];
+    private readonly Dictionary<Guid, MemoryServerPasswordProvider> _sessionServerPasswords = [];
 
     public MainWindowViewModel(
         IIrcTransportFactory transportFactory,
         System.Windows.Threading.Dispatcher dispatcher,
-        ConfigurationService? configuration = null)
+        ConfigurationService? configuration = null,
+        ProfileCredentialService? credentials = null,
+        IConversationLogStore? logStore = null)
     {
+        _uiDispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         Configuration = configuration;
-        Sessions = new NetworkSessionManager(transportFactory, new WpfWorkspaceDispatcher(dispatcher), configuration: configuration);
+        Credentials = credentials ?? new ProfileCredentialService(
+            OperatingSystem.IsWindows()
+                ? new WindowsCredentialStore()
+                : new InMemoryProfileCredentialStore());
+        Sessions = new NetworkSessionManager(transportFactory, new WpfWorkspaceDispatcher(dispatcher), configuration: configuration, logStore: logStore);
         if (configuration is not null)
         {
-            _notificationAdapter = new DesktopNotificationAdapter(Sessions.Notifications, () => CurrentPreferences);
+            _notificationAdapter = new DesktopNotificationAdapter(Sessions.Notifications, () => CurrentPreferences, notification => { RouteNotification(notification); });
         }
         _commands = new IrcCommandDispatcher(Sessions);
         InputHistory = new InputHistory();
-        Completion = new CompletionEngine();
+        Completion = new CompletionEngine(() => Configuration?.Aliases ?? Array.Empty<AliasDefinition>());
         if (configuration is not null)
         {
             var preferences = configuration.Preferences;
@@ -71,6 +81,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public NetworkSessionManager Sessions { get; }
 
     public ConfigurationService? Configuration { get; }
+
+    public ProfileCredentialService Credentials { get; }
+
+    public ProfilePortabilityService? ProfilePortability => Configuration is null ? null : new ProfilePortabilityService(Configuration);
+
+    public IReadOnlyList<AliasDefinition> Aliases => Configuration?.Aliases ?? Array.Empty<AliasDefinition>();
 
     public ObservableCollection<NetworkWorkspace> Networks => Sessions.Networks;
 
@@ -165,7 +181,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             try
             {
-                var workspace = Sessions.Add(profile.ToConnectionOptions());
+                var workspace = Sessions.Add(profile.ToConnectionOptions(Credentials.Store));
                 if (profile.AutoConnect)
                 {
                     await Sessions.ConnectAsync(workspace.Id).ConfigureAwait(true);
@@ -194,11 +210,24 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        var options = profile.ToConnectionOptions();
+        var options = profile.ToConnectionOptions(Credentials.Store);
+        if (_sessionCredentials.TryGetValue(profile.Id, out var sessionCredential))
+        {
+            options = options with { SaslCredentialProvider = sessionCredential };
+        }
+        if (_sessionServerPasswords.TryGetValue(profile.Id, out var sessionServerPassword))
+        {
+            options = options with { PasswordProvider = sessionServerPassword };
+        }
         var workspace = Sessions.Networks.FirstOrDefault(network => network.ProfileId == profileId);
-        if (workspace is not null && !IsEquivalent(workspace.Options, options))
+        var runtimeProviderChanged = workspace is not null
+            && ((workspace.Options.SaslCredentialProvider is MemorySaslCredentialProvider) != _sessionCredentials.ContainsKey(profile.Id)
+                || (workspace.Options.PasswordProvider is MemoryServerPasswordProvider) != _sessionServerPasswords.ContainsKey(profile.Id));
+        if (workspace is not null && (!IsEquivalent(workspace.Options, options) || runtimeProviderChanged))
         {
             await Sessions.RemoveAsync(workspace.Id).ConfigureAwait(true);
+            _sessionCredentials.Remove(profile.Id);
+            _sessionServerPasswords.Remove(profile.Id);
             workspace = null;
         }
 
@@ -225,6 +254,77 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         StatusText = $"Saved profile {profile.DisplayName}.";
     }
 
+    public async Task SaveProfileAsync(NetworkProfile profile, string? saslPassword, bool clearSaslCredential)
+    {
+        await SaveProfileAsync(profile, saslPassword, clearSaslCredential, null, false, false).ConfigureAwait(true);
+    }
+
+    public async Task SaveProfileAsync(
+        NetworkProfile profile,
+        string? saslPassword,
+        bool clearSaslCredential,
+        string? serverPassword,
+        bool clearServerPassword,
+        bool updateServerPassword)
+    {
+        await SaveProfileAsync(profile).ConfigureAwait(true);
+        if (profile.SaslPolicy != nexIRC.Core.Session.SaslAuthenticationPolicy.Disabled)
+        {
+            if (clearSaslCredential)
+            {
+                var deleted = await Credentials.DeleteAsync(profile.Id, ProfileCredentialKind.Sasl).ConfigureAwait(true);
+                if (!deleted.Succeeded) StatusText = deleted.Diagnostic ?? "The stored SASL credential could not be deleted.";
+            }
+            else if (!string.IsNullOrEmpty(saslPassword))
+            {
+                var username = string.IsNullOrWhiteSpace(profile.SaslUsername) ? profile.Nickname : profile.SaslUsername;
+                var saved = await Credentials.SaveAsync(profile.Id, ProfileCredentialKind.Sasl, username, saslPassword).ConfigureAwait(true);
+                if (!saved.Succeeded)
+                {
+                    if (_sessionCredentials.Remove(profile.Id, out var previous)) previous.Dispose();
+                    _sessionCredentials[profile.Id] = new MemorySaslCredentialProvider(username, saslPassword);
+                    StatusText = saved.Diagnostic ?? "The SASL credential could not be stored securely; it will be used for this runtime session only.";
+                }
+                else if (_sessionCredentials.Remove(profile.Id, out var previous))
+                {
+                    previous.Dispose();
+                }
+            }
+        }
+
+        if (updateServerPassword)
+        {
+            if (clearServerPassword)
+            {
+                var deleted = await Credentials.DeleteAsync(profile.Id, ProfileCredentialKind.ServerPassword).ConfigureAwait(true);
+                if (!deleted.Succeeded) StatusText = deleted.Diagnostic ?? "The stored server password could not be deleted.";
+            }
+            else if (!string.IsNullOrEmpty(serverPassword))
+            {
+                var saved = await Credentials.SaveAsync(profile.Id, ProfileCredentialKind.ServerPassword, profile.Nickname, serverPassword).ConfigureAwait(true);
+                if (!saved.Succeeded)
+                {
+                    if (_sessionServerPasswords.Remove(profile.Id, out var previous)) previous.Dispose();
+                    _sessionServerPasswords[profile.Id] = new MemoryServerPasswordProvider(serverPassword);
+                    StatusText = saved.Diagnostic ?? "The server password could not be stored securely; it will be used for this runtime session only.";
+                }
+                else if (_sessionServerPasswords.Remove(profile.Id, out var previous))
+                {
+                    previous.Dispose();
+                }
+            }
+        }
+    }
+
+    public ValueTask<CredentialLoadResult> LoadCredentialStateAsync(Guid profileId) =>
+        Credentials.LoadAsync(profileId, ProfileCredentialKind.Sasl);
+
+    public ValueTask<bool> CredentialExistsAsync(Guid profileId) =>
+        Credentials.ExistsAsync(profileId, ProfileCredentialKind.Sasl);
+
+    public ValueTask<CredentialLoadResult> LoadServerPasswordStateAsync(Guid profileId) =>
+        Credentials.LoadAsync(profileId, ProfileCredentialKind.ServerPassword);
+
     public async Task DeleteProfileAsync(Guid profileId)
     {
         if (Configuration is null || !Configuration.Profiles.Remove(profileId))
@@ -237,6 +337,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             await Sessions.RemoveAsync(workspace.Id).ConfigureAwait(true);
         }
+
+        await Credentials.ClearProfileAsync(profileId).ConfigureAwait(true);
+        if (_sessionCredentials.Remove(profileId, out var sessionCredential)) sessionCredential.Dispose();
+        if (_sessionServerPasswords.Remove(profileId, out var serverPassword)) serverPassword.Dispose();
 
         await Configuration.SaveAsync().ConfigureAwait(true);
     }
@@ -266,6 +370,158 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             await Configuration.SaveAsync().ConfigureAwait(true);
         }
+    }
+
+    public async Task AddCurrentFavoriteAsync(string? label = null)
+    {
+        if (Sessions.ActiveNetwork is null || ActiveView is not (ChannelView or QueryView))
+        {
+            StatusText = "Select a channel or query first.";
+            return;
+        }
+
+        var kind = ActiveView is ChannelView ? DestinationKind.Channel : DestinationKind.Query;
+        var name = ActiveView is ChannelView channel ? channel.Channel : ((QueryView)ActiveView).Nickname;
+        StatusText = Sessions.AddFavorite(Sessions.ActiveNetwork.Id, kind, name, label)
+            ? $"Added {name} to favorites."
+            : "That destination is already a favorite or the favorite limit was reached.";
+        if (Configuration is not null)
+        {
+            await Configuration.SaveAsync().ConfigureAwait(true);
+        }
+    }
+
+    public void RemoveFavorite(Guid favoriteId) => Sessions.RemoveFavorite(favoriteId);
+
+    public async Task OpenDestinationAsync(Guid networkId, DestinationKind kind, string name)
+    {
+        if (!Sessions.TryGet(networkId, out var network) || network is null)
+        {
+            return;
+        }
+
+        WorkspaceView view = kind == DestinationKind.Channel
+            ? Sessions.EnsureChannel(networkId, name)
+            : Sessions.EnsureQuery(networkId, name);
+        Sessions.ActivateView(view.Id);
+        Sessions.RecordRecent(network, kind, name);
+        if (kind == DestinationKind.Channel && view is ChannelView channel && !channel.IsJoined)
+        {
+            await network.Session.JoinChannelAsync(name).ConfigureAwait(true);
+        }
+        await Task.CompletedTask;
+    }
+
+    public async Task<IReadOnlyList<ConversationLogSearchResult>> SearchLogsAsync(ConversationLogQuery query)
+    {
+        if (Sessions.LogStore is null) return Array.Empty<ConversationLogSearchResult>();
+        return await Sessions.LogStore.SearchAsync(query).ConfigureAwait(true);
+    }
+
+    public async Task<IReadOnlyList<ConversationLogRecord>> LoadHistoryPageAsync(
+        Guid scopeId,
+        LogConversationKind kind,
+        string conversationName,
+        int pageSize = ConfigurationLimits.MaximumHistoryPageSize,
+        DateTimeOffset? before = null)
+    {
+        if (Sessions.LogStore is null) return Array.Empty<ConversationLogRecord>();
+        return await Sessions.LogStore.ReadPageAsync(scopeId, kind, conversationName, pageSize, before).ConfigureAwait(true);
+    }
+
+    public bool RouteLogSearchResult(ConversationLogSearchResult result)
+    {
+        var network = Sessions.Networks.FirstOrDefault(item => item.Id == result.Record.NetworkId)
+            ?? (result.Record.ProfileId is Guid profileId ? Sessions.Networks.FirstOrDefault(item => item.ProfileId == profileId) : null);
+        if (network is not null)
+        {
+            return Sessions.ActivateNotification(new IrcNotification(
+                network.Id,
+                Guid.Empty,
+                result.Record.ConversationKind == LogConversationKind.Channel ? WorkspaceViewKind.Channel
+                    : result.Record.ConversationKind == LogConversationKind.PrivateConversation ? WorkspaceViewKind.Query : WorkspaceViewKind.ServerStatus,
+                IrcNotificationType.Status,
+                WorkspaceActivity.None,
+                result.Record.Sender,
+                result.Preview,
+                result.Record.Timestamp,
+                false,
+                nameof(ConversationLogSearchResult),
+                Activation: new NotificationActivationTarget(
+                    network.Id,
+                    network.ProfileId,
+                    Guid.Empty,
+                    result.Record.ConversationKind == LogConversationKind.Channel ? WorkspaceViewKind.Channel
+                        : result.Record.ConversationKind == LogConversationKind.PrivateConversation ? WorkspaceViewKind.Query : WorkspaceViewKind.ServerStatus,
+                    result.Record.ConversationName)));
+        }
+
+        return false;
+    }
+
+    public void CaptureViewState(double width, double height, double left, double top, bool maximized, double navigationPaneWidth)
+    {
+        if (Configuration is null) return;
+        var state = ViewStateValidator.Normalize(CurrentPreferences.ViewState with
+        {
+            WindowWidth = width,
+            WindowHeight = height,
+            WindowLeft = left,
+            WindowTop = top,
+            IsMaximized = maximized,
+            NavigationPaneWidth = navigationPaneWidth
+        });
+        Configuration.SetPreferences(CurrentPreferences with { ViewState = state });
+    }
+
+    public async Task ExportProfilesAsync(string path, IEnumerable<Guid>? selectedIds = null)
+    {
+        if (ProfilePortability is null) return;
+        await ProfilePortability.ExportAsync(path, selectedIds).ConfigureAwait(true);
+        StatusText = "Profiles exported without credentials.";
+    }
+
+    public async Task<ProfileImportResult> ImportProfilesAsync(string path)
+    {
+        if (ProfilePortability is null) return new ProfileImportResult([], 0, ["Configuration is unavailable."]);
+        var result = await ProfilePortability.ImportAsync(path).ConfigureAwait(true);
+        await Configuration!.SaveAsync().ConfigureAwait(true);
+        StatusText = result.Diagnostics.Count == 0 ? $"Imported {result.ImportedProfiles.Count} profile(s)." : string.Join(" ", result.Diagnostics);
+        return result;
+    }
+
+    public bool RouteNotification(IrcNotification notification)
+    {
+        if (!_uiDispatcher.CheckAccess())
+        {
+            _uiDispatcher.BeginInvoke(new Action(() => RouteNotification(notification)));
+            return true;
+        }
+
+        var routed = Sessions.ActivateNotification(notification);
+        if (routed) NotificationActivationRequested?.Invoke(notification);
+        return routed;
+    }
+
+    public event Action<IrcNotification>? NotificationActivationRequested;
+
+    public async Task SaveAliasAsync(AliasDefinition alias)
+    {
+        if (Configuration is null || !AliasValidator.Validate(alias).IsValid || !Configuration.AddOrUpdateAlias(alias))
+        {
+            StatusText = AliasValidator.Validate(alias).Error ?? "The alias could not be saved.";
+            return;
+        }
+
+        await Configuration.SaveAsync().ConfigureAwait(true);
+        StatusText = $"Saved alias /{alias.Name.Trim().TrimStart('/')}.";
+    }
+
+    public async Task DeleteAliasAsync(Guid aliasId)
+    {
+        if (Configuration is null) return;
+        Configuration.RemoveAlias(aliasId);
+        await Configuration.SaveAsync().ConfigureAwait(true);
     }
 
     public void SelectView(object? selectedItem)
@@ -355,6 +611,16 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             await Configuration.SaveAsync().ConfigureAwait(true);
         }
+        foreach (var provider in _sessionCredentials.Values)
+        {
+            provider.Dispose();
+        }
+        _sessionCredentials.Clear();
+        foreach (var provider in _sessionServerPasswords.Values)
+        {
+            provider.Dispose();
+        }
+        _sessionServerPasswords.Clear();
     }
 
     private void SavePreferencesInBackground()
@@ -390,6 +656,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         && left.Nickname == right.Nickname
         && left.Username == right.Username
         && left.RealName == right.RealName
+        && left.SaslPolicy == right.SaslPolicy
+        && left.PasswordProvider?.GetType() == right.PasswordProvider?.GetType()
         && left.AutoConnect == right.AutoConnect
         && left.Reconnect == right.Reconnect
         && left.NicknameFallbacks.SequenceEqual(right.NicknameFallbacks, StringComparer.Ordinal)

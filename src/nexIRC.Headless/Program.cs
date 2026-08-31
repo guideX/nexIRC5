@@ -19,7 +19,7 @@ internal static class Program
 
         if (arguments.Server is null)
         {
-            Console.Error.WriteLine("Usage: nexIRC.Headless --server <host> [--port <port>] [--no-tls] [--nick <nick>] [--transcript <path>]");
+            Console.Error.WriteLine("Usage: nexIRC.Headless --server <host> [--port <port>] [--no-tls] [--nick <nick>] [--whois-self] [--transcript <path>]");
             return 2;
         }
 
@@ -41,13 +41,47 @@ internal static class Program
             Reconnect = new ReconnectPolicy(Enabled: false)
         };
         await using var session = new ServerSession(options, new TcpTlsIrcTransportFactory());
+        var registered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var whoisComplete = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         session.StateChanged += (_, change) => Console.WriteLine($"STATE {change.Previous} -> {change.Current} (generation {change.ConnectionGeneration})");
-        session.SemanticEventReceived += (_, item) => Console.WriteLine($"EVENT {item.Event.GetType().Name}: {item.Event.Message.RawLine}");
+        session.StateChanged += (_, change) =>
+        {
+            if (change.Current == ServerSessionState.Registered)
+            {
+                registered.TrySetResult(true);
+            }
+        };
+        session.SemanticEventReceived += (_, item) =>
+        {
+            Console.WriteLine($"EVENT {item.Event.GetType().Name}: {IrcSensitiveData.RedactLine(item.Event.Message.RawLine)}");
+            if (item.Event is IrcWhoisEvent { Numeric: 318 } whois
+                && string.Equals(whois.Nickname, arguments.Nickname, StringComparison.OrdinalIgnoreCase))
+            {
+                whoisComplete.TrySetResult(true);
+            }
+        };
 
         var rawTask = PrintRawAsync(session, cancellation.Token);
         var runTask = session.RunAsync(cancellation.Token);
         try
         {
+            if (arguments.WhoisSelf)
+            {
+                var startup = await Task.WhenAny(registered.Task, runTask).ConfigureAwait(false);
+                if (startup == registered.Task)
+                {
+                    await session.SendCommandAsync("WHOIS", [arguments.Nickname], cancellationToken: cancellation.Token).ConfigureAwait(false);
+                    Console.WriteLine($"WHOIS sent for temporary nickname {arguments.Nickname}; waiting for 318.");
+                    await whoisComplete.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellation.Token).ConfigureAwait(false);
+                    Console.WriteLine("WHOIS self proof received (numeric 318).");
+                    await session.DisconnectAsync("nexIRC Phase 1F smoke test").ConfigureAwait(false);
+                }
+                else
+                {
+                    Console.WriteLine("WHOIS self proof was not attempted because registration ended first.");
+                }
+            }
+
             await runTask.ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
@@ -182,6 +216,7 @@ internal static class Program
         public int Port { get; private set; } = 6697;
         public bool UseTls { get; private set; } = true;
         public string Nickname { get; private set; } = "nexIRC5";
+        public bool WhoisSelf { get; private set; }
 
         public static Arguments Parse(string[] args)
         {
@@ -201,6 +236,9 @@ internal static class Program
                         break;
                     case "--transcript" when index + 1 < args.Length:
                         result.TranscriptPath = args[++index];
+                        break;
+                    case "--whois-self":
+                        result.WhoisSelf = true;
                         break;
                     case "--no-tls":
                         result.UseTls = false;

@@ -99,11 +99,46 @@ public sealed class DemoScenario
             && alpha.Channels.Any(channel => channel.Channel == "#alpha")
             && beta.Channels.Any(channel => channel.Channel == "#lounge")).ConfigureAwait(true);
 
+        sessions.Configuration?.AddOrUpdateAlias(new AliasDefinition { Name = "j", Expansion = "/join $1", Description = "Join a channel quickly." });
+        sessions.Configuration?.AddOrUpdateAlias(new AliasDefinition { Name = "w", Expansion = "/whois $1", Description = "Open WHOIS quickly." });
+        sessions.AddFavorite(alpha.Id, DestinationKind.Channel, "#alpha", "Alpha home");
+        sessions.AddFavorite(beta.Id, DestinationKind.Channel, "#lounge", "Beta lounge");
+        sessions.RecordRecent(alpha, DestinationKind.Channel, "#alpha");
+        sessions.RecordRecent(beta, DestinationKind.Channel, "#lounge");
+
         var dispatcher = new IrcCommandDispatcher(sessions);
+        var completion = new CompletionEngine(() => sessions.Configuration?.Aliases ?? Array.Empty<AliasDefinition>());
+        if (!completion.Complete("/j", 2, alpha, alpha.Channels[0]).Completed)
+        {
+            throw new InvalidOperationException("The deterministic demo alias completion did not return a result.");
+        }
         var alphaChannel = alpha.Channels.First(channel => channel.Channel == "#alpha");
+        await dispatcher.DispatchAsync(alpha, alphaChannel, "/j #lounge").ConfigureAwait(true);
         await dispatcher.DispatchAsync(alpha, alphaChannel, "Local AlphaNet message").ConfigureAwait(true);
         await dispatcher.DispatchAsync(alpha, alphaChannel, "/me demonstrates a local action").ConfigureAwait(true);
         await dispatcher.DispatchAsync(alpha, alphaChannel, "/msg Mira A local private message").ConfigureAwait(true);
+
+        if (sessions.LogStore is { } logs)
+        {
+            await logs.FlushAsync().ConfigureAwait(true);
+            var results = await logs.SearchAsync(new ConversationLogQuery { Text = "Welcome", NetworkId = alpha.Id }).ConfigureAwait(true);
+            var result = results.Count > 0 ? results[0] : null;
+            if (result is not null)
+            {
+                sessions.ActivateNotification(new IrcNotification(
+                    alpha.Id,
+                    Guid.Empty,
+                    WorkspaceViewKind.Channel,
+                    IrcNotificationType.Status,
+                    WorkspaceActivity.None,
+                    result.Record.Sender,
+                    result.Preview,
+                    result.Record.Timestamp,
+                    false,
+                    nameof(DemoScenario),
+                    Activation: new NotificationActivationTarget(alpha.Id, alpha.ProfileId, Guid.Empty, WorkspaceViewKind.Channel, result.Record.ConversationName)));
+            }
+        }
 
         sessions.ActivateView(alpha.StatusView.Id);
     }

@@ -60,6 +60,30 @@ public sealed class ServerSessionTests
     }
 
     [Fact]
+    public async Task SendsPassFromProviderWithoutRetainingProviderFailureInSessionState()
+    {
+        var endpoint = new IrcEndpoint("test.example", 6667, false);
+        var transport = new FakeIrcTransport(endpoint);
+        var factory = new FakeIrcTransportFactory();
+        factory.Add(transport);
+        await using var session = new ServerSession(new ServerSessionOptions
+        {
+            Endpoint = endpoint,
+            Nickname = "nex",
+            PasswordProvider = new TestServerPasswordProvider("provider-secret"),
+            Reconnect = new ReconnectPolicy(Enabled: false)
+        }, factory);
+
+        var run = session.RunAsync();
+        await WaitForAsync(() => transport.OutboundLines.Contains("PASS :provider-secret"));
+        transport.EnqueueInboundLine(":srv CAP * LS :");
+        transport.EnqueueInboundLine(":srv 001 nex :Welcome");
+        await WaitForAsync(() => session.Snapshot.State == ServerSessionState.Registered);
+        await session.DisconnectAsync();
+        await run;
+    }
+
+    [Fact]
     public async Task OrderedNicknameFallbacksAreTriedWithoutRandomPolicyInsideTheParser()
     {
         var endpoint = new IrcEndpoint("test.example", 6667, false);
@@ -299,5 +323,14 @@ public sealed class ServerSessionTests
         }
 
         throw new InvalidOperationException("The expected numeric was not found.");
+    }
+
+    private sealed class TestServerPasswordProvider(string password) : IServerPasswordProvider
+    {
+        public ValueTask<string?> GetPasswordAsync(IrcEndpoint endpoint, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return ValueTask.FromResult<string?>(password);
+        }
     }
 }

@@ -16,20 +16,45 @@ public partial class MainWindow : Window
 {
     private bool _closing;
 
-    public MainWindow(IIrcTransportFactory transportFactory, ConfigurationService? configuration = null)
+    public MainWindow(
+        IIrcTransportFactory transportFactory,
+        ConfigurationService? configuration = null,
+        ProfileCredentialService? credentials = null,
+        IConversationLogStore? logStore = null)
     {
         InitializeComponent();
         ViewModel = new MainWindowViewModel(
             transportFactory,
             Dispatcher,
-            configuration ?? new ConfigurationService(new InMemoryConfigurationStore()));
+            configuration ?? new ConfigurationService(new InMemoryConfigurationStore()),
+            credentials,
+            logStore);
         DataContext = ViewModel;
         ViewModel.NewConnectionRequested += ShowNewConnectionAsync;
         ViewModel.ExitRequested += Close;
+        ViewModel.NotificationActivationRequested += _ =>
+        {
+            if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+            Activate();
+            Focus();
+        };
         AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(OnPreviewRightClick), true);
     }
 
     public MainWindowViewModel ViewModel { get; }
+
+    private void OnLoaded(object sender, RoutedEventArgs e)
+    {
+        var state = ViewModel.CurrentPreferences.ViewState;
+        var bounds = SystemParameters.WorkArea;
+        var valid = ViewStateValidator.Normalize(state, new ViewportBounds(bounds.Left, bounds.Top, bounds.Right, bounds.Bottom));
+        Width = valid.WindowWidth;
+        Height = valid.WindowHeight;
+        if (valid.WindowLeft is double left) Left = left;
+        if (valid.WindowTop is double top) Top = top;
+        NavigationColumn.Width = new GridLength(valid.NavigationPaneWidth);
+        if (valid.IsMaximized) WindowState = WindowState.Maximized;
+    }
 
     private async Task ShowNewConnectionAsync()
     {
@@ -128,6 +153,15 @@ public partial class MainWindow : Window
             await Task.CompletedTask;
         }
     }
+
+    private void OnFavoritesClick(object sender, RoutedEventArgs e) =>
+        new FavoritesWindow(ViewModel) { Owner = this }.ShowDialog();
+
+    private void OnAliasesClick(object sender, RoutedEventArgs e) =>
+        new AliasesWindow(ViewModel) { Owner = this }.ShowDialog();
+
+    private void OnLogsClick(object sender, RoutedEventArgs e) =>
+        new LogViewerWindow(ViewModel) { Owner = this }.ShowDialog();
 
     private async void OnChannelListDoubleClick(object sender, MouseButtonEventArgs e)
     {
@@ -275,6 +309,7 @@ public partial class MainWindow : Window
 
         e.Cancel = true;
         _closing = true;
+        ViewModel.CaptureViewState(ActualWidth, ActualHeight, Left, Top, WindowState == WindowState.Maximized, NavigationColumn.ActualWidth);
         await ViewModel.ShutdownAsync();
         Close();
     }
