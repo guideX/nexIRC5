@@ -3,6 +3,7 @@ using nexIRC.Application;
 using nexIRC.Core.Networking;
 using nexIRC.Core.Session;
 using nexIRC.Core.State;
+using MessageBox = System.Windows.MessageBox;
 
 namespace nexIRC.Desktop;
 

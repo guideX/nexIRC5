@@ -29,8 +29,30 @@ public sealed class DemoScenario
 
     public async Task SeedAsync(NetworkSessionManager sessions)
     {
-        var alpha = sessions.Add(Options("AlphaNet", _alpha.Endpoint, "nexAlpha", "#alpha", "#lounge"));
-        var beta = sessions.Add(Options("BetaNet", _beta.Endpoint, "nexBeta", "#lounge"));
+        var alphaProfile = new NetworkProfile
+        {
+            Id = Guid.NewGuid(),
+            DisplayName = "AlphaNet",
+            Host = _alpha.Endpoint.Host,
+            Port = _alpha.Endpoint.Port,
+            UseTls = _alpha.Endpoint.UseTls,
+            Nickname = "nexAlpha",
+            Username = "nexAlpha",
+            RealName = "nexIRC 5 deterministic demo",
+            AutoJoinChannels = ["#alpha", "#lounge"]
+        };
+        var betaProfile = alphaProfile with
+        {
+            Id = Guid.NewGuid(),
+            DisplayName = "BetaNet",
+            Host = _beta.Endpoint.Host,
+            Nickname = "nexBeta",
+            AutoJoinChannels = ["#lounge"]
+        };
+        sessions.Configuration?.Profiles.AddOrUpdate(alphaProfile);
+        sessions.Configuration?.Profiles.AddOrUpdate(betaProfile);
+        var alpha = sessions.Add(Options("AlphaNet", _alpha.Endpoint, "nexAlpha", "#alpha", "#lounge") with { ProfileId = alphaProfile.Id });
+        var beta = sessions.Add(Options("BetaNet", _beta.Endpoint, "nexBeta", "#lounge") with { ProfileId = betaProfile.Id });
         await sessions.ConnectAsync(alpha.Id).ConfigureAwait(true);
         await sessions.ConnectAsync(beta.Id).ConfigureAwait(true);
         await WaitForAsync(() => _alpha.ConnectCount == 1 && _beta.ConnectCount == 1).ConfigureAwait(true);
@@ -48,6 +70,7 @@ public sealed class DemoScenario
         _alpha.EnqueueInboundLine(":Rook!r@alpha PRIVMSG #alpha :Try /join, /me, or /query in the command line.");
         _alpha.EnqueueInboundLine(":Mira!m@alpha PRIVMSG #alpha :nexAlpha, this is an important highlight.");
         _alpha.EnqueueInboundLine(":Mira!m@alpha PRIVMSG nexAlpha :This private query is intentionally highlighted.");
+        _alpha.EnqueueInboundLine(":Mira!m@alpha PRIVMSG nexAlpha :\u0001VERSION\u0001");
         _alpha.EnqueueInboundLine(":Rook!r@alpha NICK RookAway");
         _alpha.EnqueueInboundLine(":alpha.server 311 nexAlpha Mira mira alpha.example * :Mira Demo User");
         _alpha.EnqueueInboundLine(":alpha.server 312 nexAlpha Mira alpha.server :AlphaNet IRC services");
@@ -68,6 +91,7 @@ public sealed class DemoScenario
         _beta.EnqueueInboundLine(":beta.server 366 nexBeta #lounge :End of names");
         _beta.EnqueueInboundLine(":beta.server 332 nexBeta #lounge :Beta network topic");
         _beta.EnqueueInboundLine(":Mira!m@beta PRIVMSG #lounge :Events from BetaNet stay in BetaNet.");
+        _beta.EnqueueInboundLine(":Mira!m@beta PRIVMSG nexBeta :The same nickname is a different BetaNet query.");
         _beta.EnqueueInboundLine(":beta.server NOTICE nexBeta :Status notices are rendered in the server view.");
 
         await WaitForAsync(() => alpha.State == NetworkDisplayState.Registered

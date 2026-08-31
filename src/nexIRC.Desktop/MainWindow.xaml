@@ -205,6 +205,7 @@
         <Menu DockPanel.Dock="Top" IsMainMenu="True">
             <MenuItem Header="_File">
                 <MenuItem Header="_New Connection…" Command="{Binding NewConnectionCommand}" />
+                <MenuItem Header="Saved _Network Profiles…" Click="OnProfilesClick" />
                 <Separator />
                 <MenuItem Header="_Disconnect" Command="{Binding DisconnectCommand}" />
                 <MenuItem Header="_Reconnect" Command="{Binding ReconnectCommand}" />
@@ -231,7 +232,7 @@
                 <MenuItem Header="Highlight nickname" IsCheckable="True" IsChecked="{Binding HighlightPolicy.HighlightNickname, Mode=TwoWay}" />
                 <MenuItem Header="Highlight custom words" IsCheckable="True" IsChecked="{Binding HighlightPolicy.HighlightCustomWords, Mode=TwoWay}" />
                 <Separator />
-                <MenuItem Header="Preferences" IsEnabled="False" />
+                <MenuItem Header="Preferences…" Click="OnPreferencesClick" />
             </MenuItem>
             <MenuItem Header="_Window">
                 <MenuItem Header="_Next View" Command="{Binding NextViewCommand}" />
@@ -257,7 +258,7 @@
         <StatusBar DockPanel.Dock="Bottom" Visibility="{Binding IsStatusBarVisible, Converter={StaticResource BooleanToVisibility}}">
             <StatusBarItem Content="{Binding StatusText}" />
             <Separator />
-            <StatusBarItem Content="nexIRC 5 · Phase 1D" />
+            <StatusBarItem Content="nexIRC 5 · Phase 1E" />
         </StatusBar>
 
         <Grid>

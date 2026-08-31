@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using nexIRC.Core.Session;
+using nexIRC.Core.State;
 
 namespace nexIRC.Application;
 
@@ -100,7 +101,7 @@ public sealed class ChannelListResult : ObservableObject
         State = RichResultState.Loading;
     }
 
-    public void Apply(IrcListItemEvent item)
+    public void Apply(IrcListItemEvent item, IrcCaseMapping mapping = IrcCaseMapping.Rfc1459)
     {
         if (State == RichResultState.Idle)
         {
@@ -109,7 +110,7 @@ public sealed class ChannelListResult : ObservableObject
 
         lock (_gate)
         {
-            var existing = Rows.FirstOrDefault(row => string.Equals(row.Channel, item.Channel, StringComparison.OrdinalIgnoreCase));
+            var existing = Rows.FirstOrDefault(row => IrcCaseMappingComparer.Equals(row.Channel, item.Channel, mapping));
             if (existing is not null)
             {
                 Rows[Rows.IndexOf(existing)] = new ChannelListRow(item.Channel, item.VisibleUsers, item.Topic);
@@ -124,7 +125,10 @@ public sealed class ChannelListResult : ObservableObject
 
             var row = new ChannelListRow(item.Channel, item.VisibleUsers, item.Topic);
             var insertionIndex = 0;
-            while (insertionIndex < Rows.Count && string.Compare(Rows[insertionIndex].Channel, row.Channel, StringComparison.OrdinalIgnoreCase) < 0)
+            while (insertionIndex < Rows.Count
+                && StringComparer.Ordinal.Compare(
+                    IrcCaseMappingComparer.Fold(Rows[insertionIndex].Channel, mapping),
+                    IrcCaseMappingComparer.Fold(row.Channel, mapping)) < 0)
             {
                 insertionIndex++;
             }
@@ -159,7 +163,7 @@ public sealed class ChannelListView : WorkspaceView
 
     internal void BeginRequest() => Result.Begin();
 
-    internal void Apply(IrcListItemEvent item) => Result.Apply(item);
+    internal void Apply(IrcListItemEvent item, IrcCaseMapping mapping = IrcCaseMapping.Rfc1459) => Result.Apply(item, mapping);
 
     internal void CompleteRequest() => Result.Complete();
 }

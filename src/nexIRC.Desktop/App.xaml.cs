@@ -1,7 +1,9 @@
 using System.Windows;
+using nexIRC.Application;
 using nexIRC.Core.Networking;
 using nexIRC.Networking;
 using nexIRC.Networking.Testing;
+using MessageBox = System.Windows.MessageBox;
 
 namespace nexIRC.Desktop;
 
@@ -23,7 +25,22 @@ public partial class App : System.Windows.Application
             transportFactory = new TcpTlsIrcTransportFactory();
         }
 
-        var window = new MainWindow(transportFactory);
+        ConfigurationService? configuration;
+        ConfigurationLoadResult? loadResult = null;
+        if (demo)
+        {
+            configuration = new ConfigurationService(new InMemoryConfigurationStore(new NexIrcConfiguration
+            {
+                Preferences = new ApplicationPreferences { NotificationsEnabled = true }
+            }));
+        }
+        else
+        {
+            configuration = new ConfigurationService(new JsonConfigurationStore(ConfigurationPaths.GetDefaultPath()));
+            loadResult = await configuration.LoadAsync().ConfigureAwait(true);
+        }
+
+        var window = new MainWindow(transportFactory, configuration);
         MainWindow = window;
         window.Show();
         if (demo && demoScenario is not null)
@@ -36,6 +53,15 @@ public partial class App : System.Windows.Application
             {
                 MessageBox.Show(window, exception.Message, "Demo mode", MessageBoxButton.OK, MessageBoxImage.Error);
             }
+        }
+        else
+        {
+            if (loadResult?.Diagnostic is { } diagnostic && loadResult.UsedDefaults)
+            {
+                window.ViewModel.StatusText = diagnostic;
+            }
+
+            await window.ViewModel.RestoreProfilesAsync().ConfigureAwait(true);
         }
     }
 }

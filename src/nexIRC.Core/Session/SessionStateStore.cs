@@ -48,6 +48,13 @@ internal sealed class SessionStateStore
 
     public bool IsDesiredChannel(string channel) => _desiredChannels.Contains(channel);
 
+    public bool ShouldRequestJoin(string channel)
+    {
+        var key = ChannelKey(channel);
+        return !_channels.TryGetValue(key, out var existing)
+            || (!existing.IsJoined && existing.Synchronization == ChannelSynchronizationState.NotRequested);
+    }
+
     public void SetCaseMapping(IrcCaseMapping caseMapping)
     {
         if (_caseMapping == caseMapping)
@@ -193,13 +200,13 @@ internal sealed class SessionStateStore
                 events.Add(new IrcMotdEvent(message, IrcMotdEventKind.End, Text(message)));
                 break;
             case "321":
-                events.Add(new IrcListStartEvent(message));
+                events.Add(new IrcListStartEvent(message, RequestLabel(message)));
                 break;
             case "322":
                 ApplyListItem(message, events);
                 break;
             case "323":
-                events.Add(new IrcListEndEvent(message));
+                events.Add(new IrcListEndEvent(message, RequestLabel(message)));
                 break;
             case "352":
                 ApplyWho(message, features, events);
@@ -366,16 +373,41 @@ internal sealed class SessionStateStore
             return;
         }
 
-        var semantic = new IrcPrivmsgEvent(message, target, text, isNotice);
-        events.Add(semantic);
+        if (TryParseCtcp(text, out var ctcpCommand, out var ctcpArguments))
+        {
+            events.Add(new IrcCtcpEvent(message, target, ctcpCommand, ctcpArguments, isNotice));
+        }
+        else
+        {
+            events.Add(new IrcPrivmsgEvent(message, target, text, isNotice));
+        }
         if (!IsChannelTarget(target, features.ChannelTypes) && !string.IsNullOrEmpty(message.Prefix?.Name) && !NamesEqual(message.Prefix.Name, _nickname, features.CaseMapping))
         {
             var query = _queries.TryGetValue(NameKey(message.Prefix.Name), out var existing)
                 ? existing
                 : (_queries[NameKey(message.Prefix.Name)] = new MutableQuery(message.Prefix.Name, _connectionGeneration));
-            query.Messages.Add(text);
-            events.Add(new IrcQueryMessageEvent(message, message.Prefix.Name, text, isNotice));
+            query.Messages.Add(TryParseCtcp(text, out var command, out var arguments) ? $"[CTCP {command}{(arguments.Length == 0 ? string.Empty : $" {arguments}")}]" : text);
+            if (!TryParseCtcp(text, out _, out _))
+            {
+                events.Add(new IrcQueryMessageEvent(message, message.Prefix.Name, text, isNotice));
+            }
         }
+    }
+
+    private static bool TryParseCtcp(string text, out string command, out string arguments)
+    {
+        command = string.Empty;
+        arguments = string.Empty;
+        if (text.Length < 2 || text[0] != '\u0001' || text[^1] != '\u0001')
+        {
+            return false;
+        }
+
+        var payload = text[1..^1];
+        var separator = payload.IndexOf(' ');
+        command = (separator < 0 ? payload : payload[..separator]).Trim().ToUpperInvariant();
+        arguments = separator < 0 ? string.Empty : payload[(separator + 1)..].Trim();
+        return command.Length > 0 && command.Length <= 32;
     }
 
     private void ApplyTopic(IrcMessage message, List<IrcSemanticEvent> events)
@@ -604,7 +636,7 @@ internal sealed class SessionStateStore
         var count = int.TryParse(Parameter(message, 2), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var parsed)
             ? parsed
             : 0;
-        events.Add(new IrcListItemEvent(message, channel, count, Text(message)));
+        events.Add(new IrcListItemEvent(message, channel, count, Text(message), RequestLabel(message)));
     }
 
     private void ApplyWho(IrcMessage message, ServerFeatureSet features, List<IrcSemanticEvent> events)
@@ -642,8 +674,12 @@ internal sealed class SessionStateStore
     private static void ApplyWhois(IrcMessage message, List<IrcSemanticEvent> events)
     {
         var nickname = Parameter(message, 1) ?? Parameter(message, 0) ?? string.Empty;
-        events.Add(new IrcWhoisEvent(message, message.NumericCommand ?? 0, nickname, message.Parameters, message.HasTrailingParameter ? message.TrailingParameter : null));
+        events.Add(new IrcWhoisEvent(message, message.NumericCommand ?? 0, nickname, message.Parameters, message.HasTrailingParameter ? message.TrailingParameter : null, RequestLabel(message)));
     }
+
+    private static string? RequestLabel(IrcMessage message) => message.TagValues.TryGetValue("label", out var label)
+        ? label
+        : null;
 
     private static string Text(IrcMessage message) => message.HasTrailingParameter
         ? message.TrailingParameter ?? string.Empty

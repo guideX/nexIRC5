@@ -181,6 +181,13 @@ public sealed record IrcQuitEvent(IrcMessage Message, string Nickname, string? R
 
 public sealed record IrcPrivmsgEvent(IrcMessage Message, string Target, string Text, bool IsNotice) : IrcSemanticEvent(Message);
 
+public sealed record IrcCtcpEvent(
+    IrcMessage Message,
+    string Target,
+    string Command,
+    string Arguments,
+    bool IsNotice) : IrcSemanticEvent(Message);
+
 public sealed record IrcTopicEvent(IrcMessage Message, string Channel, string Topic) : IrcSemanticEvent(Message);
 
 public sealed record IrcNamesEvent(IrcMessage Message, string Channel, IReadOnlyList<string> Nicknames) : IrcSemanticEvent(Message);
@@ -206,15 +213,16 @@ public enum IrcMotdEventKind
     End
 }
 
-public sealed record IrcListStartEvent(IrcMessage Message) : IrcSemanticEvent(Message);
+public sealed record IrcListStartEvent(IrcMessage Message, string? RequestLabel = null) : IrcSemanticEvent(Message);
 
 public sealed record IrcListItemEvent(
     IrcMessage Message,
     string Channel,
     int VisibleUsers,
-    string Topic) : IrcSemanticEvent(Message);
+    string Topic,
+    string? RequestLabel = null) : IrcSemanticEvent(Message);
 
-public sealed record IrcListEndEvent(IrcMessage Message) : IrcSemanticEvent(Message);
+public sealed record IrcListEndEvent(IrcMessage Message, string? RequestLabel = null) : IrcSemanticEvent(Message);
 
 public sealed record IrcWhoEvent(
     IrcMessage Message,
@@ -233,7 +241,8 @@ public sealed record IrcWhoisEvent(
     int Numeric,
     string Nickname,
     IReadOnlyList<string> Parameters,
-    string? Text) : IrcSemanticEvent(Message);
+    string? Text,
+    string? RequestLabel = null) : IrcSemanticEvent(Message);
 
 public sealed record IrcNumericEvent(IrcMessage Message, int Numeric) : IrcSemanticEvent(Message);
 

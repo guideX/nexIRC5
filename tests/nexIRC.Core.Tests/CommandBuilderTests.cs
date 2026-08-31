@@ -38,4 +38,22 @@ public sealed class CommandBuilderTests
         Assert.EndsWith("\r\n", System.Text.Encoding.UTF8.GetString(command.FramedBytes.Span));
         Assert.Throws<InvalidOperationException>(() => new IrcCommandBuilder(8).BuildRaw("LONGCOMMAND"));
     }
+
+    [Fact]
+    public void TaggedCommandEscapesValuesAndUsesDeterministicTagOrdering()
+    {
+        var command = new IrcCommandBuilder().BuildWithTags(
+            new Dictionary<string, string?> { ["zeta"] = "two words", ["label"] = "nexirc;1" },
+            "WHOIS",
+            ["Mira"]);
+
+        Assert.Equal("@label=nexirc\\:1;zeta=two\\swords WHOIS Mira", command.Line);
+    }
+
+    [Fact]
+    public void TaggedCommandRejectsEmptyTagSetAndLineBreaks()
+    {
+        Assert.Throws<ArgumentException>(() => new IrcCommandBuilder().BuildWithTags(new Dictionary<string, string?>(), "WHOIS", ["Mira"]));
+        Assert.Throws<ArgumentException>(() => new IrcCommandBuilder().BuildWithTags(new Dictionary<string, string?> { ["label"] = "bad\nvalue" }, "WHOIS", ["Mira"]));
+    }
 }

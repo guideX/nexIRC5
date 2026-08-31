@@ -135,12 +135,20 @@ public sealed class ServerSession : IAsyncDisposable
     public async ValueTask JoinChannelAsync(string channel, CancellationToken cancellationToken = default)
     {
         ValidateChannelName(channel);
+        var shouldSend = false;
+        var isRegistered = false;
         lock (_gate)
         {
             _stateStore.AddDesiredChannel(channel);
+            isRegistered = _registration == RegistrationState.Registered;
+            shouldSend = isRegistered && _stateStore.ShouldRequestJoin(channel);
+            if (shouldSend)
+            {
+                _stateStore.MarkChannelJoining(channel);
+            }
         }
 
-        if (Snapshot.Registration == RegistrationState.Registered)
+        if (shouldSend)
         {
             await SendCommandAsync("JOIN", [channel], cancellationToken: cancellationToken).ConfigureAwait(false);
         }
@@ -178,6 +186,17 @@ public sealed class ServerSession : IAsyncDisposable
     public async ValueTask SendRawCommandAsync(string rawLine, CancellationToken cancellationToken = default)
     {
         var message = new IrcCommandBuilder(_options.MaximumOutboundLineBytes).BuildRaw(rawLine);
+        await QueueOutboundAsync(message, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask SendTaggedCommandAsync(
+        IReadOnlyDictionary<string, string?> tags,
+        string command,
+        IReadOnlyList<string>? middleParameters = null,
+        string? trailingParameter = null,
+        CancellationToken cancellationToken = default)
+    {
+        var message = new IrcCommandBuilder(_options.MaximumOutboundLineBytes).BuildWithTags(tags, command, middleParameters, trailingParameter);
         await QueueOutboundAsync(message, cancellationToken).ConfigureAwait(false);
     }
 
@@ -1125,7 +1144,9 @@ public sealed class ServerSession : IAsyncDisposable
         string[] desiredChannels;
         lock (_gate)
         {
-            desiredChannels = _stateStore.DesiredChannels.ToArray();
+            desiredChannels = _stateStore.DesiredChannels
+                .Where(_stateStore.ShouldRequestJoin)
+                .ToArray();
             foreach (var channel in desiredChannels)
             {
                 _stateStore.MarkChannelJoining(channel);
@@ -1341,7 +1362,7 @@ public sealed class ServerSession : IAsyncDisposable
             .Concat(string.IsNullOrWhiteSpace(options.AlternateNickname) ? Array.Empty<string>() : [options.AlternateNickname!])
             .Concat(options.NicknameFallbacks ?? Array.Empty<string>())
             .Where(static nickname => !string.IsNullOrWhiteSpace(nickname))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Distinct(IrcCaseMappingComparer.For(IrcCaseMapping.Rfc1459))
             .ToArray();
         return candidates.Length == 0 ? [options.Nickname] : candidates;
     }

@@ -22,7 +22,8 @@ public sealed record IrcNotification(
     string Summary,
     DateTimeOffset Timestamp,
     bool IsViewActive,
-    string SemanticSource);
+    string SemanticSource,
+    bool IsOwnMessage = false);
 
 public interface IIrcNotificationService : IDisposable
 {

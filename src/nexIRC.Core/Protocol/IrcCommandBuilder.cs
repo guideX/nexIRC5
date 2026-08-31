@@ -56,6 +56,62 @@ public sealed class IrcCommandBuilder
     }
 
     /// <summary>
+    /// Builds a client-tagged command such as the IRCv3 labeled-response
+    /// request form. Tags are validated and escaped here so correlation never
+    /// becomes a raw-command injection escape hatch.
+    /// </summary>
+    public IrcOutboundMessage BuildWithTags(
+        IReadOnlyDictionary<string, string?> tags,
+        string command,
+        IReadOnlyList<string>? middleParameters = null,
+        string? trailingParameter = null)
+    {
+        ArgumentNullException.ThrowIfNull(tags);
+        if (tags.Count == 0)
+        {
+            throw new ArgumentException("A tagged IRC command requires at least one tag.", nameof(tags));
+        }
+
+        ValidateToken(command, nameof(command), allowLeadingColon: false);
+        var builder = new StringBuilder("@");
+        var first = true;
+        foreach (var tag in tags.OrderBy(static pair => pair.Key, StringComparer.Ordinal))
+        {
+            ValidateTagKey(tag.Key);
+            if (!first)
+            {
+                builder.Append(';');
+            }
+
+            first = false;
+            builder.Append(tag.Key);
+            if (tag.Value is not null)
+            {
+                ValidateNoLineBreak(tag.Value, nameof(tags));
+                builder.Append('=').Append(EscapeTagValue(tag.Value));
+            }
+        }
+
+        builder.Append(' ').Append(command);
+        if (middleParameters is not null)
+        {
+            foreach (var parameter in middleParameters)
+            {
+                ValidateMiddleParameter(parameter);
+                builder.Append(' ').Append(parameter);
+            }
+        }
+
+        if (trailingParameter is not null)
+        {
+            ValidateNoLineBreak(trailingParameter, nameof(trailingParameter));
+            builder.Append(" :").Append(trailingParameter);
+        }
+
+        return Frame(builder.ToString());
+    }
+
+    /// <summary>
     /// Builds a caller-authorized raw IRC command while retaining line-size and injection checks.
     /// </summary>
     public IrcOutboundMessage BuildRaw(string rawLine)
@@ -111,4 +167,21 @@ public sealed class IrcCommandBuilder
             throw new ArgumentException("IRC command values cannot contain CR or LF.", parameterName);
         }
     }
+
+    private static void ValidateTagKey(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Any(char.IsWhiteSpace) || value.Contains(';') || value.Contains('='))
+        {
+            throw new ArgumentException("An IRC tag key must be non-empty and contain no whitespace, ';', or '='.", nameof(value));
+        }
+
+        ValidateNoLineBreak(value, nameof(value));
+    }
+
+    private static string EscapeTagValue(string value) => value
+        .Replace("\\", "\\\\", StringComparison.Ordinal)
+        .Replace(";", "\\:", StringComparison.Ordinal)
+        .Replace(" ", "\\s", StringComparison.Ordinal)
+        .Replace("\r", "\\r", StringComparison.Ordinal)
+        .Replace("\n", "\\n", StringComparison.Ordinal);
 }

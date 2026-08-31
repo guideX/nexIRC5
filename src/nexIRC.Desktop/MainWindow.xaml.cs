@@ -5,6 +5,10 @@ using System.Windows.Input;
 using System.Windows.Media;
 using nexIRC.Application;
 using nexIRC.Core.Networking;
+using ContextMenu = System.Windows.Controls.ContextMenu;
+using ListBox = System.Windows.Controls.ListBox;
+using MenuItem = System.Windows.Controls.MenuItem;
+using MessageBox = System.Windows.MessageBox;
 
 namespace nexIRC.Desktop;
 
@@ -12,10 +16,13 @@ public partial class MainWindow : Window
 {
     private bool _closing;
 
-    public MainWindow(IIrcTransportFactory transportFactory)
+    public MainWindow(IIrcTransportFactory transportFactory, ConfigurationService? configuration = null)
     {
         InitializeComponent();
-        ViewModel = new MainWindowViewModel(transportFactory, Dispatcher);
+        ViewModel = new MainWindowViewModel(
+            transportFactory,
+            Dispatcher,
+            configuration ?? new ConfigurationService(new InMemoryConfigurationStore()));
         DataContext = ViewModel;
         ViewModel.NewConnectionRequested += ShowNewConnectionAsync;
         ViewModel.ExitRequested += Close;
@@ -42,7 +49,7 @@ public partial class MainWindow : Window
 
     private async void OnSendClick(object sender, RoutedEventArgs e) => await SubmitInputAsync();
 
-    private async void OnInputKeyDown(object sender, KeyEventArgs e)
+    private async void OnInputKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
         if (Keyboard.Modifiers == ModifierKeys.None && e.Key is Key.Up or Key.Down)
         {
@@ -106,6 +113,22 @@ public partial class MainWindow : Window
         InputBox.Focus();
     }
 
+    private void OnProfilesClick(object sender, RoutedEventArgs e)
+    {
+        var dialog = new NetworkProfilesWindow(ViewModel) { Owner = this };
+        dialog.ShowDialog();
+    }
+
+    private async void OnPreferencesClick(object sender, RoutedEventArgs e)
+    {
+        var dialog = new PreferencesWindow(ViewModel) { Owner = this };
+        if (dialog.ShowDialog() == true)
+        {
+            ViewModel.StatusText = "Preferences saved.";
+            await Task.CompletedTask;
+        }
+    }
+
     private async void OnChannelListDoubleClick(object sender, MouseButtonEventArgs e)
     {
         if (sender is ListBox list && list.SelectedItem is ChannelListRow row)
@@ -148,8 +171,14 @@ public partial class MainWindow : Window
             };
             if (view is ChannelView channel)
             {
-                actions.Add(("Part", () => ViewModel.ExecuteInputAsync($"/part {channel.Channel}")));
+                actions.Add((channel.IsJoined ? "Part" : "Join", () => ViewModel.ExecuteInputAsync(channel.IsJoined ? $"/part {channel.Channel}" : $"/join {channel.Channel}")));
                 actions.Add(("Rejoin", () => ViewModel.ExecuteInputAsync($"/join {channel.Channel}")));
+                actions.Add(("Copy channel name", () => CopyText(channel.Channel)));
+                actions.Add(("Request channel modes", () => ViewModel.ExecuteInputAsync($"/mode {channel.Channel}")));
+                actions.Add(("Request topic", () => ViewModel.ExecuteInputAsync($"/topic {channel.Channel}")));
+                actions.Add(("Open LIST", () => ViewModel.ExecuteInputAsync("/list")));
+                actions.Add(("Clear local view", () => { channel.ClearEntries(); return Task.CompletedTask; }));
+                actions.Add(("Close local view", () => { ViewModel.Sessions.CloseView(channel.Id); return Task.CompletedTask; }));
             }
 
             OpenContextMenu(treeItem, actions);
@@ -164,10 +193,27 @@ public partial class MainWindow : Window
             if (channel is not null)
             {
                 ViewModel.SelectView(channel);
-                OpenContextMenu(memberItem, [
-                    ("Query", () => ViewModel.ExecuteInputAsync($"/query {member.Nickname}")),
-                    ("WHOIS", () => ViewModel.ExecuteInputAsync($"/whois {member.Nickname}"))
-                ]);
+                var actions = new List<(string, Func<Task>)>
+                {
+                    ("Query / open private conversation", () => ViewModel.ExecuteInputAsync($"/query {member.Nickname}")),
+                    ("WHOIS", () => ViewModel.ExecuteInputAsync($"/whois {member.Nickname}")),
+                    ("Mention / insert nickname", () => { ViewModel.PrepareInput($"{member.Nickname}: "); InputBox.Focus(); return Task.CompletedTask; }),
+                    ("Copy nickname", () => CopyText(member.Nickname)),
+                    ("Notice", () => { ViewModel.PrepareInput($"/notice {member.Nickname} "); InputBox.Focus(); return Task.CompletedTask; }),
+                    ("CTCP VERSION", () => ViewModel.ExecuteInputAsync($"/ctcp {member.Nickname} VERSION")),
+                    ("CTCP TIME", () => ViewModel.ExecuteInputAsync($"/ctcp {member.Nickname} TIME")),
+                    ("CTCP PING", () => ViewModel.ExecuteInputAsync($"/ctcp {member.Nickname} PING"))
+                };
+                if (channel.CanModerate)
+                {
+                    actions.Add(("Give operator", () => ViewModel.ExecuteInputAsync($"/op {member.Nickname}")));
+                    actions.Add(("Remove operator", () => ViewModel.ExecuteInputAsync($"/deop {member.Nickname}")));
+                    actions.Add(("Give voice", () => ViewModel.ExecuteInputAsync($"/voice {member.Nickname}")));
+                    actions.Add(("Remove voice", () => ViewModel.ExecuteInputAsync($"/devoice {member.Nickname}")));
+                    actions.Add(("Kick", () => ViewModel.ExecuteInputAsync($"/kick {member.Nickname} ")));
+                }
+
+                OpenContextMenu(memberItem, actions);
                 e.Handled = true;
             }
         }
@@ -192,6 +238,12 @@ public partial class MainWindow : Window
         {
             await action();
         }
+    }
+
+    private static Task CopyText(string text)
+    {
+        System.Windows.Clipboard.SetText(text);
+        return Task.CompletedTask;
     }
 
     private static T? FindAncestor<T>(DependencyObject? source)

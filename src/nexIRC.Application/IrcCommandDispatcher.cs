@@ -19,7 +19,8 @@ public sealed class IrcCommandDispatcher
     public static IReadOnlyList<string> SupportedCommands { get; } =
     [
         "server", "join", "part", "msg", "query", "q", "nick", "me", "quit",
-        "disconnect", "whois", "list", "raw", "quote"
+        "disconnect", "whois", "list", "notice", "ctcp", "op", "deop", "voice",
+        "devoice", "kick", "mode", "topic", "clear", "close", "raw", "quote"
     ];
 
     private readonly NetworkSessionManager _sessions;
@@ -101,6 +102,31 @@ public sealed class IrcCommandDispatcher
                     return await WhoisAsync(network, parts, cancellationToken).ConfigureAwait(false);
                 case "LIST":
                     return await ListAsync(network, parts, cancellationToken).ConfigureAwait(false);
+                case "NOTICE":
+                    return await NoticeAsync(network, arguments, cancellationToken).ConfigureAwait(false);
+                case "CTCP":
+                    return await CtcpAsync(network, arguments, cancellationToken).ConfigureAwait(false);
+                case "OP":
+                    return await MemberModeAsync(network, activeView, parts, 'o', adding: true, cancellationToken).ConfigureAwait(false);
+                case "DEOP":
+                    return await MemberModeAsync(network, activeView, parts, 'o', adding: false, cancellationToken).ConfigureAwait(false);
+                case "VOICE":
+                    return await MemberModeAsync(network, activeView, parts, 'v', adding: true, cancellationToken).ConfigureAwait(false);
+                case "DEVOICE":
+                    return await MemberModeAsync(network, activeView, parts, 'v', adding: false, cancellationToken).ConfigureAwait(false);
+                case "KICK":
+                    return await KickAsync(network, activeView, arguments, parts, cancellationToken).ConfigureAwait(false);
+                case "MODE":
+                    return await ModeAsync(network, activeView, parts, cancellationToken).ConfigureAwait(false);
+                case "TOPIC":
+                    return await TopicAsync(network, activeView, parts, cancellationToken).ConfigureAwait(false);
+                case "CLEAR":
+                    activeView.ClearEntries();
+                    return CommandDispatchResult.Success("Local view cleared.", activeView);
+                case "CLOSE":
+                    return _sessions.CloseView(activeView.Id)
+                        ? CommandDispatchResult.Success("Local view closed.", network.StatusView)
+                        : CommandDispatchResult.Failure("The server status view cannot be closed.", activeView);
                 case "ME":
                     return await ActionAsync(network, activeView, arguments, cancellationToken).ConfigureAwait(false);
                 case "QUIT":
@@ -184,7 +210,9 @@ public sealed class IrcCommandDispatcher
             return CommandDispatchResult.Failure("Usage: /part [#channel] [reason]", activeView);
         }
 
-        var reason = arguments.StartsWith(channel, StringComparison.OrdinalIgnoreCase)
+        var typedChannel = arguments.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault();
+        var reason = typedChannel is not null
+            && IrcIdentity.Equals(typedChannel, channel, network.Snapshot.Features.CaseMapping)
             ? arguments[channel.Length..].Trim()
             : string.Empty;
         await network.Session.PartChannelAsync(channel, string.IsNullOrWhiteSpace(reason) ? null : reason, cancellationToken).ConfigureAwait(false);
@@ -236,29 +264,21 @@ public sealed class IrcCommandDispatcher
             return CommandDispatchResult.Failure("Usage: /whois <nickname>", network.StatusView);
         }
 
-        var view = _sessions.BeginWhois(network.Id, parts[0]);
-        try
-        {
-            await network.Session.SendCommandAsync("WHOIS", [parts[0]], cancellationToken: cancellationToken).ConfigureAwait(false);
-            return CommandDispatchResult.Success($"WHOIS requested for {parts[0]}.", view);
-        }
-        catch (InvalidOperationException exception)
-        {
-            return CommandDispatchResult.Failure(exception.Message, view);
-        }
+        var request = await _sessions.RequestWhoisAsync(network.Id, parts[0], cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success($"WHOIS requested for {parts[0]}.", request.View);
     }
 
     private async ValueTask<CommandDispatchResult> ListAsync(NetworkWorkspace network, string[] parts, CancellationToken cancellationToken)
     {
-        var view = _sessions.BeginChannelList(network.Id);
+        IrcQueryRequestResult request;
         try
         {
-            await network.Session.SendCommandAsync("LIST", parts, cancellationToken: cancellationToken).ConfigureAwait(false);
-            return CommandDispatchResult.Success("Channel list requested.", view);
+            request = await _sessions.RequestChannelListAsync(network.Id, parts, cancellationToken).ConfigureAwait(false);
+            return CommandDispatchResult.Success(request.WasCoalesced ? "A channel list request is already in progress." : "Channel list requested.", request.View);
         }
         catch (InvalidOperationException exception)
         {
-            return CommandDispatchResult.Failure(exception.Message, view);
+            return CommandDispatchResult.Failure(exception.Message, network.StatusView);
         }
     }
 
@@ -282,6 +302,110 @@ public sealed class IrcCommandDispatcher
         await network.Session.SendCommandAsync("PRIVMSG", [target], $"\u0001ACTION {arguments}\u0001", cancellationToken).ConfigureAwait(false);
         _sessions.AppendLocal(activeView, IrcEventPresentation.CreateLocalMessage(network.Session.Snapshot.Nickname, arguments, isAction: true));
         return CommandDispatchResult.Success($"Action sent to {target}.", activeView);
+    }
+
+    private async ValueTask<CommandDispatchResult> NoticeAsync(NetworkWorkspace network, string arguments, CancellationToken cancellationToken)
+    {
+        var (target, text) = SplitTargetAndText(arguments);
+        if (target is null || text is null)
+        {
+            return CommandDispatchResult.Failure("Usage: /notice <target> <message>", network.StatusView);
+        }
+
+        var view = _sessions.EnsureQuery(network.Id, target);
+        _sessions.ActivateView(view.Id);
+        await network.Session.SendCommandAsync("NOTICE", [target], text, cancellationToken).ConfigureAwait(false);
+        _sessions.AppendLocal(view, IrcEventPresentation.CreateLocalMessage(network.Session.Snapshot.Nickname, text, OutgoingMessageKind.Notice));
+        return CommandDispatchResult.Success($"Notice sent to {target}.", view);
+    }
+
+    private async ValueTask<CommandDispatchResult> CtcpAsync(NetworkWorkspace network, string arguments, CancellationToken cancellationToken)
+    {
+        var (target, payload) = SplitTargetAndText(arguments);
+        if (target is null || payload is null)
+        {
+            return CommandDispatchResult.Failure("Usage: /ctcp <target> <VERSION|TIME|PING> [data]", network.StatusView);
+        }
+
+        var parts = payload.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var command = parts[0].ToUpperInvariant();
+        if (command is not ("VERSION" or "TIME" or "PING"))
+        {
+            return CommandDispatchResult.Failure("This phase permits CTCP VERSION, TIME, or PING.", network.StatusView);
+        }
+
+        var data = parts.Length > 1 ? string.Join(' ', parts.Skip(1)) : string.Empty;
+        var view = _sessions.EnsureQuery(network.Id, target);
+        _sessions.ActivateView(view.Id);
+        var ctcp = command + (data.Length == 0 ? string.Empty : $" {data}");
+        await network.Session.SendCommandAsync("PRIVMSG", [target], $"\u0001{ctcp}\u0001", cancellationToken).ConfigureAwait(false);
+        _sessions.AppendLocal(view, IrcEventPresentation.CreateLocalCtcp(command, data));
+        return CommandDispatchResult.Success($"CTCP {command} sent to {target}.", view);
+    }
+
+    private async ValueTask<CommandDispatchResult> MemberModeAsync(
+        NetworkWorkspace network,
+        WorkspaceView activeView,
+        string[] parts,
+        char fallbackMode,
+        bool adding,
+        CancellationToken cancellationToken)
+    {
+        if (activeView is not ChannelView channel || parts.Length == 0)
+        {
+            return CommandDispatchResult.Failure("Select a channel and provide a nickname.", activeView);
+        }
+
+        var grammar = network.Snapshot.Features.Prefix;
+        var mode = fallbackMode == 'v'
+            ? grammar is { Modes.Count: > 0 } ? grammar.Modes[^1] : fallbackMode
+            : grammar?.Modes.FirstOrDefault(candidate => candidate == 'o') ?? (grammar is { Modes.Count: > 1 } ? grammar.Modes.Take(grammar.Modes.Count - 1).FirstOrDefault() : default);
+        if (mode == default)
+        {
+            return CommandDispatchResult.Failure("The server did not advertise a suitable member mode.", channel);
+        }
+
+        await network.Session.SendCommandAsync("MODE", [channel.Channel, $"{(adding ? '+' : '-')}{mode}", parts[0]], cancellationToken: cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success($"Member mode {(adding ? "added" : "removed")} for {parts[0]}.", channel);
+    }
+
+    private async ValueTask<CommandDispatchResult> KickAsync(NetworkWorkspace network, WorkspaceView activeView, string arguments, string[] parts, CancellationToken cancellationToken)
+    {
+        if (activeView is not ChannelView channel || parts.Length == 0)
+        {
+            return CommandDispatchResult.Failure("Select a channel and provide a nickname.", activeView);
+        }
+
+        var reason = arguments.Length > parts[0].Length ? arguments[parts[0].Length..].Trim() : string.Empty;
+        await network.Session.SendCommandAsync("KICK", [channel.Channel, parts[0]], string.IsNullOrWhiteSpace(reason) ? null : reason, cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success($"Kick requested for {parts[0]}.", channel);
+    }
+
+    private async ValueTask<CommandDispatchResult> ModeAsync(NetworkWorkspace network, WorkspaceView activeView, string[] parts, CancellationToken cancellationToken)
+    {
+        var channel = activeView as ChannelView ?? (parts.Length > 0 ? network.Channels.FirstOrDefault(item => IrcIdentity.Equals(item.Channel, parts[0], network.Snapshot.Features.CaseMapping)) : null);
+        if (channel is null)
+        {
+            return CommandDispatchResult.Failure("Usage: /mode [#channel] [modes]", activeView);
+        }
+
+        var parameters = parts.Length > 0 && IrcIdentity.Equals(parts[0], channel.Channel, network.Snapshot.Features.CaseMapping)
+            ? parts.Skip(1).ToArray()
+            : parts;
+        await network.Session.SendCommandAsync("MODE", new[] { channel.Channel }.Concat(parameters).ToArray(), cancellationToken: cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success($"Mode requested for {channel.Channel}.", channel);
+    }
+
+    private async ValueTask<CommandDispatchResult> TopicAsync(NetworkWorkspace network, WorkspaceView activeView, string[] parts, CancellationToken cancellationToken)
+    {
+        var channel = activeView as ChannelView ?? (parts.Length > 0 ? network.Channels.FirstOrDefault(item => IrcIdentity.Equals(item.Channel, parts[0], network.Snapshot.Features.CaseMapping)) : null);
+        if (channel is null)
+        {
+            return CommandDispatchResult.Failure("Usage: /topic [#channel]", activeView);
+        }
+
+        await network.Session.SendCommandAsync("TOPIC", [channel.Channel], cancellationToken: cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success($"Topic requested for {channel.Channel}.", channel);
     }
 
     private static (string? Target, string? Text) SplitTargetAndText(string arguments)

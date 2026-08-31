@@ -34,7 +34,9 @@ public sealed class HighlightActivityPolicy : ObservableObject
             var words = value
                 .Where(static word => !string.IsNullOrWhiteSpace(word))
                 .Select(static word => word.Trim())
-                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Where(static word => word.Length <= ConfigurationLimits.MaximumStringLength && !word.Any(character => character is '\r' or '\n'))
+                .Take(ConfigurationLimits.MaximumHighlightWords)
+                .Distinct(IrcCaseMappingComparer.For(IrcCaseMapping.Rfc1459))
                 .ToArray();
             SetProperty(ref _customWords, words);
         }

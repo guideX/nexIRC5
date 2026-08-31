@@ -32,6 +32,8 @@ public enum TranscriptEntryKind
     OutgoingPrivateMessage,
     OutgoingAction,
     OutgoingNotice,
+    Ctcp,
+    OutgoingCtcp,
     Capability,
     Authentication,
     Registration,
@@ -98,7 +100,8 @@ public sealed record TranscriptEntry(
     public bool IsOutgoing => Kind is TranscriptEntryKind.OutgoingMessage
         or TranscriptEntryKind.OutgoingPrivateMessage
         or TranscriptEntryKind.OutgoingAction
-        or TranscriptEntryKind.OutgoingNotice;
+        or TranscriptEntryKind.OutgoingNotice
+        or TranscriptEntryKind.OutgoingCtcp;
 
     public bool IsHighlight => string.Equals(Metadata, "highlight", StringComparison.Ordinal);
 
@@ -107,8 +110,11 @@ public sealed record TranscriptEntry(
     public string DisplayLine => Kind switch
     {
         TranscriptEntryKind.OutgoingAction => $"* {Sender} {Text}",
+        TranscriptEntryKind.Action => $"* {Sender} {Text}",
         TranscriptEntryKind.OutgoingPrivateMessage => $"→ {Sender}: {Text}",
         TranscriptEntryKind.OutgoingNotice => $"→ -{Sender}- {Text}",
+        TranscriptEntryKind.OutgoingCtcp => $"→ [CTCP {Text}]",
+        TranscriptEntryKind.Ctcp => string.IsNullOrWhiteSpace(Sender) ? $"[CTCP {Text}]" : $"[{Sender} CTCP {Text}]",
         TranscriptEntryKind.OutgoingMessage => $"→ {Text}",
         _ => string.IsNullOrWhiteSpace(Sender) ? Text : $"<{Sender}> {Text}"
     };
@@ -116,6 +122,8 @@ public sealed record TranscriptEntry(
 
 public sealed record NetworkConnectionOptions
 {
+    public Guid? ProfileId { get; init; }
+
     public required string DisplayName { get; init; }
 
     public required IrcEndpoint Endpoint { get; init; }
@@ -130,9 +138,11 @@ public sealed record NetworkConnectionOptions
 
     public IReadOnlyList<string> NicknameFallbacks { get; init; } = Array.Empty<string>();
 
-    public IReadOnlyList<string> RequestedCapabilities { get; init; } = ["message-tags", "server-time", "multi-prefix"];
+    public IReadOnlyList<string> RequestedCapabilities { get; init; } = ["message-tags", "server-time", "multi-prefix", "labeled-response"];
 
     public IReadOnlySet<string> DesiredChannels { get; init; } = new HashSet<string>(StringComparer.Ordinal);
+
+    public bool AutoConnect { get; init; }
 
     public ReconnectPolicy Reconnect { get; init; } = new();
 
@@ -275,6 +285,14 @@ public abstract class WorkspaceView : ObservableObject
         }
     }
 
+    public void ClearEntries()
+    {
+        lock (_entriesGate)
+        {
+            Entries.Clear();
+        }
+    }
+
     public void Activate()
     {
         IsActive = true;
@@ -346,6 +364,7 @@ public sealed class ChannelMemberView : ObservableObject
     private string _prefixText = string.Empty;
     private string? _username;
     private string? _host;
+    private IReadOnlySet<char> _prefixModes = new HashSet<char>();
 
     internal ChannelMemberView(string nickname)
     {
@@ -372,17 +391,20 @@ public sealed class ChannelMemberView : ObservableObject
         private set => SetProperty(ref _prefixText, value);
     }
 
+    public IReadOnlySet<char> PrefixModes => _prefixModes;
+
     public string DisplayText => $"{PrefixText}{Nickname}";
 
     internal void Apply(IrcChannelMemberSnapshot snapshot, IrcPrefixGrammar? grammar)
     {
         Username = snapshot.Username;
         Host = snapshot.Host;
+        _prefixModes = new HashSet<char>(snapshot.PrefixModes);
         PrefixText = HighestPrefix(snapshot.PrefixModes, grammar);
         OnPropertyChanged(nameof(DisplayText));
     }
 
-    private static string HighestPrefix(IEnumerable<char> modes, IrcPrefixGrammar? grammar)
+    internal static string HighestPrefix(IEnumerable<char> modes, IrcPrefixGrammar? grammar)
     {
         var modeSet = modes.ToHashSet();
         if (modeSet.Count == 0)
@@ -420,6 +442,8 @@ public sealed class ChannelView : WorkspaceView
     private string? _topic;
     private ChannelSynchronizationState _synchronization;
     private string _modeSummary = string.Empty;
+    private IReadOnlySet<char> _localPrefixModes = new HashSet<char>();
+    private string _localPrefixText = string.Empty;
 
     internal ChannelView(Guid networkId, Guid id, string channel)
         : base(networkId, id, WorkspaceViewKind.Channel, channel)
@@ -463,6 +487,20 @@ public sealed class ChannelView : WorkspaceView
         private set => SetProperty(ref _modeSummary, value);
     }
 
+    public IReadOnlySet<char> LocalPrefixModes => _localPrefixModes;
+
+    public string LocalPrefixText
+    {
+        get => _localPrefixText;
+        private set => SetProperty(ref _localPrefixText, value);
+    }
+
+    /// <summary>
+    /// Uses the server-advertised PREFIX ordering and treats every rank above
+    /// the final (normally voice) rank as moderation-capable.
+    /// </summary>
+    public bool CanModerate { get; private set; }
+
     public ObservableCollection<ChannelMemberView> Members { get; } = [];
 
     public IReadOnlyList<ChannelMemberView> MembersSnapshot
@@ -476,7 +514,7 @@ public sealed class ChannelView : WorkspaceView
         }
     }
 
-    internal void ApplySnapshot(IrcChannelSnapshot? snapshot, IrcPrefixGrammar? grammar)
+    internal void ApplySnapshot(IrcChannelSnapshot? snapshot, IrcPrefixGrammar? grammar, string? localNickname = null, IrcCaseMapping mapping = IrcCaseMapping.Rfc1459)
     {
         if (snapshot is null)
         {
@@ -489,6 +527,9 @@ public sealed class ChannelView : WorkspaceView
                 Members.Clear();
             }
             ModeSummary = string.Empty;
+            _localPrefixModes = new HashSet<char>();
+            LocalPrefixText = string.Empty;
+            CanModerate = false;
         }
         else
         {
@@ -511,6 +552,18 @@ public sealed class ChannelView : WorkspaceView
                     Members.Add(view);
                 }
             }
+
+            var localMember = localNickname is null
+                ? null
+                : snapshot.Members.Values.FirstOrDefault(member => IrcCaseMappingComparer.Equals(member.Nickname, localNickname, mapping));
+            _localPrefixModes = localMember?.PrefixModes is { } localModes
+                ? new HashSet<char>(localModes)
+                : new HashSet<char>();
+            LocalPrefixText = ChannelMemberView.HighestPrefix(_localPrefixModes, grammar);
+            var moderationModes = grammar?.Modes.Count > 1
+                ? grammar.Modes.Take(grammar.Modes.Count - 1).ToHashSet()
+                : grammar?.Modes.ToHashSet() ?? new HashSet<char>();
+            CanModerate = _localPrefixModes.Any(moderationModes.Contains);
         }
 
         OnPropertyChanged(nameof(TopicText));
@@ -590,11 +643,13 @@ public sealed class NetworkWorkspace : ObservableObject
         StatusView.ApplySnapshot(_snapshot);
         foreach (var channel in Channels)
         {
-            channel.ApplySnapshot(null, _snapshot.Features.Prefix);
+            channel.ApplySnapshot(null, _snapshot.Features.Prefix, _snapshot.Nickname, _snapshot.Features.CaseMapping);
         }
     }
 
     public Guid Id { get; }
+
+    public Guid? ProfileId => Options.ProfileId;
 
     public NetworkConnectionOptions Options { get; internal set; }
 
@@ -667,7 +722,7 @@ public sealed class NetworkWorkspace : ObservableObject
 
         foreach (var channel in snapshot.Channels)
         {
-            EnsureChannel(channel.Name).ApplySnapshot(channel, snapshot.Features.Prefix);
+            EnsureChannel(channel.Name).ApplySnapshot(channel, snapshot.Features.Prefix, snapshot.Nickname, snapshot.Features.CaseMapping);
         }
 
         foreach (var channel in Channels)
@@ -675,7 +730,7 @@ public sealed class NetworkWorkspace : ObservableObject
             if (!snapshot.Channels.Any(item => IrcCaseMappingComparer.Equals(item.Name, channel.Channel, snapshot.Features.CaseMapping)) &&
                 snapshot.DesiredChannels.All(item => !IrcCaseMappingComparer.Equals(item, channel.Channel, snapshot.Features.CaseMapping)))
             {
-                channel.ApplySnapshot(null, snapshot.Features.Prefix);
+                channel.ApplySnapshot(null, snapshot.Features.Prefix, snapshot.Nickname, snapshot.Features.CaseMapping);
             }
         }
 
@@ -715,10 +770,12 @@ public sealed class NetworkWorkspace : ObservableObject
         return view;
     }
 
-    internal WhoisView EnsureWhois(string nickname, bool beginRequest = false)
+    internal WhoisView EnsureWhois(string nickname, bool beginRequest = false, bool forceNew = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
-        var existing = WhoisViews.FirstOrDefault(item => IrcCaseMappingComparer.Equals(item.RequestedNickname, nickname, _snapshot.Features.CaseMapping));
+        var existing = forceNew
+            ? null
+            : WhoisViews.LastOrDefault(item => IrcCaseMappingComparer.Equals(item.RequestedNickname, nickname, _snapshot.Features.CaseMapping));
         if (existing is not null)
         {
             if (beginRequest)

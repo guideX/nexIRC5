@@ -230,3 +230,11 @@ profiles, highlight words and view preferences. Then add labeled-response
 correlation for overlapping WHOIS/LIST operations, richer channel/member
 context actions, and the first opt-in notification adapter while preserving
 the current UI-neutral boundary.
+
+## Phase 1E follow-up
+
+Phase 1E implements the recommended persistence, labeled/unlabeled query
+correlation, richer channel/member actions and opt-in desktop adapter. See
+`docs/Phase1E-Persistent-Profiles-Correlated-Queries-And-Rich-Actions.md` for
+the current architecture, schema, limits, validation and remaining
+limitations.

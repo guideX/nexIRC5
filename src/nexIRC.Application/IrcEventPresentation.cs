@@ -17,6 +17,8 @@ public static class IrcEventPresentation
             IrcQuitEvent quit => Entry(TranscriptEntryKind.Quit, quit.Nickname, $"quit{FormatDetail(quit.Reason)}"),
             IrcKickEvent kick => Entry(TranscriptEntryKind.Kick, kick.Nickname, $"was kicked from {kick.Channel}{FormatDetail(kick.Reason)}"),
             IrcNicknameChangedEvent nick => Entry(TranscriptEntryKind.Nick, nick.PreviousNickname, $"is now known as {nick.NewNickname}"),
+            IrcCtcpEvent ctcp when ctcp.Command == "ACTION" => Entry(TranscriptEntryKind.Action, ctcp.Message.Prefix?.Name, ctcp.Arguments),
+            IrcCtcpEvent ctcp => Entry(TranscriptEntryKind.Ctcp, ctcp.Message.Prefix?.Name, FormatCtcp(ctcp.Command, ctcp.Arguments)),
             IrcPrivmsgEvent message when message.IsNotice => Entry(TranscriptEntryKind.Notice, message.Message.Prefix?.Name, message.Text),
             IrcPrivmsgEvent message => Entry(TranscriptEntryKind.Message, message.Message.Prefix?.Name, message.Text),
             IrcQueryMessageEvent query when query.IsNotice => Entry(TranscriptEntryKind.Notice, query.Nickname, query.Text),
@@ -56,10 +58,15 @@ public static class IrcEventPresentation
 
     public static TranscriptEntry CreateLocalCommand(string text) => Entry(TranscriptEntryKind.System, null, text);
 
+    public static TranscriptEntry CreateLocalCtcp(string command, string arguments) =>
+        Entry(TranscriptEntryKind.OutgoingCtcp, null, FormatCtcp(command, arguments));
+
     private static TranscriptEntry Entry(TranscriptEntryKind kind, string? sender, string text, string? metadata = null) =>
         new(DateTimeOffset.UtcNow, kind, sender, text, metadata);
 
     private static string FormatDetail(string? detail) => string.IsNullOrWhiteSpace(detail) ? string.Empty : $": {detail}";
+
+    private static string FormatCtcp(string command, string arguments) => string.IsNullOrWhiteSpace(arguments) ? command : $"{command} {arguments}";
 
     private static string FormatModes(IReadOnlyList<nexIRC.Core.State.IrcModeChange> changes) => string.Join(' ', changes.Select(change =>
         $"{(change.IsAdding ? '+' : '-')}{change.Mode}{(change.Parameter is null ? string.Empty : $" {change.Parameter}")}"));

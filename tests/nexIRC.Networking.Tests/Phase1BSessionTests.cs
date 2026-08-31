@@ -9,6 +9,67 @@ namespace nexIRC.Networking.Tests;
 public sealed class Phase1BSessionTests
 {
     [Fact]
+    public async Task RepeatedJoinDoesNotMultiplyPendingJoinsAndPreRegistrationJoinWaitsForWelcome()
+    {
+        var endpoint = new IrcEndpoint("join-lifecycle.example", 6667, false);
+        var transport = new FakeIrcTransport(endpoint);
+        var factory = new FakeIrcTransportFactory();
+        factory.Add(transport);
+        await using var session = new ServerSession(new ServerSessionOptions
+        {
+            Endpoint = endpoint,
+            Nickname = "me",
+            Reconnect = new ReconnectPolicy(Enabled: false)
+        }, factory);
+        var run = session.RunAsync();
+        await WaitForAsync(() => transport.ConnectCount == 1);
+        await session.JoinChannelAsync("#before-registration");
+        Assert.DoesNotContain(transport.OutboundLines, line => line == "JOIN #before-registration");
+        transport.EnqueueInboundLine(":srv CAP * LS :");
+        transport.EnqueueInboundLine(":srv 001 me :Welcome");
+        await WaitForAsync(() => transport.OutboundLines.Count(line => line == "JOIN #before-registration") == 1);
+        await session.JoinChannelAsync("#before-registration");
+        Assert.Equal(1, transport.OutboundLines.Count(line => line == "JOIN #before-registration"));
+        transport.EnqueueInboundLine(":me!u@h JOIN #before-registration");
+        await session.DisconnectAsync();
+        await run;
+    }
+
+    [Fact]
+    public async Task LabeledListAndWhoisNumericsRetainRequestLabels()
+    {
+        var endpoint = new IrcEndpoint("labels.example", 6667, false);
+        var transport = new FakeIrcTransport(endpoint);
+        var factory = new FakeIrcTransportFactory();
+        factory.Add(transport);
+        await using var session = new ServerSession(new ServerSessionOptions
+        {
+            Endpoint = endpoint,
+            Nickname = "me",
+            Reconnect = new ReconnectPolicy(Enabled: false)
+        }, factory);
+        var events = new List<IrcSemanticEvent>();
+        session.SemanticEventReceived += (_, item) => events.Add(item.Event);
+        var run = session.RunAsync();
+        await WaitForAsync(() => transport.ConnectCount == 1);
+        transport.EnqueueInboundLine(":srv CAP * LS :");
+        transport.EnqueueInboundLine(":srv 001 me :Welcome");
+        transport.EnqueueInboundLine("@label=who-1 :srv 311 me Mira user host * :Real");
+        transport.EnqueueInboundLine("@label=who-1 :srv 318 me Mira :End");
+        transport.EnqueueInboundLine("@label=list-1 :srv 321 me Channel :Users Name");
+        transport.EnqueueInboundLine("@label=list-1 :srv 322 me #room 2 :Topic");
+        transport.EnqueueInboundLine("@label=list-1 :srv 323 me :End");
+        await WaitForAsync(() => events.OfType<IrcListEndEvent>().Any() && events.OfType<IrcWhoisEvent>().Any(item => item.Numeric == 318));
+
+        Assert.Equal("who-1", events.OfType<IrcWhoisEvent>().Single(item => item.Numeric == 311).RequestLabel);
+        Assert.Equal("who-1", events.OfType<IrcWhoisEvent>().Single(item => item.Numeric == 318).RequestLabel);
+        Assert.Equal("list-1", events.OfType<IrcListItemEvent>().Single().RequestLabel);
+        Assert.Equal("list-1", events.OfType<IrcListEndEvent>().Single().RequestLabel);
+        await session.DisconnectAsync();
+        await run;
+    }
+
+    [Fact]
     public async Task DesiredChannelsReplayAndResynchronizeAfterReconnect()
     {
         var endpoint = new IrcEndpoint("test.example", 6667, false);
