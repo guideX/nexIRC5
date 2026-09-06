@@ -412,12 +412,15 @@ public sealed class ServerSession : IAsyncDisposable
             _outbound = outbound;
         }
 
-        if (transport is IIrcTransportCallbackSource callbackSource)
+        IIrcTransportCallbackSource? callbackSource = transport as IIrcTransportCallbackSource;
+        Func<IrcTransportCallback, ValueTask>? callbackHandler = null;
+        if (callbackSource is not null)
         {
             var weakSession = new WeakReference<ServerSession>(this);
-            callbackSource.CallbackReceived += callback => weakSession.TryGetTarget(out var session)
+            callbackHandler = callback => weakSession.TryGetTarget(out var session)
                 ? session.ProcessTransportCallbackAsync(callback, epoch, connectionCts)
                 : ValueTask.CompletedTask;
+            callbackSource.CallbackReceived += callbackHandler;
         }
 
         var writerFailure = new StrongBox<ConnectionFailure?>(null);
@@ -450,6 +453,11 @@ public sealed class ServerSession : IAsyncDisposable
         }
         finally
         {
+            if (callbackSource is not null && callbackHandler is not null)
+            {
+                callbackSource.CallbackReceived -= callbackHandler;
+            }
+
             outbound.Writer.TryComplete();
             connectionCts.Cancel();
             try

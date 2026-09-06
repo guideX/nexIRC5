@@ -20,10 +20,13 @@ public sealed class FakeIrcTransport : IIrcTransport, IIrcTransportCallbackSourc
     private readonly Channel<object> _inbound = Channel.CreateUnbounded<object>();
     private readonly ConcurrentQueue<byte[]> _outbound = new();
     private readonly object _pendingGate = new();
+    private Func<IrcTransportCallback, ValueTask>? _callbackReceived;
     private byte[]? _pendingBytes;
     private int _pendingOffset;
     private bool _connected;
     private bool _disposed;
+    private int _activeReads;
+    private int _maximumActiveReads;
 
     public FakeIrcTransport(IrcEndpoint endpoint)
     {
@@ -42,9 +45,23 @@ public sealed class FakeIrcTransport : IIrcTransport, IIrcTransportCallbackSourc
 
     public int DisconnectCount { get; private set; }
 
+    public int DisposeCount { get; private set; }
+
+    public bool IsDisposed => _disposed;
+
+    public int CallbackSubscriptionCount => _callbackReceived?.GetInvocationList().Length ?? 0;
+
+    public int ActiveReadCount => Volatile.Read(ref _activeReads);
+
+    public int MaximumActiveReadCount => Volatile.Read(ref _maximumActiveReads);
+
     public ConnectionFailure? ConnectFailure { get; set; }
 
-    public event Func<IrcTransportCallback, ValueTask>? CallbackReceived;
+    public event Func<IrcTransportCallback, ValueTask>? CallbackReceived
+    {
+        add => _callbackReceived += value;
+        remove => _callbackReceived -= value;
+    }
 
     public IReadOnlyList<byte[]> OutboundBytes => _outbound.ToArray();
 
@@ -68,58 +85,67 @@ public sealed class FakeIrcTransport : IIrcTransport, IIrcTransportCallbackSourc
     public async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        while (true)
+        var activeReads = Interlocked.Increment(ref _activeReads);
+        UpdateMaximum(ref _maximumActiveReads, activeReads);
+        try
         {
-            lock (_pendingGate)
+            while (true)
             {
-                if (_pendingBytes is not null)
+                lock (_pendingGate)
                 {
-                    var remaining = _pendingBytes.Length - _pendingOffset;
-                    var count = Math.Min(remaining, buffer.Length);
-                    _pendingBytes.AsMemory(_pendingOffset, count).CopyTo(buffer);
-                    _pendingOffset += count;
-                    if (_pendingOffset == _pendingBytes.Length)
+                    if (_pendingBytes is not null)
                     {
-                        _pendingBytes = null;
-                        _pendingOffset = 0;
-                    }
+                        var remaining = _pendingBytes.Length - _pendingOffset;
+                        var count = Math.Min(remaining, buffer.Length);
+                        _pendingBytes.AsMemory(_pendingOffset, count).CopyTo(buffer);
+                        _pendingOffset += count;
+                        if (_pendingOffset == _pendingBytes.Length)
+                        {
+                            _pendingBytes = null;
+                            _pendingOffset = 0;
+                        }
 
-                    return count;
+                        return count;
+                    }
+                }
+
+                if (!_connected)
+                {
+                    return 0;
+                }
+
+                var item = await _inbound.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+                switch (item)
+                {
+                    case FakeInboundChunk chunk:
+                        await DelayAsync(chunk.Delay, cancellationToken).ConfigureAwait(false);
+                        if (chunk.Bytes.IsEmpty)
+                        {
+                            continue;
+                        }
+
+                        lock (_pendingGate)
+                        {
+                            _pendingBytes = chunk.Bytes.ToArray();
+                        }
+
+                        break;
+                    case FakeInboundFailure failure:
+                        await DelayAsync(failure.Delay, cancellationToken).ConfigureAwait(false);
+                        LastFailure = failure.Failure;
+                        _connected = false;
+                        throw new IrcTransportException(failure.Failure);
+                    case FakeInboundDisconnect disconnect:
+                        await DelayAsync(disconnect.Delay, cancellationToken).ConfigureAwait(false);
+                        _connected = false;
+                        LastFailure = new ConnectionFailure(ConnectionFailureKind.RemoteClosed, "The fake remote closed the connection.");
+                        return 0;
                 }
             }
-
-            if (!_connected)
-            {
-                return 0;
-            }
-
-            var item = await _inbound.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
-            switch (item)
-            {
-                case FakeInboundChunk chunk:
-                    await DelayAsync(chunk.Delay, cancellationToken).ConfigureAwait(false);
-                    if (chunk.Bytes.IsEmpty)
-                    {
-                        continue;
-                    }
-
-                    lock (_pendingGate)
-                    {
-                        _pendingBytes = chunk.Bytes.ToArray();
-                    }
-
-                    break;
-                case FakeInboundFailure failure:
-                    await DelayAsync(failure.Delay, cancellationToken).ConfigureAwait(false);
-                    LastFailure = failure.Failure;
-                    _connected = false;
-                    throw new IrcTransportException(failure.Failure);
-                case FakeInboundDisconnect disconnect:
-                    await DelayAsync(disconnect.Delay, cancellationToken).ConfigureAwait(false);
-                    _connected = false;
-                    LastFailure = new ConnectionFailure(ConnectionFailureKind.RemoteClosed, "The fake remote closed the connection.");
-                    return 0;
-            }
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activeReads);
         }
     }
 
@@ -160,7 +186,7 @@ public sealed class FakeIrcTransport : IIrcTransport, IIrcTransportCallbackSourc
     public ValueTask EmitCallbackAsync(IrcTransportCallback callback)
     {
         ArgumentNullException.ThrowIfNull(callback);
-        return CallbackReceived is { } handler ? handler(callback) : ValueTask.CompletedTask;
+        return _callbackReceived is { } handler ? handler(callback) : ValueTask.CompletedTask;
     }
 
     public void EnqueueScript(IEnumerable<object> steps)
@@ -179,6 +205,7 @@ public sealed class FakeIrcTransport : IIrcTransport, IIrcTransportCallbackSourc
         }
 
         _disposed = true;
+        DisposeCount++;
         _connected = false;
         _inbound.Writer.TryComplete();
         await ValueTask.CompletedTask;
@@ -186,12 +213,37 @@ public sealed class FakeIrcTransport : IIrcTransport, IIrcTransportCallbackSourc
 
     private static Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken) =>
         delay > TimeSpan.Zero ? Task.Delay(delay, cancellationToken) : Task.CompletedTask;
+
+    private static void UpdateMaximum(ref int target, int value)
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref target);
+            if (value <= current || Interlocked.CompareExchange(ref target, value, current) == current)
+            {
+                return;
+            }
+        }
+    }
 }
 
 public sealed class FakeIrcTransportFactory : IIrcTransportFactory
 {
     private readonly Queue<IIrcTransport> _transports = new();
     private readonly object _gate = new();
+
+    public int CreatedTransportCount { get; private set; }
+
+    public int RemainingTransportCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _transports.Count;
+            }
+        }
+    }
 
     public void Add(IIrcTransport transport)
     {
@@ -212,6 +264,7 @@ public sealed class FakeIrcTransportFactory : IIrcTransportFactory
                 throw new IrcTransportException(new ConnectionFailure(ConnectionFailureKind.Network, "The fake transport factory has no scripted connection left."));
             }
 
+            CreatedTransportCount++;
             return ValueTask.FromResult(_transports.Dequeue());
         }
     }
