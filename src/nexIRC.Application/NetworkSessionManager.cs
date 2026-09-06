@@ -1,4 +1,5 @@
-using System.Collections.ObjectModel;
+using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using nexIRC.Core.Session;
 using nexIRC.Core.Protocol;
 using nexIRC.Core.State;
@@ -8,7 +9,7 @@ namespace nexIRC.Application;
 public sealed class NetworkSessionManager : IAsyncDisposable
 {
     private readonly nexIRC.Core.Networking.IIrcTransportFactory _transportFactory;
-    private readonly IWorkspaceDispatcher _dispatcher;
+    private readonly SerializedWorkspaceDispatcher _dispatcher;
     private readonly object _entriesGate = new();
     private readonly Dictionary<Guid, SessionEntry> _entries = [];
     private readonly object _pendingGate = new();
@@ -23,6 +24,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private readonly bool _ownsLogStore;
     private readonly IrcOperationTimeoutPolicy _operationTimeouts;
     private long _operationSequence;
+    private long _activitySequence;
+    private long _staleGenerationEventsDiscarded;
+    private long _duplicateSemanticEventsDiscarded;
+    private long _resynchronizationEventsSuppressed;
     private bool _disposed;
 
     private const int MaximumOutstandingOperations = 64;
@@ -38,7 +43,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         IrcOperationTimeoutPolicy? operationTimeouts = null)
     {
         _transportFactory = transportFactory ?? throw new ArgumentNullException(nameof(transportFactory));
-        _dispatcher = dispatcher ?? new ImmediateWorkspaceDispatcher();
+        _dispatcher = new SerializedWorkspaceDispatcher(dispatcher ?? new ImmediateWorkspaceDispatcher());
         Notifications = notifications ?? new NotificationSubscriptionService();
         _ownsNotifications = notifications is null;
         HighlightPolicy = highlightPolicy ?? new HighlightActivityPolicy();
@@ -55,7 +60,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
     }
 
-    public ObservableCollection<NetworkWorkspace> Networks { get; } = [];
+    public ThreadSafeObservableCollection<NetworkWorkspace> Networks { get; } = [];
 
     public NetworkWorkspace? ActiveNetwork { get; private set; }
 
@@ -74,6 +79,14 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     public OperationFeedbackViewModel OperationFeedback { get; } = new();
 
     public IrcOperationTimeoutPolicy OperationTimeouts => _operationTimeouts;
+
+    public NetworkSessionDiagnostics Diagnostics => new(
+        _dispatcher.Diagnostics,
+        Interlocked.Read(ref _staleGenerationEventsDiscarded),
+        Interlocked.Read(ref _duplicateSemanticEventsDiscarded),
+        Interlocked.Read(ref _resynchronizationEventsSuppressed));
+
+    public ValueTask FlushStateDispatchAsync() => _dispatcher.FlushAsync();
 
     public bool IsIgnored(NetworkWorkspace workspace, IrcPrefix? prefix, string? account = null)
     {
@@ -113,7 +126,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             .SelectMany(network => network.Views.Select(view => CreateNavigationItem(network, view)))
             .ToArray();
         return ordering == ConversationOrderingMode.RecentActivity
-            ? items.OrderByDescending(item => item.LastActivity).ThenBy(item => item.NetworkDisplayName, StringComparer.OrdinalIgnoreCase).ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase).ToArray()
+            ? items.OrderByDescending(item => item.LastActivity)
+                .ThenByDescending(item => item.LastActivitySequence)
+                .ThenBy(item => item.NetworkDisplayName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
+                .ToArray()
             : items;
     }
 
@@ -990,6 +1007,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         await Task.WhenAll(pending).ConfigureAwait(false);
+        await _dispatcher.CompleteAsync().ConfigureAwait(false);
 
         if (_ownsNotifications)
         {
@@ -1004,6 +1022,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     internal void AppendLocal(WorkspaceView view, TranscriptEntry entry)
     {
+        entry = entry with { Sequence = NextActivitySequence() };
         view.Append(entry, markActivity: false);
         if (TryGet(view.NetworkId, out var workspace) && workspace is not null)
         {
@@ -1156,6 +1175,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     private void ReconcileKickEvent(NetworkWorkspace workspace, IrcKickEvent kick)
     {
+        if (IrcIdentity.Equals(kick.Nickname, workspace.Snapshot.Nickname, workspace.Snapshot.Features.CaseMapping)
+            && workspace.Channels.FirstOrDefault(channel => IrcIdentity.Equals(channel.Channel, kick.Channel, workspace.Snapshot.Features.CaseMapping)) is { } selfKicked)
+        {
+            selfKicked.SetLifecycleState(ConversationLifecycleState.Kicked);
+        }
+
         PendingActionOperation? match = null;
         lock (_operationsGate)
         {
@@ -1255,11 +1280,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             var target = numeric.Interpretation.TargetNickname;
             var whois = workspace.WhoisViews.LastOrDefault(view => view.IsLoading
                 && IrcIdentity.Equals(view.RequestedNickname, target ?? string.Empty, workspace.Snapshot.Features.CaseMapping));
-            whois?.Fail(numeric.Interpretation.FriendlyExplanation + $" [{numeric.Name} {numeric.Numeric}: {numeric.Interpretation.ProtocolText}]");
             foreach (var operation in FindWhoisOperations(workspace.Id, target, workspace.Snapshot.Features.CaseMapping))
             {
                 RemoveWhoisOperation(workspace.Id, operation, IrcOperationState.Rejected, numeric.Numeric, numeric.Interpretation.FriendlyExplanation, NumericProtocolDetail(numeric), numeric.Message.RawLine);
             }
+
+            whois?.Fail(numeric.Interpretation.FriendlyExplanation + $" [{numeric.Name} {numeric.Numeric}: {numeric.Interpretation.ProtocolText}]");
         }
     }
 
@@ -1914,14 +1940,20 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             return;
         }
 
+        var snapshot = session.Snapshot;
         Dispatch(() =>
         {
-            if (!IsCurrentGeneration(entry, session, change.ConnectionGeneration))
+            if (_disposed)
             {
                 return;
             }
 
-            var snapshot = session.Snapshot;
+            if (!IsCurrentGeneration(entry, session, change.ConnectionGeneration))
+            {
+                Interlocked.Increment(ref _staleGenerationEventsDiscarded);
+                return;
+            }
+
             entry.Workspace.ApplySnapshot(snapshot);
             if (change.Current is ServerSessionState.Disconnected or ServerSessionState.Failed)
             {
@@ -1939,7 +1971,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 text += $": {snapshot.LastFailure.Message}";
             }
 
-            entry.Workspace.StatusView.Append(new TranscriptEntry(DateTimeOffset.Now, kind, null, text));
+            entry.Workspace.StatusView.Append(new TranscriptEntry(DateTimeOffset.Now, kind, null, text, Sequence: NextActivitySequence()));
             NotifyNavigationChanged();
             if (change.Current == ServerSessionState.Failed)
             {
@@ -1965,14 +1997,26 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             return;
         }
 
+        var snapshot = session.Snapshot;
         Dispatch(() =>
         {
-            if (!IsCurrentGeneration(entry, session, item.ConnectionGeneration))
+            if (_disposed)
             {
                 return;
             }
 
-            var snapshot = session.Snapshot;
+            if (!IsCurrentGeneration(entry, session, item.ConnectionGeneration))
+            {
+                Interlocked.Increment(ref _staleGenerationEventsDiscarded);
+                return;
+            }
+
+            if (!AcceptSemanticEvent(entry, item))
+            {
+                Interlocked.Increment(ref _duplicateSemanticEventsDiscarded);
+                return;
+            }
+
             entry.Workspace.ApplySnapshot(snapshot);
             RouteSemanticEvent(entry.Workspace, item.Event, snapshot);
         });
@@ -1980,13 +2024,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     private void RouteSemanticEvent(NetworkWorkspace workspace, IrcSemanticEvent semanticEvent, ServerSessionSnapshot snapshot)
     {
-        if (semanticEvent switch
-        {
-            IrcPrivmsgEvent message => IsIgnored(workspace, message.Message.Prefix, AccountTag(message.Message)),
-            IrcQueryMessageEvent query => IsIgnored(workspace, query.Message.Prefix, AccountTag(query.Message)),
-            IrcCtcpEvent ctcp => IsIgnored(workspace, ctcp.Message.Prefix, AccountTag(ctcp.Message)),
-            _ => false
-        })
+        if (ShouldSuppressIgnoredPresentation(workspace, semanticEvent))
         {
             // StateStore has already applied structural protocol state.  Ignore
             // only presentation/activity/notification for matching identities.
@@ -2154,6 +2192,72 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
     }
 
+    private bool ShouldSuppressIgnoredPresentation(NetworkWorkspace workspace, IrcSemanticEvent semanticEvent) =>
+        semanticEvent switch
+        {
+            IrcPrivmsgEvent message => IsIgnored(workspace, message.Message.Prefix, AccountTag(message.Message)),
+            IrcQueryMessageEvent query => IsIgnored(workspace, query.Message.Prefix, AccountTag(query.Message)),
+            IrcCtcpEvent ctcp => IsIgnored(workspace, ctcp.Message.Prefix, AccountTag(ctcp.Message)),
+            IrcJoinEvent join => IsIgnored(workspace, join.Message.Prefix, AccountTag(join.Message)),
+            IrcPartEvent part => IsIgnored(workspace, part.Message.Prefix, AccountTag(part.Message)),
+            IrcQuitEvent quit => IsIgnored(workspace, quit.Message.Prefix, AccountTag(quit.Message)),
+            IrcNicknameChangedEvent nick => IsIgnored(workspace, nick.Message.Prefix, AccountTag(nick.Message)),
+            IrcKickEvent kick => IsIgnored(workspace, kick.Message.Prefix, AccountTag(kick.Message)),
+            IrcTopicEvent topic => IsIgnored(workspace, topic.Message.Prefix, AccountTag(topic.Message)),
+            IrcTopicUnsetEvent topic => IsIgnored(workspace, topic.Message.Prefix, AccountTag(topic.Message)),
+            IrcModeEvent mode => IsIgnored(workspace, mode.Message.Prefix, AccountTag(mode.Message)),
+            _ => false
+        };
+
+    private static bool IsResynchronizationEvent(WorkspaceView view, IrcSemanticEvent semanticEvent, ServerSessionSnapshot snapshot) =>
+        semanticEvent switch
+        {
+            IrcChannelSynchronizationEvent => true,
+            IrcNamesEvent or IrcNamesCompleteEvent or IrcWhoEvent or IrcWhoEndEvent => true,
+            IrcJoinEvent join => IrcIdentity.Equals(join.Nickname, snapshot.Nickname, snapshot.Features.CaseMapping),
+            IrcTopicEvent topic when topic.Message.NumericCommand is 332 => true,
+            IrcTopicUnsetEvent topic when topic.Message.NumericCommand is 331 => true,
+            IrcModeEvent mode when mode.Message.NumericCommand is 324 => true,
+            IrcModeEvent when view is ChannelView channel && channel.Synchronization != ChannelSynchronizationState.Synchronized => true,
+            IrcServerNumericEvent numeric when numeric.Numeric is 332 or 331 or 324 or 353 or 366 => true,
+            _ => false
+        };
+
+    private static string SemanticIdentity(IrcSemanticEvent semanticEvent)
+    {
+        var message = semanticEvent.Message;
+        var msgid = message.TagValues.TryGetValue("msgid", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value
+            : $"delivery:{RuntimeHelpers.GetHashCode(semanticEvent):x8}";
+        return $"{semanticEvent.GetType().Name}:{msgid}";
+    }
+
+    private static bool AcceptSemanticEvent(SessionEntry entry, SessionSemanticEvent item)
+    {
+        var message = item.Event.Message;
+        if (!message.TagValues.TryGetValue("msgid", out var msgid) || string.IsNullOrWhiteSpace(msgid))
+        {
+            return true;
+        }
+
+        var key = $"{item.ConnectionGeneration}:{item.Event.GetType().Name}:{msgid}";
+        if (!entry.RecentSemanticEventIds.Add(key))
+        {
+            return false;
+        }
+
+        entry.RecentSemanticEventOrder.Enqueue(key);
+        while (entry.RecentSemanticEventOrder.Count > 512
+            && entry.RecentSemanticEventOrder.TryDequeue(out var retired))
+        {
+            entry.RecentSemanticEventIds.Remove(retired);
+        }
+
+        return true;
+    }
+
+    private long NextActivitySequence() => Interlocked.Increment(ref _activitySequence);
+
     private static string? AccountTag(IrcMessage message) =>
         message.TagValues.TryGetValue("account", out var account) && !string.Equals(account, "*", StringComparison.Ordinal)
             ? account
@@ -2176,6 +2280,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         var previousActivity = view.Activity;
+        var isResynchronization = IsResynchronizationEvent(view, semanticEvent, snapshot);
         var isOwnMessage = semanticEvent switch
         {
             IrcPrivmsgEvent message => IrcIdentity.Equals(message.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping),
@@ -2183,20 +2288,33 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             IrcCtcpEvent ctcp => IrcIdentity.Equals(ctcp.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping),
             _ => false
         };
-        var effectiveActivity = isOwnMessage ? WorkspaceActivity.None : activity ?? HighlightPolicy.Classify(view, semanticEvent, snapshot);
+        var effectiveActivity = isResynchronization || isOwnMessage
+            ? WorkspaceActivity.None
+            : activity ?? HighlightPolicy.Classify(view, semanticEvent, snapshot);
+        if (isResynchronization)
+        {
+            Interlocked.Increment(ref _resynchronizationEventsSuppressed);
+        }
         if (semanticEvent is IrcPrivmsgEvent { IsNotice: false } channelMessage
             && view is ChannelView
+            && !isOwnMessage
             && HighlightPolicy.IsHighlight(channelMessage.Text, snapshot.Nickname, snapshot.Features.CaseMapping))
         {
             entry = entry with { Metadata = "highlight" };
         }
 
-        view.Append(entry, markActivity: false);
-        if (view is ChannelView channel && semanticEvent is IrcJoinEvent)
+        entry = entry with { Sequence = NextActivitySequence() };
+        view.Append(entry, markActivity: false, updateLastActivity: !isResynchronization);
+        if (entry.IsHighlight && !isResynchronization)
+        {
+            view.MarkHighlight();
+        }
+
+        if (!isResynchronization && view is ChannelView channel && semanticEvent is IrcJoinEvent)
         {
             RecordRecent(workspace, DestinationKind.Channel, channel.Channel);
         }
-        else if (view is QueryView query && view.EntriesSnapshot.Count == 1 && semanticEvent is IrcQueryMessageEvent or IrcCtcpEvent)
+        else if (!isResynchronization && view is QueryView query && view.EntriesSnapshot.Count == 1 && semanticEvent is (IrcQueryMessageEvent or IrcCtcpEvent))
         {
             RecordRecent(workspace, DestinationKind.Query, query.Nickname);
         }
@@ -2220,6 +2338,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
         NotifyNavigationChanged();
 
+        if (isResynchronization)
+        {
+            return;
+        }
+
         var notification = new IrcNotification(
             view.NetworkId,
             view.Id,
@@ -2237,7 +2360,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 TryGet(view.NetworkId, out var targetWorkspace) ? targetWorkspace?.ProfileId : null,
                 view.Id,
                 view.Kind,
-                view is ChannelView targetChannel ? targetChannel.Channel : view is QueryView targetQuery ? targetQuery.Nickname : view.Title));
+                view is ChannelView targetChannel ? targetChannel.Channel : view is QueryView targetQuery ? targetQuery.Nickname : view.Title),
+            SemanticIdentity(semanticEvent));
         if (_notificationCoalescer.ShouldPublish(notification))
         {
             Notifications.Publish(notification);
@@ -2294,7 +2418,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         view.Activity,
         view.LifecycleState,
         view.IsViewOpen,
-        view.LastActivity);
+        view.LastActivity,
+        view.LastActivitySequence);
 
     private bool IsOpenIdentityAvailable(ConversationIdentity identity) => Networks
         .Where(network => network.Id == identity.NetworkId)
@@ -2442,6 +2567,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private bool IsCurrentGeneration(SessionEntry entry, ServerSession session, int generation) =>
         ReferenceEquals(entry.Session, session)
         && ReferenceEquals(entry.Session, entry.Workspace.Session)
+        && generation == session.Snapshot.ConnectionGeneration
         && generation >= entry.Workspace.Snapshot.ConnectionGeneration;
 
     private SessionEntry GetEntry(Guid networkId) =>
@@ -2490,5 +2616,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         public Task? RunTask { get; set; }
 
         public bool NeedsReplacement { get; set; }
+
+        public HashSet<string> RecentSemanticEventIds { get; } = new(StringComparer.Ordinal);
+
+        public ConcurrentQueue<string> RecentSemanticEventOrder { get; } = new();
     }
 }

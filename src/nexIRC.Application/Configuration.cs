@@ -49,6 +49,7 @@ public static class ConfigurationLimits
     public const int MaximumLogRecordBytes = 32_768;
     public const int MaximumNotificationCoalescingEntries = 256;
     public const int MaximumIgnoreRules = 256;
+    public const int MaximumUnreadCount = 10_000;
 }
 
 public static class ConfigurationSchema

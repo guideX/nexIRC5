@@ -8,11 +8,13 @@ namespace nexIRC.Desktop;
 
 public sealed class DemoScenario
 {
+    private readonly FakeIrcTransportFactory _factory;
     private readonly FakeIrcTransport _alpha;
     private readonly FakeIrcTransport _beta;
 
-    private DemoScenario(FakeIrcTransport alpha, FakeIrcTransport beta)
+    private DemoScenario(FakeIrcTransportFactory factory, FakeIrcTransport alpha, FakeIrcTransport beta)
     {
+        _factory = factory;
         _alpha = alpha;
         _beta = beta;
     }
@@ -21,13 +23,25 @@ public sealed class DemoScenario
 
     internal FakeIrcTransport BetaTransport => _beta;
 
+    internal FakeIrcTransport AddAlphaReconnectTransport()
+    {
+        var reconnect = new FakeIrcTransport(_alpha.Endpoint);
+        _factory.Add(reconnect);
+        return reconnect;
+    }
+
     internal async Task<(NetworkWorkspace Alpha, NetworkWorkspace Beta)> SeedSmokeAsync(MainWindowViewModel viewModel)
     {
         ArgumentNullException.ThrowIfNull(viewModel);
         var sessions = viewModel.Sessions;
         var alpha = sessions.Add(Options("AlphaNet", _alpha.Endpoint, "nexAlpha", "#general") with
         {
-            RequestedCapabilities = Array.Empty<string>()
+            RequestedCapabilities = Array.Empty<string>(),
+            Reconnect = new ReconnectPolicy(
+                Enabled: true,
+                MaximumAttempts: 3,
+                InitialDelay: TimeSpan.FromMilliseconds(10),
+                MaximumDelay: TimeSpan.FromMilliseconds(50))
         });
         var beta = sessions.Add(Options("BetaNet", _beta.Endpoint, "nexBeta", "#general") with
         {
@@ -59,7 +73,7 @@ public sealed class DemoScenario
         var beta = new FakeIrcTransport(new IrcEndpoint("demo.beta.invalid", 6667, false));
         factory.Add(alpha);
         factory.Add(beta);
-        scenario = new DemoScenario(alpha, beta);
+        scenario = new DemoScenario(factory, alpha, beta);
         return factory;
     }
 

@@ -24,7 +24,8 @@ public sealed record IrcNotification(
     bool IsViewActive,
     string SemanticSource,
     bool IsOwnMessage = false,
-    NotificationActivationTarget? Activation = null);
+    NotificationActivationTarget? Activation = null,
+    string? SemanticId = null);
 
 public sealed record NotificationActivationTarget(
     Guid NetworkId,
@@ -36,7 +37,7 @@ public sealed record NotificationActivationTarget(
 public sealed class NotificationCoalescer
 {
     private readonly object _gate = new();
-    private readonly Dictionary<(Guid NetworkId, Guid ViewId, IrcNotificationType Type), DateTimeOffset> _recent = [];
+    private readonly Dictionary<(Guid NetworkId, Guid ViewId, IrcNotificationType Type, string? SemanticId), DateTimeOffset> _recent = [];
     private readonly TimeSpan _window;
 
     public NotificationCoalescer(TimeSpan? window = null)
@@ -59,9 +60,16 @@ public sealed class NotificationCoalescer
                 _recent.Remove(staleKey);
             }
 
-            var key = (notification.NetworkId, notification.ViewId, notification.Type);
+            // Without a protocol identity this retains the legacy short
+            // coalescing behavior for callers that construct notifications
+            // directly. Manager-produced protocol messages carry msgid (when
+            // advertised) or another delivery identity, so distinct messages
+            // with the same text are never suppressed merely because they
+            // arrived close together.
+            var key = (notification.NetworkId, notification.ViewId, notification.Type, notification.SemanticId);
             if (_recent.TryGetValue(key, out var previous) && now - previous < _window)
             {
+                Interlocked.Increment(ref _coalescedCount);
                 return false;
             }
 
@@ -73,6 +81,21 @@ public sealed class NotificationCoalescer
 
             _recent[key] = now;
             return true;
+        }
+    }
+
+    private long _coalescedCount;
+
+    public long CoalescedCount => Interlocked.Read(ref _coalescedCount);
+
+    public int EntryCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _recent.Count;
+            }
         }
     }
 }

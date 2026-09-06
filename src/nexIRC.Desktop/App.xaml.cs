@@ -21,13 +21,15 @@ public partial class App : System.Windows.Application
         if (smokeScenario is not null && !demo)
         {
             Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": UI smoke requires --demo so no real network session can be used.");
+            Environment.ExitCode = 2;
             Shutdown(2);
             return;
         }
 
         if (smokeScenario is not null && !UiSmokeHarness.IsKnownScenario(smokeScenario))
         {
-            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": unknown scenario. Expected participant, moderation, channel-properties, or multi-network.");
+            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": unknown scenario. Expected participant, moderation, channel-properties, multi-network, lifecycle, read-state, or reconnect.");
+            Environment.ExitCode = 2;
             Shutdown(2);
             return;
         }
@@ -105,6 +107,7 @@ public partial class App : System.Windows.Application
             {
                 await UiSmokeHarness.RunAsync(smokeScenario, window, demoScenario).ConfigureAwait(true);
                 await window.CloseAfterSmokeAsync().ConfigureAwait(true);
+                Environment.ExitCode = 0;
                 Shutdown(0);
             }
             catch (Exception exception)
@@ -118,6 +121,7 @@ public partial class App : System.Windows.Application
                 {
                 }
 
+                Environment.ExitCode = 1;
                 Shutdown(1);
             }
         }

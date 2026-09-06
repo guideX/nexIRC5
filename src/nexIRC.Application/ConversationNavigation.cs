@@ -41,7 +41,8 @@ public sealed record ConversationNavigationItem(
     WorkspaceActivity Activity,
     ConversationLifecycleState LifecycleState,
     bool IsViewOpen,
-    DateTimeOffset LastActivity)
+    DateTimeOffset LastActivity,
+    long LastActivitySequence = 0)
 {
     public bool IsUnread => Activity != WorkspaceActivity.None;
 
@@ -49,16 +50,19 @@ public sealed record ConversationNavigationItem(
 
     public string StateMarker => LifecycleState switch
     {
+        ConversationLifecycleState.Joining => "◐",
         ConversationLifecycleState.Joined or ConversationLifecycleState.Active => "●",
         ConversationLifecycleState.Disconnected => "◌",
-        ConversationLifecycleState.Parted => "○",
+        ConversationLifecycleState.Parted or ConversationLifecycleState.Kicked => "○",
         _ => "◇"
     };
 
     public string LifecycleText => LifecycleState switch
     {
+        ConversationLifecycleState.Joining => "joining",
         ConversationLifecycleState.Joined => "joined",
         ConversationLifecycleState.Parted => "parted",
+        ConversationLifecycleState.Kicked => "kicked",
         ConversationLifecycleState.Active => "active",
         ConversationLifecycleState.Disconnected => "disconnected",
         _ => "historical"

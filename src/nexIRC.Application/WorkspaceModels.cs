@@ -27,8 +27,10 @@ public enum WorkspaceActivity
 public enum ConversationLifecycleState
 {
     HistoricalOnly,
+    Joining,
     Joined,
     Parted,
+    Kicked,
     Active,
     Disconnected
 }
@@ -103,7 +105,8 @@ public sealed record TranscriptEntry(
     TranscriptEntryKind Kind,
     string? Sender,
     string Text,
-    string? Metadata = null)
+    string? Metadata = null,
+    long Sequence = 0)
 {
     public string DisplayTime => Timestamp.ToLocalTime().ToString("HH:mm:ss", System.Globalization.CultureInfo.CurrentCulture);
 
@@ -224,10 +227,14 @@ public abstract class WorkspaceView : ObservableObject
 {
     private readonly object _entriesGate = new();
     private WorkspaceActivity _activity;
+    private int _unreadCount;
+    private int _importantCount;
+    private int _highlightCount;
     private bool _isActive;
     private bool _isViewOpen = true;
     private ConversationLifecycleState _lifecycleState = ConversationLifecycleState.HistoricalOnly;
     private DateTimeOffset _lastActivity;
+    private long _lastActivitySequence;
     private string? _historyContextMatch;
 
     protected WorkspaceView(Guid networkId, Guid id, WorkspaceViewKind kind, string title)
@@ -265,10 +272,37 @@ public abstract class WorkspaceView : ObservableObject
         }
     }
 
+    /// <summary>
+    /// Saturated count of live, unread activity. Historical inspection and
+    /// synchronization projections never change this value.
+    /// </summary>
+    public int UnreadCount => _unreadCount;
+
+    /// <summary>
+    /// Saturated count of unread activity classified as important. This
+    /// includes highlights, private messages, errors, and notices.
+    /// </summary>
+    public int ImportantCount => _importantCount;
+
+    /// <summary>
+    /// Saturated count of unread channel mentions.
+    /// </summary>
+    public int HighlightCount => _highlightCount;
+
+    public bool HasUnread => _unreadCount > 0;
+
+    public bool IsImportant => _importantCount > 0;
+
     public DateTimeOffset LastActivity
     {
         get => _lastActivity;
         private set => SetProperty(ref _lastActivity, value);
+    }
+
+    public long LastActivitySequence
+    {
+        get => _lastActivitySequence;
+        private set => SetProperty(ref _lastActivitySequence, value);
     }
 
     public bool IsActive
@@ -298,8 +332,10 @@ public abstract class WorkspaceView : ObservableObject
 
     public string LifecycleText => LifecycleState switch
     {
+        ConversationLifecycleState.Joining => "joining",
         ConversationLifecycleState.Joined => "joined",
         ConversationLifecycleState.Parted => "parted",
+        ConversationLifecycleState.Kicked => "kicked",
         ConversationLifecycleState.Active => "active",
         ConversationLifecycleState.Disconnected => "disconnected",
         _ => "historical"
@@ -307,15 +343,16 @@ public abstract class WorkspaceView : ObservableObject
 
     public string StateMarker => LifecycleState switch
     {
+        ConversationLifecycleState.Joining => "◐",
         ConversationLifecycleState.Joined or ConversationLifecycleState.Active => "●",
         ConversationLifecycleState.Disconnected => "◌",
-        ConversationLifecycleState.Parted => "○",
+        ConversationLifecycleState.Parted or ConversationLifecycleState.Kicked => "○",
         _ => "◇"
     };
 
-    public ObservableCollection<TranscriptEntry> Entries { get; } = [];
+    public ThreadSafeObservableCollection<TranscriptEntry> Entries { get; } = [];
 
-    public ObservableCollection<HistoryContextEntry> HistoryContext { get; } = [];
+    public ThreadSafeObservableCollection<HistoryContextEntry> HistoryContext { get; } = [];
 
     public bool HasHistoryContext => HistoryContext.Count > 0;
 
@@ -332,9 +369,17 @@ public abstract class WorkspaceView : ObservableObject
         }
     }
 
-    internal void Append(TranscriptEntry entry, bool markActivity = true, WorkspaceActivity? activity = null)
+    internal void Append(
+        TranscriptEntry entry,
+        bool markActivity = true,
+        WorkspaceActivity? activity = null,
+        bool updateLastActivity = true)
     {
-        LastActivity = entry.Timestamp;
+        if (updateLastActivity)
+        {
+            LastActivity = entry.Timestamp;
+            LastActivitySequence = entry.Sequence;
+        }
         lock (_entriesGate)
         {
             Entries.Add(entry);
@@ -354,10 +399,54 @@ public abstract class WorkspaceView : ObservableObject
 
     public void MarkActivity(WorkspaceActivity activity)
     {
-        if (activity > Activity)
+        if (activity == WorkspaceActivity.None)
         {
-            Activity = activity;
+            return;
         }
+
+        IncrementCounter(ref _unreadCount, nameof(UnreadCount));
+        if (activity == WorkspaceActivity.Important)
+        {
+            IncrementCounter(ref _importantCount, nameof(ImportantCount));
+        }
+
+        RefreshActivity();
+    }
+
+    internal void MarkHighlight()
+    {
+        IncrementCounter(ref _highlightCount, nameof(HighlightCount));
+    }
+
+    private void IncrementCounter(ref int counter, string propertyName)
+    {
+        if (counter < ConfigurationLimits.MaximumUnreadCount)
+        {
+            counter++;
+            OnPropertyChanged(propertyName);
+        }
+    }
+
+    private void RefreshActivity()
+    {
+        Activity = _importantCount > 0
+            ? WorkspaceActivity.Important
+            : _unreadCount > 0
+                ? WorkspaceActivity.Unread
+                : WorkspaceActivity.None;
+        OnPropertyChanged(nameof(HasUnread));
+        OnPropertyChanged(nameof(IsImportant));
+    }
+
+    public void MarkRead()
+    {
+        _unreadCount = 0;
+        _importantCount = 0;
+        _highlightCount = 0;
+        OnPropertyChanged(nameof(UnreadCount));
+        OnPropertyChanged(nameof(ImportantCount));
+        OnPropertyChanged(nameof(HighlightCount));
+        RefreshActivity();
     }
 
     public void ClearEntries()
@@ -388,7 +477,7 @@ public abstract class WorkspaceView : ObservableObject
     public void Activate()
     {
         IsActive = true;
-        Activity = WorkspaceActivity.None;
+        MarkRead();
     }
 
     internal void Deactivate() => IsActive = false;
@@ -680,7 +769,7 @@ public sealed class ChannelView : WorkspaceView
 
     public bool IsConnected => LifecycleState is ConversationLifecycleState.Joined or ConversationLifecycleState.Active;
 
-    public ObservableCollection<ChannelMemberView> Members { get; } = [];
+    public ThreadSafeObservableCollection<ChannelMemberView> Members { get; } = [];
 
     public IReadOnlyList<ChannelMemberView> MembersSnapshot
     {
@@ -730,11 +819,16 @@ public sealed class ChannelView : WorkspaceView
         {
             IsJoined = snapshot.IsJoined;
             IsStale = snapshot.IsStale;
+            var retainedLifecycle = LifecycleState is ConversationLifecycleState.Parted or ConversationLifecycleState.Kicked;
             SetLifecycleState(snapshot.IsJoined
                 ? ConversationLifecycleState.Joined
                 : snapshot.IsStale || !networkAvailable
                     ? ConversationLifecycleState.Disconnected
-                    : !isDesired && LifecycleState is not ConversationLifecycleState.HistoricalOnly ? ConversationLifecycleState.Parted : ConversationLifecycleState.HistoricalOnly);
+                    : snapshot.Synchronization is ChannelSynchronizationState.Joining or ChannelSynchronizationState.Synchronizing
+                        ? ConversationLifecycleState.Joining
+                        : retainedLifecycle && isDesired
+                            ? LifecycleState
+                            : !isDesired && LifecycleState is not ConversationLifecycleState.HistoricalOnly ? ConversationLifecycleState.Parted : ConversationLifecycleState.HistoricalOnly);
             Synchronization = snapshot.Synchronization;
             Topic = snapshot.Topic;
             TopicSetter = snapshot.TopicSetter;
@@ -933,17 +1027,17 @@ public sealed class NetworkWorkspace : ObservableObject
 
     public ServerStatusView StatusView { get; }
 
-    public ObservableCollection<WorkspaceView> Views { get; } = [];
+    public ThreadSafeObservableCollection<WorkspaceView> Views { get; } = [];
 
-    public ObservableCollection<ChannelView> Channels { get; } = [];
+    public ThreadSafeObservableCollection<ChannelView> Channels { get; } = [];
 
-    public ObservableCollection<QueryView> Queries { get; } = [];
+    public ThreadSafeObservableCollection<QueryView> Queries { get; } = [];
 
-    public ObservableCollection<WhoisView> WhoisViews { get; } = [];
+    public ThreadSafeObservableCollection<WhoisView> WhoisViews { get; } = [];
 
-    public ObservableCollection<ChannelListView> ChannelListViews { get; } = [];
+    public ThreadSafeObservableCollection<ChannelListView> ChannelListViews { get; } = [];
 
-    public ObservableCollection<BanListView> BanListViews { get; } = [];
+    public ThreadSafeObservableCollection<BanListView> BanListViews { get; } = [];
 
     public WorkspaceView? ActiveView
     {

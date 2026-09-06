@@ -1,5 +1,8 @@
 using System.Windows;
 using nexIRC.Application;
+using nexIRC.Core.Networking;
+using nexIRC.Core.Session;
+using nexIRC.Networking.Testing;
 
 namespace nexIRC.Desktop;
 
@@ -10,7 +13,7 @@ namespace nexIRC.Desktop;
 /// </summary>
 internal static class UiSmokeHarness
 {
-    private static readonly string[] Scenarios = ["participant", "moderation", "channel-properties", "multi-network"];
+    private static readonly string[] Scenarios = ["participant", "moderation", "channel-properties", "multi-network", "lifecycle", "read-state", "reconnect"];
 
     public static bool IsKnownScenario(string? scenario) =>
         scenario is not null && Scenarios.Contains(scenario, StringComparer.OrdinalIgnoreCase);
@@ -35,6 +38,15 @@ internal static class UiSmokeHarness
                 break;
             case "multi-network":
                 await MultiNetworkAsync(window, demo, state.Alpha, state.Beta).ConfigureAwait(true);
+                break;
+            case "lifecycle":
+                await LifecycleAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "read-state":
+                await ReadStateAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "reconnect":
+                await ReconnectAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
             default:
                 throw new ArgumentException($"Unknown UI smoke scenario '{scenario}'.", nameof(scenario));
@@ -174,6 +186,92 @@ internal static class UiSmokeHarness
         demo.AlphaTransport.EnqueueInboundLine(":nexAlpha!demo@alpha.server TOPIC #general :Alpha-only topic");
         await WaitForAsync(viewModel.Sessions, () => alphaChannel.Topic == "Alpha-only topic", "AlphaNet topic confirmation was not isolated").ConfigureAwait(true);
         Require(betaChannel.Topic == "Beta topic", "cross-network topic projection mutation occurred");
+    }
+
+    private static async Task LifecycleAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var viewModel = window.ViewModel;
+        var channel = RequiredChannel(network);
+        viewModel.SelectView(channel);
+        var beforeClose = demo.AlphaTransport.OutboundLines.Count;
+        Require(viewModel.CloseActiveView(), "lifecycle channel did not close through the view-model path");
+        Require(!channel.IsViewOpen, "lifecycle close left the view open");
+        Require(demo.AlphaTransport.OutboundLines.Count == beforeClose
+            || !demo.AlphaTransport.OutboundLines.Skip(beforeClose).Any(line => line.StartsWith("PART", StringComparison.Ordinal)), "closing the view unexpectedly PARTed the channel");
+
+        demo.AlphaTransport.EnqueueInboundLine(":Lifecycle!u@demo PRIVMSG #general :lifecycle live message");
+        await WaitForAsync(viewModel.Sessions, () => channel.EntriesSnapshot.Any(entry => entry.Text == "lifecycle live message"), "lifecycle message was not received").ConfigureAwait(true);
+        Require(viewModel.ReopenConversation(channel), "lifecycle conversation did not reopen");
+        Require(ReferenceEquals(viewModel.ActiveView, channel), "lifecycle reopen did not restore the same conversation");
+
+        await viewModel.PartAndCloseActiveAsync().ConfigureAwait(true);
+        Require(channel.LifecycleState == ConversationLifecycleState.Parted, "lifecycle PART did not produce parted state");
+        var beforeHistory = demo.AlphaTransport.OutboundLines.Count;
+        var historical = viewModel.Sessions.OpenHistoricalConversation(network.Id, DestinationKind.Channel, "#general");
+        Require(ReferenceEquals(historical, channel) && historical.IsViewOpen, "historical reopen created a duplicate channel view");
+        Require(demo.AlphaTransport.OutboundLines.Count == beforeHistory, "opening channel history unexpectedly sent IRC traffic");
+
+        await viewModel.Sessions.RejoinChannelAsync(network.Id, "#general").ConfigureAwait(true);
+        demo.AlphaTransport.EnqueueInboundLine(":nexAlpha!demo@alpha.server JOIN #general");
+        demo.AlphaTransport.EnqueueInboundLine(":alpha.server 353 nexAlpha = #general :@nexAlpha");
+        demo.AlphaTransport.EnqueueInboundLine(":alpha.server 366 nexAlpha #general :End of names");
+        await WaitForAsync(viewModel.Sessions, () => channel.IsJoined && channel.Synchronization == ChannelSynchronizationState.Synchronized, "explicit rejoin did not restore the channel").ConfigureAwait(true);
+    }
+
+    private static async Task ReadStateAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var viewModel = window.ViewModel;
+        var channel = RequiredChannel(network);
+        await viewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+        // The shared demo seed includes a live MODE line. Establish a clean
+        // read-state baseline before exercising accumulation semantics.
+        viewModel.SelectView(channel);
+        viewModel.SelectView(network.StatusView);
+        demo.AlphaTransport.EnqueueInboundLine(":ReadState!u@demo PRIVMSG #general :ordinary read-state message");
+        await WaitForAsync(viewModel.Sessions, () => channel.Activity == WorkspaceActivity.Unread && channel.UnreadCount == 1, "read-state unread activity was not classified").ConfigureAwait(true);
+        demo.AlphaTransport.EnqueueInboundLine(":ReadState!u@demo PRIVMSG #general :nexAlpha read-state highlight");
+        await WaitForAsync(viewModel.Sessions, () => channel.Activity == WorkspaceActivity.Important && channel.HighlightCount == 1, "read-state highlight was not classified").ConfigureAwait(true);
+        Require(channel.UnreadCount == 2, "read-state unread count was not accumulated");
+
+        viewModel.SelectView(channel);
+        Require(channel.Activity == WorkspaceActivity.None && channel.UnreadCount == 0 && channel.HighlightCount == 0, "selecting the visible conversation did not mark it read");
+        channel.SetHistoryContext(Array.Empty<HistoryContextEntry>(), "historical inspection");
+        Require(channel.Activity == WorkspaceActivity.None && channel.UnreadCount == 0, "historical inspection changed read state");
+
+        viewModel.Sessions.Configuration?.AddIgnore(new IgnoreRule { Nickname = "IgnoredReadState" });
+        demo.AlphaTransport.EnqueueInboundLine(":IgnoredReadState!u@demo JOIN #general");
+        await WaitForAsync(viewModel.Sessions, () => channel.MembersSnapshot.Any(member => member.Nickname == "IgnoredReadState"), "ignored structural join was not reconciled").ConfigureAwait(true);
+        demo.AlphaTransport.EnqueueInboundLine(":IgnoredReadState!u@demo PRIVMSG #general :ignored read-state message");
+        await viewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+        Require(channel.Activity == WorkspaceActivity.None && channel.UnreadCount == 0 && channel.HighlightCount == 0, "ignored content changed read state");
+        Require(!channel.EntriesSnapshot.Any(entry => entry.Text.Contains("ignored read-state", StringComparison.Ordinal)), "ignored content was presented");
+    }
+
+    private static async Task ReconnectAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var viewModel = window.ViewModel;
+        var channel = RequiredChannel(network);
+        var replacement = demo.AddAlphaReconnectTransport();
+        demo.AlphaTransport.EnqueueRemoteDisconnect();
+        await WaitForAsync(viewModel.Sessions, () => replacement.ConnectCount == 1 && channel.IsStale, "reconnect did not establish a new session generation").ConfigureAwait(true);
+
+        Register(replacement, "nexAlpha");
+        replacement.EnqueueInboundLine(":nexAlpha!demo@alpha.server JOIN #general");
+        replacement.EnqueueInboundLine(":alpha.server 353 nexAlpha = #general :@nexAlpha");
+        replacement.EnqueueInboundLine(":alpha.server 366 nexAlpha #general :End of names");
+        await WaitForAsync(viewModel.Sessions, () => channel.Synchronization == ChannelSynchronizationState.Synchronized, "reconnect resynchronization did not complete").ConfigureAwait(true);
+
+        await demo.AlphaTransport.EmitCallbackAsync(new IrcTransportInboundLineCallback(":old.server MODE #general +s"));
+        replacement.EnqueueInboundLine(":alpha.server MODE #general +m");
+        await WaitForAsync(viewModel.Sessions, () => channel.Modes.Contains('m'), "new-generation MODE was not projected").ConfigureAwait(true);
+        Require(!channel.Modes.Contains('s'), "an old-generation MODE contaminated the reconnected channel");
+    }
+
+    private static void Register(FakeIrcTransport transport, string nickname)
+    {
+        transport.EnqueueInboundLine(":alpha.server CAP * LS :");
+        transport.EnqueueInboundLine($":alpha.server 005 {nickname} PREFIX=(qaohv)~&@%+ CHANMODES=beI,k,l,imnpst :features");
+        transport.EnqueueInboundLine($":alpha.server 001 {nickname} :Welcome");
     }
 
     private static ChannelView RequiredChannel(NetworkWorkspace network) =>

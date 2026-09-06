@@ -89,7 +89,7 @@ public sealed class OperationFeedbackViewModel : ObservableObject
     private readonly object _gate = new();
     private IrcOperationResult? _latest;
 
-    public ObservableCollection<IrcOperationResult> Results { get; } = [];
+    public ThreadSafeObservableCollection<IrcOperationResult> Results { get; } = [];
 
     public IrcOperationResult? Latest
     {
