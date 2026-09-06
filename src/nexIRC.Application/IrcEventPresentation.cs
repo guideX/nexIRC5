@@ -28,6 +28,12 @@ public static class IrcEventPresentation
             IrcNamesEvent names => Entry(TranscriptEntryKind.Informational, null, $"NAMES {names.Channel}: {names.Nicknames.Count} member(s) observed."),
             IrcNamesCompleteEvent names => Entry(TranscriptEntryKind.Informational, null, $"Member list synchronized for {names.Channel}."),
             IrcModeEvent mode => Entry(TranscriptEntryKind.Mode, mode.Message.Prefix?.Name, $"changed modes in {mode.Channel}: {FormatModes(mode.Changes)}"),
+            IrcServerNumericEvent numeric => Entry(
+                numeric.IsError ? TranscriptEntryKind.Error : TranscriptEntryKind.Informational,
+                null,
+                $"{numeric.Interpretation.FriendlyExplanation} [{numeric.Name} {numeric.Numeric}: {numeric.Interpretation.ProtocolText}]"),
+            IrcBanListEndEvent end => Entry(TranscriptEntryKind.List, null, $"Ban list complete for {end.Channel}."),
+            IrcBanListItemEvent => null,
             IrcChannelSynchronizationEvent synchronization => Entry(TranscriptEntryKind.Informational, null, $"{synchronization.Channel}: {synchronization.State}."),
             IrcMotdEvent motd => Entry(TranscriptEntryKind.Motd, null, motd.Kind == IrcMotdEventKind.Line ? motd.Text : $"MOTD {motd.Kind.ToString().ToLowerInvariant()}: {motd.Text}"),
             IrcListStartEvent => Entry(TranscriptEntryKind.List, null, "Channel list started."),

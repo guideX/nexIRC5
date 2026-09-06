@@ -4,9 +4,12 @@ using nexIRC.Core.Session;
 
 namespace nexIRC.Application;
 
-public sealed record CommandDispatchResult(bool Succeeded, string Message, WorkspaceView? View = null)
+public sealed record CommandDispatchResult(bool Succeeded, string Message, WorkspaceView? View = null, IrcOperationResult? Operation = null)
 {
-    public static CommandDispatchResult Success(string message, WorkspaceView? view = null) => new(true, message, view);
+    public static CommandDispatchResult Success(
+        string message,
+        WorkspaceView? view = null,
+        IrcOperationResult? operation = null) => new(true, message, view, operation);
 
     public static CommandDispatchResult Failure(string message, WorkspaceView? view = null) => new(false, message, view);
 }
@@ -20,7 +23,7 @@ public sealed class IrcCommandDispatcher
     public static IReadOnlyList<string> SupportedCommands { get; } =
     [
         "server", "join", "rejoin", "part", "msg", "query", "q", "nick", "me", "quit",
-        "disconnect", "whois", "list", "notice", "ctcp", "op", "deop", "voice",
+        "disconnect", "whois", "list", "banlist", "notice", "ctcp", "op", "deop", "voice",
         "devoice", "kick", "ban", "unban", "invite", "mode", "topic", "clear", "close", "raw", "quote", "help"
     ];
 
@@ -133,6 +136,8 @@ public sealed class IrcCommandDispatcher
                     return await WhoisAsync(network, parts, cancellationToken).ConfigureAwait(false);
                 case "LIST":
                     return await ListAsync(network, parts, cancellationToken).ConfigureAwait(false);
+                case "BANLIST":
+                    return await BanListAsync(network, activeView, parts, cancellationToken).ConfigureAwait(false);
                 case "NOTICE":
                     return await NoticeAsync(network, arguments, cancellationToken).ConfigureAwait(false);
                 case "CTCP":
@@ -341,6 +346,38 @@ public sealed class IrcCommandDispatcher
         }
     }
 
+    private async ValueTask<CommandDispatchResult> BanListAsync(
+        NetworkWorkspace network,
+        WorkspaceView activeView,
+        string[] parts,
+        CancellationToken cancellationToken)
+    {
+        var channel = activeView is ChannelView channelView
+            ? channelView.Channel
+            : parts.FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(channel))
+        {
+            return CommandDispatchResult.Failure("Usage: /banlist [#channel]", activeView);
+        }
+
+        if (network.Channels.FirstOrDefault(item => IrcIdentity.Equals(item.Channel, channel, network.Snapshot.Features.CaseMapping)) is not { IsJoined: true })
+        {
+            return CommandDispatchResult.Failure("Ban lists are available for joined channels only.", activeView);
+        }
+
+        try
+        {
+            var request = await _sessions.RequestBanListAsync(network.Id, channel, cancellationToken).ConfigureAwait(false);
+            return CommandDispatchResult.Success(
+                request.WasCoalesced ? "A ban-list request is already in progress." : $"Ban list requested for {channel}.",
+                request.View);
+        }
+        catch (InvalidOperationException exception)
+        {
+            return CommandDispatchResult.Failure(exception.Message, activeView);
+        }
+    }
+
     private async ValueTask<CommandDispatchResult> ActionAsync(
         NetworkWorkspace network,
         WorkspaceView activeView,
@@ -504,8 +541,14 @@ public sealed class IrcCommandDispatcher
         var parameters = parts.Length > 0 && IrcIdentity.Equals(parts[0], channel.Channel, network.Snapshot.Features.CaseMapping)
             ? parts.Skip(1).ToArray()
             : parts;
+        IrcOperationResult? operation = null;
+        if (parameters.Length == 0)
+        {
+            operation = _sessions.StartOperation(IrcOperationType.ChannelModeQuery, network.Id, channel.Channel, command: "MODE");
+        }
+
         await network.Session.SendCommandAsync("MODE", new[] { channel.Channel }.Concat(parameters).ToArray(), cancellationToken: cancellationToken).ConfigureAwait(false);
-        return CommandDispatchResult.Success($"Mode requested for {channel.Channel}.", channel);
+        return CommandDispatchResult.Success($"Mode requested for {channel.Channel}.", channel, operation);
     }
 
     private async ValueTask<CommandDispatchResult> TopicAsync(NetworkWorkspace network, WorkspaceView activeView, string[] parts, CancellationToken cancellationToken)

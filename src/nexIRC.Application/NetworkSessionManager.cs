@@ -21,6 +21,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private readonly ConversationNavigationHistory _navigationHistory = new();
     private readonly bool _ownsNotifications;
     private readonly bool _ownsLogStore;
+    private readonly IrcOperationTimeoutPolicy _operationTimeouts;
     private long _operationSequence;
     private bool _disposed;
 
@@ -33,7 +34,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         HighlightActivityPolicy? highlightPolicy = null,
         ConfigurationService? configuration = null,
         IConversationLogStore? logStore = null,
-        ConversationLoggingService? logging = null)
+        ConversationLoggingService? logging = null,
+        IrcOperationTimeoutPolicy? operationTimeouts = null)
     {
         _transportFactory = transportFactory ?? throw new ArgumentNullException(nameof(transportFactory));
         _dispatcher = dispatcher ?? new ImmediateWorkspaceDispatcher();
@@ -46,6 +48,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             ? new ConversationLoggingService(logStore, () => configuration.Preferences)
             : null);
         _ownsLogStore = logStore is not null;
+        _operationTimeouts = operationTimeouts ?? new IrcOperationTimeoutPolicy();
         if (configuration is not null)
         {
             ApplyPreferences(configuration.Preferences);
@@ -67,6 +70,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     public IConversationLogStore? LogStore => _logStore;
 
     public ConversationLoggingService? Logging => _logging;
+
+    public OperationFeedbackViewModel OperationFeedback { get; } = new();
+
+    public IrcOperationTimeoutPolicy OperationTimeouts => _operationTimeouts;
 
     public bool IsIgnored(NetworkWorkspace workspace, IrcPrefix? prefix, string? account = null)
     {
@@ -245,12 +252,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 }
 
                 var outstandingUnlabeled = (state.UnlabeledWhois is null ? 0 : 1) + state.QueuedWhois.Count;
-                if (outstandingUnlabeled >= MaximumOutstandingOperations)
+                if (state.Count >= MaximumOutstandingOperations)
                 {
                     throw new InvalidOperationException("Too many WHOIS operations are already outstanding on this network.");
                 }
             }
-            else if (state.LabeledWhois.Count >= MaximumOutstandingOperations)
+            else if (state.Count >= MaximumOutstandingOperations)
             {
                 throw new InvalidOperationException("Too many WHOIS operations are already outstanding on this network.");
             }
@@ -288,6 +295,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             result = new IrcQueryRequestResult(view, operation.Operation, false);
         Completed:
             ;
+        }
+
+        if (!result.WasCoalesced)
+        {
+            PublishQueryPending(result.Operation);
         }
 
         if (operationToStart is not null)
@@ -352,6 +364,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             RetireOperation(previous);
         }
         ScheduleOperationExpiry(networkId, operation);
+        PublishQueryPending(operation.Operation);
         var commandParts = filters ?? Array.Empty<string>();
         try
         {
@@ -376,6 +389,166 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
         ActivateView(operation.View.Id);
         return new IrcQueryRequestResult(operation.View, operation.Operation, false);
+    }
+
+    public async ValueTask<IrcQueryRequestResult> RequestBanListAsync(
+        Guid networkId,
+        string channel,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(channel);
+        var workspace = GetWorkspace(networkId);
+        var mapping = workspace.Snapshot.Features.CaseMapping;
+        ActiveOperation? operation;
+        lock (_operationsGate)
+        {
+            var state = GetOperationStateUnsafe(networkId);
+            operation = state.BanLists.Values.FirstOrDefault(item =>
+                IrcIdentity.Equals(item.Operation.Target, channel, mapping));
+            if (operation is not null)
+            {
+                var coalesced = new IrcQueryRequestResult(
+                    operation.View,
+                    operation.Operation with { Correlation = IrcQueryCorrelationMode.CoalescedUnlabeled },
+                    true);
+                ActivateView(operation.View.Id);
+                return coalesced;
+            }
+
+            if (state.Count >= MaximumOutstandingOperations)
+            {
+                throw new InvalidOperationException("Too many IRC operations are already outstanding on this network.");
+            }
+
+            var supportsLabels = workspace.Snapshot.Capabilities.IsEnabled("labeled-response");
+            var label = supportsLabels
+                ? NextOperationLabelUnsafe(state.LabeledWhois.Keys
+                    .Concat(state.BanLists.Values.Select(item => item.Operation.RequestLabel ?? string.Empty))
+                    .Append(state.ActiveList?.Operation.RequestLabel ?? string.Empty))
+                : null;
+            var view = workspace.EnsureBanList(channel, beginRequest: true);
+            operation = new ActiveOperation
+            {
+                Operation = new IrcQueryOperation(
+                    Guid.NewGuid(),
+                    networkId,
+                    "BANLIST",
+                    channel,
+                    label,
+                    supportsLabels ? IrcQueryCorrelationMode.LabeledResponse : IrcQueryCorrelationMode.SerializedUnlabeled,
+                    DateTimeOffset.UtcNow),
+                View = view
+            };
+            state.BanLists.Add(operation.Operation.Id, operation);
+        }
+
+        ScheduleOperationExpiry(networkId, operation);
+        PublishQueryPending(operation.Operation);
+        try
+        {
+            var mode = workspace.Snapshot.Features.ChannelModes?.ListModes.FirstOrDefault() ?? 'b';
+            if (operation.Operation.RequestLabel is { } requestLabel)
+            {
+                await workspace.Session.SendTaggedCommandAsync(
+                    new Dictionary<string, string?> { ["label"] = requestLabel },
+                    "MODE",
+                    [channel, $"+{mode}"],
+                    cancellationToken: cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                await workspace.Session.SendCommandAsync("MODE", [channel, $"+{mode}"], cancellationToken: cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            CompleteBanListOperation(networkId, operation, IrcOperationState.Cancelled, "Ban-list request could not be sent.", null);
+            throw;
+        }
+
+        ActivateView(operation.View.Id);
+        return new IrcQueryRequestResult(operation.View, operation.Operation, false);
+    }
+
+    public IrcOperationResult StartOperation(
+        IrcOperationType type,
+        Guid networkId,
+        string targetConversation,
+        string? targetNickname = null,
+        string? requestedMode = null,
+        string? requestedMask = null,
+        string? command = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(targetConversation);
+        var workspace = GetWorkspace(networkId);
+        PendingActionOperation operation;
+        lock (_operationsGate)
+        {
+            var state = GetOperationStateUnsafe(networkId);
+            if (state.Count >= MaximumOutstandingOperations)
+            {
+                throw new InvalidOperationException("Too many IRC operations are already outstanding on this network.");
+            }
+
+            var result = new IrcOperationResult(
+                Guid.NewGuid(),
+                networkId,
+                workspace.Snapshot.ConnectionGeneration,
+                type,
+                targetConversation,
+                targetNickname,
+                requestedMode,
+                requestedMask,
+                DateTimeOffset.UtcNow,
+                IrcOperationState.Pending,
+                false,
+                null,
+                null,
+                null,
+                null);
+            operation = new PendingActionOperation
+            {
+                Result = result,
+                CurrentNickname = targetNickname,
+                Command = command ?? type.ToString().ToUpperInvariant()
+            };
+            state.Actions.Add(result.Id, operation);
+        }
+
+        OperationFeedback.AddOrUpdate(operation.Result);
+        _ = ExpireActionOperationAsync(networkId, operation);
+        return operation.Result;
+    }
+
+    public bool CancelOperation(Guid networkId, Guid operationId, IrcOperationState state = IrcOperationState.Cancelled, string? explanation = null)
+    {
+        if (state is IrcOperationState.Pending or IrcOperationState.Confirmed or IrcOperationState.Rejected)
+        {
+            throw new ArgumentOutOfRangeException(nameof(state));
+        }
+
+        PendingActionOperation? operation = null;
+        lock (_operationsGate)
+        {
+            if (_operations.TryGetValue(networkId, out var operations) && operations.Actions.Remove(operationId, out operation))
+            {
+                operation.Result = operation.Result with
+                {
+                    State = state,
+                    Explanation = explanation ?? (state == IrcOperationState.Disconnected ? "The network disconnected before confirmation." : "The operation was cancelled.")
+                };
+            }
+        }
+
+        if (operation is null)
+        {
+            return false;
+        }
+
+        RetireActionOperation(operation);
+        OperationFeedback.AddOrUpdate(operation.Result);
+        RemoveEmptyOperationState(networkId);
+        return true;
     }
 
     public void ActivateView(Guid viewId)
@@ -442,6 +615,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 .Concat(workspace.Queries)
                 .Concat(workspace.WhoisViews)
                 .Concat(workspace.ChannelListViews)
+                .Concat(workspace.BanListViews)
                 .FirstOrDefault(item => item.Id == viewId);
             if (view is null)
             {
@@ -481,6 +655,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         {
             workspace.ChannelListViews.Remove(list);
             workspace.Close(list);
+            ClearOperations(workspace.Id);
+        }
+        else if (view is BanListView banList)
+        {
+            workspace.BanListViews.Remove(banList);
+            workspace.Close(banList);
             ClearOperations(workspace.Id);
         }
 
@@ -833,6 +1013,331 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         NotifyNavigationChanged();
     }
 
+    private void PublishQueryPending(IrcQueryOperation operation)
+    {
+        var type = operation.Kind switch
+        {
+            "WHOIS" => IrcOperationType.Whois,
+            "BANLIST" => IrcOperationType.BanListQuery,
+            _ => IrcOperationType.ChannelModeQuery
+        };
+        var workspace = GetWorkspace(operation.NetworkId);
+        var result = new IrcOperationResult(
+            operation.Id,
+            operation.NetworkId,
+            workspace.Snapshot.ConnectionGeneration,
+            type,
+            operation.Target,
+            type == IrcOperationType.Whois ? operation.Target : null,
+            type == IrcOperationType.BanListQuery
+                ? $"+{workspace.Snapshot.Features.ChannelModes?.ListModes.FirstOrDefault() ?? 'b'}"
+                : null,
+            null,
+            operation.StartedAt,
+            IrcOperationState.Pending,
+            false,
+            null,
+            null,
+            null,
+            null);
+        if (TryFindActiveQuery(operation.NetworkId, operation.Id, out var active))
+        {
+            active.Feedback = result;
+        }
+
+        OperationFeedback.AddOrUpdate(result);
+    }
+
+    public bool TryGetOperation(Guid operationId, out IrcOperationResult? result) =>
+        (result = OperationFeedback.Snapshot.LastOrDefault(item => item.Id == operationId)) is not null;
+
+    private bool TryFindActiveQuery(Guid networkId, Guid operationId, out ActiveOperation operation)
+    {
+        lock (_operationsGate)
+        {
+            if (_operations.TryGetValue(networkId, out var state))
+            {
+                operation = state.LabeledWhois.Values
+                    .Concat(state.UnlabeledWhois is null ? Array.Empty<ActiveOperation>() : [state.UnlabeledWhois])
+                    .Concat(state.QueuedWhois)
+                    .Concat(state.BanLists.Values)
+                    .Concat(state.ActiveList is null ? Array.Empty<ActiveOperation>() : [state.ActiveList])
+                    .FirstOrDefault(item => item.Operation.Id == operationId)!;
+                return operation is not null;
+            }
+        }
+
+        operation = null!;
+        return false;
+    }
+
+    private void CompleteQueryFeedback(
+        ActiveOperation operation,
+        IrcOperationState state,
+        int? numeric = null,
+        string? explanation = null,
+        string? protocolDetail = null,
+        string? rawServerLine = null)
+    {
+        if (operation.Feedback is not { } feedback)
+        {
+            return;
+        }
+
+        operation.Feedback = feedback with
+        {
+            State = state,
+            ServerConfirmed = state == IrcOperationState.Confirmed,
+            Numeric = numeric,
+            Explanation = explanation,
+            ProtocolDetail = protocolDetail,
+            RawServerLine = rawServerLine
+        };
+        OperationFeedback.AddOrUpdate(operation.Feedback);
+    }
+
+    private void CompleteAction(
+        NetworkWorkspace workspace,
+        PendingActionOperation operation,
+        IrcOperationState state,
+        int? numeric = null,
+        string? explanation = null,
+        string? protocolDetail = null,
+        string? rawServerLine = null)
+    {
+        lock (_operationsGate)
+        {
+            if (!_operations.TryGetValue(workspace.Id, out var stateEntry)
+                || !stateEntry.Actions.Remove(operation.Result.Id, out _))
+            {
+                return;
+            }
+        }
+
+        operation.Result = operation.Result with
+        {
+            State = state,
+            ServerConfirmed = state == IrcOperationState.Confirmed,
+            Numeric = numeric,
+            Explanation = explanation,
+            ProtocolDetail = protocolDetail,
+            RawServerLine = rawServerLine
+        };
+        RetireActionOperation(operation);
+        OperationFeedback.AddOrUpdate(operation.Result);
+        RemoveEmptyOperationState(workspace.Id);
+    }
+
+    private void ReconcileModeEvent(NetworkWorkspace workspace, IrcModeEvent mode)
+    {
+        PendingActionOperation? match = null;
+        lock (_operationsGate)
+        {
+            if (_operations.TryGetValue(workspace.Id, out var state))
+            {
+                match = state.Actions.Values
+                    .Where(item => item.Result.ConnectionGeneration == workspace.Snapshot.ConnectionGeneration)
+                    .Where(item => IrcIdentity.Equals(item.Result.TargetConversation, mode.Channel, workspace.Snapshot.Features.CaseMapping))
+                    .Where(item => item.Result.Type is IrcOperationType.ChannelModeQuery or IrcOperationType.ModeChange or IrcOperationType.Ban or IrcOperationType.Unban)
+                    .FirstOrDefault(item => item.Result.Type == IrcOperationType.ChannelModeQuery || mode.Changes.Any(change =>
+                        (item.Result.RequestedMode is null || item.Result.RequestedMode.Contains(change.Mode, StringComparison.Ordinal))
+                        && (item.Result.TargetNickname is null
+                            || IrcIdentity.Equals(item.CurrentNickname ?? item.Result.TargetNickname, change.Parameter ?? string.Empty, workspace.Snapshot.Features.CaseMapping))
+                        && (item.Result.RequestedMask is null || string.Equals(item.Result.RequestedMask, change.Parameter, StringComparison.Ordinal))
+                        && (item.Result.RequestedMode is null || ((item.Result.RequestedMode.StartsWith('+')) == change.IsAdding))));
+            }
+        }
+
+        if (match is not null)
+        {
+            CompleteAction(workspace, match, IrcOperationState.Confirmed, explanation: $"Server confirmed {match.Result.RequestedMode ?? "MODE"} in {mode.Channel}.");
+        }
+    }
+
+    private void ReconcileKickEvent(NetworkWorkspace workspace, IrcKickEvent kick)
+    {
+        PendingActionOperation? match = null;
+        lock (_operationsGate)
+        {
+            if (_operations.TryGetValue(workspace.Id, out var state))
+            {
+                match = state.Actions.Values.FirstOrDefault(item =>
+                    item.Result.ConnectionGeneration == workspace.Snapshot.ConnectionGeneration
+                    && item.Result.Type == IrcOperationType.Kick
+                    && IrcIdentity.Equals(item.Result.TargetConversation, kick.Channel, workspace.Snapshot.Features.CaseMapping)
+                    && IrcIdentity.Equals(item.CurrentNickname ?? item.Result.TargetNickname ?? string.Empty, kick.Nickname, workspace.Snapshot.Features.CaseMapping));
+            }
+        }
+
+        if (match is not null)
+        {
+            CompleteAction(workspace, match, IrcOperationState.Confirmed, explanation: $"Server confirmed removing {kick.Nickname} from {kick.Channel}.");
+        }
+    }
+
+    private void ReconcileNumericOperation(NetworkWorkspace workspace, IrcServerNumericEvent numeric)
+    {
+        if (numeric.Numeric == 341)
+        {
+            PendingActionOperation? invite = null;
+            lock (_operationsGate)
+            {
+                if (_operations.TryGetValue(workspace.Id, out var state))
+                {
+                    invite = state.Actions.Values.FirstOrDefault(item =>
+                        item.Result.Type == IrcOperationType.Invite
+                        && item.Result.ConnectionGeneration == workspace.Snapshot.ConnectionGeneration
+                        && IrcIdentity.Equals(item.Result.TargetConversation, numeric.Interpretation.TargetChannel ?? string.Empty, workspace.Snapshot.Features.CaseMapping)
+                        && IrcIdentity.Equals(item.CurrentNickname ?? item.Result.TargetNickname ?? string.Empty, numeric.Interpretation.TargetNickname ?? string.Empty, workspace.Snapshot.Features.CaseMapping));
+                }
+            }
+
+            if (invite is not null)
+            {
+                CompleteAction(workspace, invite, IrcOperationState.Confirmed, 341, numeric.Interpretation.FriendlyExplanation, NumericProtocolDetail(numeric), numeric.Message.RawLine);
+            }
+
+            return;
+        }
+
+        PendingActionOperation? match = null;
+        lock (_operationsGate)
+        {
+            if (_operations.TryGetValue(workspace.Id, out var state))
+            {
+                var interpretation = numeric.Interpretation;
+                match = state.Actions.Values
+                    .Where(item => item.Result.ConnectionGeneration == workspace.Snapshot.ConnectionGeneration)
+                    .Where(item => NumericMayReject(item.Result.Type, numeric.Numeric))
+                    .Where(item => interpretation.TargetChannel is null
+                        || IrcIdentity.Equals(item.Result.TargetConversation, interpretation.TargetChannel, workspace.Snapshot.Features.CaseMapping))
+                    .Where(item => interpretation.TargetNickname is null
+                        || IrcIdentity.Equals(item.CurrentNickname ?? item.Result.TargetNickname ?? string.Empty, interpretation.TargetNickname, workspace.Snapshot.Features.CaseMapping))
+                    .OrderBy(item => item.Result.StartedAt)
+                    .FirstOrDefault(item => interpretation.Command is null
+                        || item.Command.Equals(interpretation.Command, StringComparison.OrdinalIgnoreCase)
+                        || item.Result.Type == IrcOperationType.Whois);
+            }
+        }
+
+        if (match is not null)
+        {
+            CompleteAction(workspace, match, IrcOperationState.Rejected, numeric.Numeric, numeric.Interpretation.FriendlyExplanation, NumericProtocolDetail(numeric), numeric.Message.RawLine);
+        }
+
+        if (numeric.Numeric == 401)
+        {
+            var target = numeric.Interpretation.TargetNickname;
+            var whois = workspace.WhoisViews.LastOrDefault(view => view.IsLoading
+                && IrcIdentity.Equals(view.RequestedNickname, target ?? string.Empty, workspace.Snapshot.Features.CaseMapping));
+            whois?.Fail(numeric.Interpretation.FriendlyExplanation + $" [{numeric.Name} {numeric.Numeric}: {numeric.Interpretation.ProtocolText}]");
+            foreach (var operation in FindWhoisOperations(workspace.Id, target, workspace.Snapshot.Features.CaseMapping))
+            {
+                RemoveWhoisOperation(workspace.Id, operation, IrcOperationState.Rejected, numeric.Numeric, numeric.Interpretation.FriendlyExplanation, NumericProtocolDetail(numeric), numeric.Message.RawLine);
+            }
+        }
+    }
+
+    private static bool NumericMayReject(IrcOperationType type, int numeric) => numeric switch
+    {
+        401 => type is IrcOperationType.Whois or IrcOperationType.Notice or IrcOperationType.Ctcp or IrcOperationType.Invite or IrcOperationType.Kick,
+        403 or 404 or 442 or 471 or 473 or 474 or 475 or 476 or 477 or 482 => type is not IrcOperationType.Whois,
+        443 => type == IrcOperationType.Invite,
+        421 or 461 => true,
+        472 => type is IrcOperationType.ModeChange or IrcOperationType.Ban or IrcOperationType.Unban,
+        481 or 485 => true,
+        _ => false
+    };
+
+    private static string NumericProtocolDetail(IrcServerNumericEvent numeric) =>
+        $"{numeric.Name} {numeric.Numeric}: {numeric.Interpretation.ProtocolText}";
+
+    private ActiveOperation[] FindWhoisOperations(Guid networkId, string? nickname, IrcCaseMapping mapping)
+    {
+        lock (_operationsGate)
+        {
+            if (!_operations.TryGetValue(networkId, out var state))
+            {
+                return Array.Empty<ActiveOperation>();
+            }
+
+            return state.LabeledWhois.Values
+                .Concat(state.UnlabeledWhois is null ? Array.Empty<ActiveOperation>() : [state.UnlabeledWhois])
+                .Where(item => nickname is null || IrcIdentity.Equals(item.Operation.Target, nickname, mapping))
+                .ToArray();
+        }
+    }
+
+    private void ReconcileNicknameChange(NetworkWorkspace workspace, IrcNicknameChangedEvent nick)
+    {
+        if (nick.PreviousNickname is null)
+        {
+            return;
+        }
+
+        PendingActionOperation[] matches;
+        lock (_operationsGate)
+        {
+            matches = _operations.TryGetValue(workspace.Id, out var state)
+                ? state.Actions.Values
+                    .Where(item => item.Result.ConnectionGeneration == workspace.Snapshot.ConnectionGeneration)
+                    .Where(item => item.CurrentNickname is not null
+                        && IrcIdentity.Equals(item.CurrentNickname, nick.PreviousNickname, workspace.Snapshot.Features.CaseMapping))
+                    .ToArray()
+                : Array.Empty<PendingActionOperation>();
+        }
+
+        foreach (var match in matches)
+        {
+            match.CurrentNickname = nick.NewNickname;
+        }
+    }
+
+    private BanListView? RouteBanListItemEvent(NetworkWorkspace workspace, IrcBanListItemEvent item)
+    {
+        ActiveOperation? operation = null;
+        lock (_operationsGate)
+        {
+            if (_operations.TryGetValue(workspace.Id, out var state))
+            {
+                operation = item.RequestLabel is { } label
+                    ? state.BanLists.Values.FirstOrDefault(candidate => candidate.Operation.RequestLabel == label)
+                    : state.BanLists.Values.FirstOrDefault(candidate => IrcIdentity.Equals(candidate.Operation.Target, item.Entry.Channel, workspace.Snapshot.Features.CaseMapping));
+            }
+        }
+
+        if (operation?.View is not BanListView view)
+        {
+            return null;
+        }
+
+        view.Apply(item);
+        return view;
+    }
+
+    private BanListView? RouteBanListEndEvent(NetworkWorkspace workspace, IrcBanListEndEvent item)
+    {
+        ActiveOperation? operation = null;
+        lock (_operationsGate)
+        {
+            if (_operations.TryGetValue(workspace.Id, out var state))
+            {
+                operation = item.RequestLabel is { } label
+                    ? state.BanLists.Values.FirstOrDefault(candidate => candidate.Operation.RequestLabel == label)
+                    : state.BanLists.Values.FirstOrDefault(candidate => IrcIdentity.Equals(candidate.Operation.Target, item.Channel, workspace.Snapshot.Features.CaseMapping));
+            }
+        }
+
+        if (operation?.View is not BanListView view)
+        {
+            return null;
+        }
+
+        view.CompleteRequest();
+        CompleteBanListOperation(workspace.Id, operation, IrcOperationState.Confirmed, "Server completed the ban-list response.", null, item.Message.RawLine);
+        return view;
+    }
+
     internal WhoisView? RouteWhoisEvent(NetworkWorkspace workspace, IrcWhoisEvent item)
     {
         ActiveOperation? operation = null;
@@ -870,7 +1375,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         view.Apply(item);
         if (item.Numeric == 318)
         {
-            _ = CompleteWhoisOperationAsync(workspace, operation);
+            _ = CompleteWhoisOperationAsync(workspace, operation, item.Message.RawLine);
         }
 
         return view;
@@ -998,27 +1503,44 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     {
         try
         {
-            await Task.Delay(TimeSpan.FromSeconds(30), operation.Lifetime.Token).ConfigureAwait(false);
-            if (operation.Operation.Kind == "WHOIS")
+            var timeout = operation.Operation.Kind == "WHOIS"
+                ? _operationTimeouts.EffectiveWhois
+                : operation.Operation.Kind == "BANLIST"
+                    ? _operationTimeouts.EffectiveBanList
+                    : _operationTimeouts.EffectiveModeration;
+            await Task.Delay(timeout, operation.Lifetime.Token).ConfigureAwait(false);
+            Dispatch(() =>
             {
-                if (operation.View is WhoisView whois)
+                if (operation.Operation.Kind == "WHOIS")
                 {
-                    whois.Fail("Timed out waiting for numeric 318.");
-                }
+                    if (operation.View is WhoisView whois)
+                    {
+                        whois.Fail("Confirmation was not observed before the WHOIS timeout.");
+                    }
 
-                RemoveWhoisOperation(networkId, operation);
-            }
-            else
-            {
-                CompleteListOperation(networkId, operation);
-            }
+                    RemoveWhoisOperation(networkId, operation, IrcOperationState.TimedOut, null, "Confirmation was not observed before the WHOIS timeout.", null);
+                }
+                else if (operation.Operation.Kind == "BANLIST")
+                {
+                    if (operation.View is BanListView banList)
+                    {
+                        banList.Fail("Confirmation was not observed before the ban-list timeout.");
+                    }
+
+                    CompleteBanListOperation(networkId, operation, IrcOperationState.TimedOut, "Confirmation was not observed before the ban-list timeout.", null);
+                }
+                else
+                {
+                    CompleteListOperation(networkId, operation);
+                }
+            });
         }
         catch (OperationCanceledException) when (operation.Lifetime.IsCancellationRequested)
         {
         }
     }
 
-    private async Task CompleteWhoisOperationAsync(NetworkWorkspace workspace, ActiveOperation completed)
+    private async Task CompleteWhoisOperationAsync(NetworkWorkspace workspace, ActiveOperation completed, string? rawServerLine)
     {
         ActiveOperation? next = null;
         var wasLabeled = completed.Operation.RequestLabel is not null;
@@ -1055,6 +1577,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             }
         }
 
+        CompleteQueryFeedback(completed, IrcOperationState.Confirmed, 318, "Server completed the WHOIS response.", "End of WHOIS list", rawServerLine);
         RetireOperation(completed);
         if (next is not null)
         {
@@ -1064,7 +1587,14 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         RemoveEmptyOperationState(workspace.Id);
     }
 
-    private void RemoveWhoisOperation(Guid networkId, ActiveOperation operation)
+    private void RemoveWhoisOperation(
+        Guid networkId,
+        ActiveOperation operation,
+        IrcOperationState completionState = IrcOperationState.Cancelled,
+        int? numeric = null,
+        string? explanation = null,
+        string? protocolDetail = null,
+        string? rawServerLine = null)
     {
         ActiveOperation? next = null;
         lock (_operationsGate)
@@ -1089,6 +1619,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             }
         }
 
+        CompleteQueryFeedback(operation, completionState, numeric, explanation, protocolDetail, rawServerLine);
         RetireOperation(operation);
         if (next is not null && TryGet(networkId, out var workspace) && workspace is not null)
         {
@@ -1114,6 +1645,30 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             }
         }
 
+        CompleteQueryFeedback(operation, IrcOperationState.Confirmed, explanation: "Server completed the channel-list response.");
+        RetireOperation(operation);
+        RemoveEmptyOperationState(networkId);
+    }
+
+    private void CompleteBanListOperation(
+        Guid networkId,
+        ActiveOperation operation,
+        IrcOperationState completionState,
+        string? explanation,
+        string? protocolDetail,
+        string? rawServerLine = null)
+    {
+        lock (_operationsGate)
+        {
+            if (!_operations.TryGetValue(networkId, out var state)
+                || !state.BanLists.Remove(operation.Operation.Id, out var current)
+                || !ReferenceEquals(current, operation))
+            {
+                return;
+            }
+        }
+
+        CompleteQueryFeedback(operation, completionState, completionState == IrcOperationState.Confirmed ? 368 : null, explanation, protocolDetail, rawServerLine);
         RetireOperation(operation);
         RemoveEmptyOperationState(networkId);
     }
@@ -1121,6 +1676,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private void ClearOperations(Guid networkId)
     {
         ActiveOperation[] operations;
+        PendingActionOperation[] actions;
         lock (_operationsGate)
         {
             if (!_operations.Remove(networkId, out var state))
@@ -1132,7 +1688,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 .Concat(state.UnlabeledWhois is null ? Array.Empty<ActiveOperation>() : [state.UnlabeledWhois])
                 .Concat(state.QueuedWhois)
                 .Concat(state.ActiveList is null ? Array.Empty<ActiveOperation>() : [state.ActiveList])
+                .Concat(state.BanLists.Values)
                 .ToArray();
+            actions = state.Actions.Values.ToArray();
         }
 
         foreach (var operation in operations)
@@ -1141,8 +1699,24 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             {
                 whois.Fail("The network disconnected before numeric 318.");
             }
+            else if (operation.View is BanListView banList && banList.IsLoading)
+            {
+                banList.Fail("The network disconnected before the ban-list response completed.");
+            }
 
+            CompleteQueryFeedback(operation, IrcOperationState.Disconnected, explanation: "The network disconnected before confirmation.");
             RetireOperation(operation);
+        }
+
+        foreach (var action in actions)
+        {
+            action.Result = action.Result with
+            {
+                State = IrcOperationState.Disconnected,
+                Explanation = "The network disconnected before confirmation."
+            };
+            RetireActionOperation(action);
+            OperationFeedback.AddOrUpdate(action.Result);
         }
     }
 
@@ -1163,6 +1737,36 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
     }
 
+    private static void RetireActionOperation(PendingActionOperation operation)
+    {
+        if (Interlocked.Exchange(ref operation.Retired, 1) == 0)
+        {
+            operation.Lifetime.Cancel();
+            operation.Lifetime.Dispose();
+        }
+    }
+
+    private async Task ExpireActionOperationAsync(Guid networkId, PendingActionOperation operation)
+    {
+        try
+        {
+            var timeout = operation.Result.Type == IrcOperationType.Invite
+                ? _operationTimeouts.EffectiveInvite
+                : _operationTimeouts.EffectiveModeration;
+            await Task.Delay(timeout, operation.Lifetime.Token).ConfigureAwait(false);
+            Dispatch(() =>
+            {
+                if (TryGet(networkId, out var workspace) && workspace is not null)
+                {
+                    CompleteAction(workspace, operation, IrcOperationState.TimedOut, explanation: "Server confirmation was not observed before the operation timeout.");
+                }
+            });
+        }
+        catch (OperationCanceledException) when (operation.Lifetime.IsCancellationRequested)
+        {
+        }
+    }
+
     private NetworkOperationState GetOperationStateUnsafe(Guid networkId)
     {
         if (!_operations.TryGetValue(networkId, out var state))
@@ -1178,7 +1782,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     {
         lock (_operationsGate)
         {
-            if (_operations.TryGetValue(networkId, out var state) && !state.HasAnyWhois && state.ActiveList is null)
+            if (_operations.TryGetValue(networkId, out var state) && !state.HasAnyWhois && state.ActiveList is null && state.BanLists.Count == 0 && state.Actions.Count == 0)
             {
                 _operations.Remove(networkId);
             }
@@ -1395,6 +1999,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 AppendRendered(workspace.EnsureChannel(part.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcKickEvent kick:
+                ReconcileKickEvent(workspace, kick);
                 AppendRendered(workspace.EnsureChannel(kick.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcTopicEvent topic:
@@ -1413,7 +2018,23 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 AppendRendered(workspace.EnsureChannel(who.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcModeEvent mode:
+                ReconcileModeEvent(workspace, mode);
                 AppendRendered(workspace.EnsureChannel(mode.Channel, reopen: false), semanticEvent, snapshot);
+                break;
+            case IrcBanListItemEvent banListItem:
+                if (RouteBanListItemEvent(workspace, banListItem) is not null)
+                {
+                    break;
+                }
+
+                AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                break;
+            case IrcBanListEndEvent banListEnd:
+                if (RouteBanListEndEvent(workspace, banListEnd) is not null)
+                {
+                    AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                }
+
                 break;
             case IrcChannelSynchronizationEvent synchronization:
                 AppendRendered(workspace.EnsureChannel(synchronization.Channel, reopen: false), semanticEvent, snapshot);
@@ -1457,6 +2078,18 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 }
 
                 break;
+            case IrcServerNumericEvent serverNumeric:
+                ReconcileNumericOperation(workspace, serverNumeric);
+                WorkspaceView targetView = serverNumeric.Interpretation.TargetChannel is { } targetChannel
+                    ? workspace.EnsureChannel(targetChannel, reopen: false)
+                    : workspace.StatusView;
+                AppendRendered(targetView, serverNumeric, snapshot);
+                if (!ReferenceEquals(targetView, workspace.StatusView))
+                {
+                    AppendRendered(workspace.StatusView, serverNumeric, snapshot);
+                }
+
+                break;
             case IrcUnknownNumericEvent unknownWhois when WhoisResult.IsPotentialAdditionalNumeric(unknownWhois.Numeric):
                 var pendingWhois = RouteWhoisAdditionalEvent(workspace, unknownWhois);
                 if (pendingWhois is null && !unknownWhois.Message.TagValues.ContainsKey("label"))
@@ -1477,7 +2110,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 }
 
                 break;
-            case IrcNicknameChangedEvent:
+            case IrcNicknameChangedEvent nickname:
+                ReconcileNicknameChange(workspace, nickname);
                 foreach (var channel in workspace.Channels)
                 {
                     AppendRendered(channel, semanticEvent, snapshot);
@@ -1485,7 +2119,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
                 AppendRendered(workspace.StatusView, semanticEvent, snapshot);
                 break;
-            case IrcNumericEvent numeric when numeric.Numeric is 332 or 331 or 324 or 353 or 366 or 375 or 372 or 376 or 422
+            case IrcNumericEvent numeric when numeric.Numeric is 332 or 331 or 324 or 353 or 366 or 367 or 368 or 375 or 372 or 376 or 422
                 || WhoisResult.IsKnownWhoisNumeric(numeric.Numeric):
                 break;
             default:
@@ -1612,7 +2246,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         IrcPrivmsgEvent { IsNotice: true } => IrcNotificationType.Notice,
         IrcPrivmsgEvent when activity == WorkspaceActivity.Important => IrcNotificationType.Highlight,
         IrcPrivmsgEvent => IrcNotificationType.Message,
-        IrcServerErrorEvent or IrcUnknownCommandEvent or IrcUnknownNumericEvent => IrcNotificationType.Error,
+        IrcServerErrorEvent or IrcServerNumericEvent { IsError: true } or IrcUnknownCommandEvent or IrcUnknownNumericEvent => IrcNotificationType.Error,
         _ => IrcNotificationType.Status
     };
 

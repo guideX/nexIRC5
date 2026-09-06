@@ -251,6 +251,35 @@ public sealed record IrcWhoisEvent(
     string? Text,
     string? RequestLabel = null) : IrcSemanticEvent(Message);
 
+public sealed record IrcServerNumericEvent(
+    IrcMessage Message,
+    IrcNumericInterpretation Interpretation) : IrcSemanticEvent(Message)
+{
+    public int Numeric => Interpretation.Numeric;
+
+    public string Name => Interpretation.Name;
+
+    public bool IsError => Interpretation.IsError;
+
+    public bool IsSuccess => Interpretation.IsSuccess;
+}
+
+public sealed record IrcBanListEntry(
+    string Channel,
+    string Mask,
+    string? Setter,
+    DateTimeOffset? SetAt);
+
+public sealed record IrcBanListItemEvent(
+    IrcMessage Message,
+    IrcBanListEntry Entry,
+    string? RequestLabel = null) : IrcSemanticEvent(Message);
+
+public sealed record IrcBanListEndEvent(
+    IrcMessage Message,
+    string Channel,
+    string? RequestLabel = null) : IrcSemanticEvent(Message);
+
 public sealed record IrcNumericEvent(IrcMessage Message, int Numeric) : IrcSemanticEvent(Message);
 
 public sealed record IrcUnknownCommandEvent(IrcMessage Message) : IrcSemanticEvent(Message);

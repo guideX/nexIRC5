@@ -229,11 +229,23 @@ internal sealed class SessionStateStore
             case "378":
             case "379":
             case "671":
+            case "401":
                 ApplyWhois(message, events);
+                break;
+            case "367":
+                ApplyBanListItem(message, events);
+                break;
+            case "368":
+                ApplyBanListEnd(message, events);
                 break;
             case "001":
                 events.Add(new IrcWelcomeEvent(message, features.NetworkName));
                 break;
+        }
+
+        if (IrcNumericCatalog.TryInterpret(message, out var interpretation))
+        {
+            events.Add(new IrcServerNumericEvent(message, interpretation));
         }
 
         return events;
@@ -691,6 +703,42 @@ internal sealed class SessionStateStore
     {
         var nickname = Parameter(message, 1) ?? Parameter(message, 0) ?? string.Empty;
         events.Add(new IrcWhoisEvent(message, message.NumericCommand ?? 0, nickname, message.Parameters, message.HasTrailingParameter ? message.TrailingParameter : null, RequestLabel(message)));
+    }
+
+    private static void ApplyBanListItem(IrcMessage message, List<IrcSemanticEvent> events)
+    {
+        var channel = Parameter(message, 1);
+        var mask = Parameter(message, 2);
+        if (string.IsNullOrWhiteSpace(channel) || string.IsNullOrWhiteSpace(mask))
+        {
+            return;
+        }
+
+        var setter = Parameter(message, 3);
+        var timestamp = Parameter(message, 4);
+        DateTimeOffset? setAt = null;
+        if (long.TryParse(timestamp, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var unixSeconds))
+        {
+            try
+            {
+                setAt = DateTimeOffset.FromUnixTimeSeconds(unixSeconds);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                setAt = null;
+            }
+        }
+
+        events.Add(new IrcBanListItemEvent(message, new IrcBanListEntry(channel, mask, setter, setAt), RequestLabel(message)));
+    }
+
+    private static void ApplyBanListEnd(IrcMessage message, List<IrcSemanticEvent> events)
+    {
+        var channel = Parameter(message, 1);
+        if (!string.IsNullOrWhiteSpace(channel))
+        {
+            events.Add(new IrcBanListEndEvent(message, channel, RequestLabel(message)));
+        }
     }
 
     private static string? RequestLabel(IrcMessage message) => message.TagValues.TryGetValue("label", out var label)

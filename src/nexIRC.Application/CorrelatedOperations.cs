@@ -33,7 +33,14 @@ internal sealed class NetworkOperationState
 
     public ActiveOperation? ActiveList { get; set; }
 
+    public Dictionary<Guid, ActiveOperation> BanLists { get; } = [];
+
+    public Dictionary<Guid, PendingActionOperation> Actions { get; } = [];
+
     public bool HasAnyWhois => UnlabeledWhois is not null || QueuedWhois.Count > 0 || LabeledWhois.Count > 0;
+
+    public int Count => (UnlabeledWhois is null ? 0 : 1) + QueuedWhois.Count + LabeledWhois.Count
+        + (ActiveList is null ? 0 : 1) + BanLists.Count + Actions.Count;
 }
 
 internal sealed class ActiveOperation
@@ -41,6 +48,8 @@ internal sealed class ActiveOperation
     public required IrcQueryOperation Operation { get; init; }
 
     public required WorkspaceView View { get; init; }
+
+    public IrcOperationResult? Feedback { get; set; }
 
     public CancellationTokenSource Lifetime { get; } = new();
 

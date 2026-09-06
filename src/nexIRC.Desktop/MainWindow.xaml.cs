@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -184,6 +185,65 @@ public partial class MainWindow : Window
         InputBox.Focus();
     }
 
+    private async void OnBanListRefreshClick(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.ActiveView is BanListView view)
+        {
+            var result = await ViewModel.ParticipantActions.RefreshBanListAsync(view).ConfigureAwait(true);
+            ViewModel.StatusText = result.Message;
+            if (result.View is not null)
+            {
+                ViewModel.SelectView(result.View);
+            }
+        }
+    }
+
+    private async void OnBanListAddClick(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.ActiveView is not BanListView view)
+        {
+            return;
+        }
+
+        var mask = view.Result.NewMask;
+        var result = await ViewModel.ParticipantActions.AddBanAsync(view, mask).ConfigureAwait(true);
+        ViewModel.StatusText = result.Message;
+        if (result.Succeeded)
+        {
+            view.Result.NewMask = string.Empty;
+        }
+    }
+
+    private async void OnBanListRemoveClick(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.ActiveView is not BanListView view || view.Result.SelectedEntry is not { } selected)
+        {
+            ViewModel.StatusText = "Select an exact ban mask to remove.";
+            return;
+        }
+
+        if (MessageBox.Show(this, $"Remove ban mask {selected.Mask}?", "Remove ban", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        var result = await ViewModel.ParticipantActions.RemoveBanAsync(view, selected.Mask).ConfigureAwait(true);
+        ViewModel.StatusText = result.Message;
+    }
+
+    private void OnBanListCopyClick(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.ActiveView is BanListView view && view.Result.SelectedEntry is { } selected)
+        {
+            CopyText(selected.Mask);
+            ViewModel.StatusText = "Copied the selected ban mask to the clipboard.";
+        }
+        else
+        {
+            ViewModel.StatusText = "Select a ban mask to copy.";
+        }
+    }
+
     private async void OnRejoinClick(object sender, RoutedEventArgs e)
     {
         if (ViewModel.Sessions.ActiveNetwork is { } network && ViewModel.ActiveView is ChannelView channel)
@@ -287,6 +347,10 @@ public partial class MainWindow : Window
                 actions.Add(("Copy channel name", () => CopyText(channel.Channel)));
                 actions.Add(("Request channel modes", () => ViewModel.ExecuteInputAsync($"/mode {channel.Channel}")));
                 actions.Add(("Request topic", () => ViewModel.ExecuteInputAsync($"/topic {channel.Channel}")));
+                if (channel.IsJoined)
+                {
+                    actions.Add(("Open Ban List", () => ViewModel.ExecuteInputAsync($"/banlist {channel.Channel}")));
+                }
                 actions.Add(("Open LIST", () => ViewModel.ExecuteInputAsync("/list")));
                 actions.Add(("History / search", () => OpenHistory(channel)));
                 actions.Add(("Export history", () => OpenHistory(channel)));
@@ -344,6 +408,8 @@ public partial class MainWindow : Window
     private void OpenParticipantContextMenu(FrameworkElement target, ParticipantActionContext context)
     {
         var menu = new ContextMenu { PlacementTarget = target };
+        AutomationProperties.SetAutomationId(menu, "ParticipantContextMenu");
+        AutomationProperties.SetName(menu, $"Actions for {context.TargetNickname}");
         var groups = ParticipantActionCatalog.Build(context, ViewModel.ParticipantActions.IsIgnored(context));
         var firstGroup = true;
         foreach (var group in groups)
@@ -375,6 +441,8 @@ public partial class MainWindow : Window
             ToolTip = action.DisabledReason,
             Tag = new ParticipantMenuInvocation(context, action)
         };
+        AutomationProperties.SetAutomationId(item, $"MemberAction.{action.Action}.{action.ModeLetter?.ToString() ?? "default"}");
+        AutomationProperties.SetName(item, action.AccessibleText);
         if (action.Children is { Count: > 0 })
         {
             foreach (var child in action.Children)

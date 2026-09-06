@@ -20,6 +20,7 @@ public sealed class WorkspaceContentTemplateSelector : DataTemplateSelector
             QueryView => "QueryContentTemplate",
             WhoisView => "WhoisContentTemplate",
             ChannelListView => "ChannelListContentTemplate",
+            BanListView => "BanListContentTemplate",
             _ => null
         };
         return key is null ? base.SelectTemplate(item, container) : element.FindResource(key) as DataTemplate;

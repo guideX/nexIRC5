@@ -148,6 +148,74 @@ public sealed class DemoScenario
         _alpha.EnqueueInboundLine(":alpha.server 671 nexAlpha Alex :is using a secure connection");
         _alpha.EnqueueInboundLine(":alpha.server 318 nexAlpha Alex :End of WHOIS list");
         await WaitForAsync(() => syntheticWhois.View is WhoisView whois && whois.IsCompleted).ConfigureAwait(true);
+
+        var actionService = viewModel.ParticipantActions;
+        var alexContext = viewModel.CreateParticipantContext(alpha, participantChannel, participant);
+        var removeVoice = await actionService.SetPrivilegeAsync(alexContext, 'v', adding: false).ConfigureAwait(true);
+        _alpha.EnqueueInboundLine(":alpha.server MODE #general -v Alex");
+        await WaitForAsync(() => removeVoice.Operation is not null
+            && sessions.TryGetOperation(removeVoice.Operation.Id, out var removedVoice)
+            && removedVoice!.State == IrcOperationState.Confirmed).ConfigureAwait(true);
+        var giveVoice = await actionService.SetPrivilegeAsync(alexContext, 'v', adding: true).ConfigureAwait(true);
+        _alpha.EnqueueInboundLine(":alpha.server MODE #general +v Alex");
+        await WaitForAsync(() => giveVoice.Operation is not null
+            && sessions.TryGetOperation(giveVoice.Operation.Id, out var givenVoice)
+            && givenVoice!.State == IrcOperationState.Confirmed).ConfigureAwait(true);
+
+        var failedBan = await actionService.BanAsync(alexContext, "*!*@demo.invalid").ConfigureAwait(true);
+        _alpha.EnqueueInboundLine(":alpha.server 482 nexAlpha #general :You need channel operator privileges");
+        await WaitForAsync(() => failedBan.Operation is not null
+            && sessions.TryGetOperation(failedBan.Operation.Id, out var rejectedBan)
+            && rejectedBan!.State == IrcOperationState.Rejected).ConfigureAwait(true);
+
+        var invite = await actionService.InviteAsync(alexContext, "#alpha").ConfigureAwait(true);
+        _alpha.EnqueueInboundLine(":alpha.server 341 nexAlpha Alex #alpha :Inviting");
+        await WaitForAsync(() => invite.Operation is not null
+            && sessions.TryGetOperation(invite.Operation.Id, out var inviting)
+            && inviting!.State == IrcOperationState.Confirmed).ConfigureAwait(true);
+        var alreadyInvited = await actionService.InviteAsync(alexContext, "#alpha").ConfigureAwait(true);
+        _alpha.EnqueueInboundLine(":alpha.server 443 nexAlpha Alex #alpha :is already on channel");
+        await WaitForAsync(() => alreadyInvited.Operation is not null
+            && sessions.TryGetOperation(alreadyInvited.Operation.Id, out var alreadyThere)
+            && alreadyThere!.State == IrcOperationState.Rejected).ConfigureAwait(true);
+
+        var banListResult = await actionService.OpenBanListAsync(alexContext).ConfigureAwait(true);
+        if (banListResult.View is not BanListView banList)
+        {
+            throw new InvalidOperationException("The deterministic demo could not open its ban-list view.");
+        }
+
+        _alpha.EnqueueInboundLine(":alpha.server 367 nexAlpha #general *!*@old.demo setter 1700000000");
+        _alpha.EnqueueInboundLine(":alpha.server 367 nexAlpha #general *!*@quiet.demo");
+        _alpha.EnqueueInboundLine(":alpha.server 367 nexAlpha #general *!*@temp.demo");
+        _alpha.EnqueueInboundLine(":alpha.server 368 nexAlpha #general :End of channel ban list");
+        await WaitForAsync(() => banList.IsCompleted && banList.Result.Entries.Count == 3).ConfigureAwait(true);
+        banList.Result.SelectedEntry = banList.Result.EntriesSnapshot[0];
+        var unban = await actionService.RemoveBanAsync(banList, "*!*@old.demo").ConfigureAwait(true);
+        _alpha.EnqueueInboundLine(":alpha.server MODE #general -b *!*@old.demo");
+        await WaitForAsync(() => unban.Operation is not null
+            && sessions.TryGetOperation(unban.Operation.Id, out var confirmedUnban)
+            && confirmedUnban!.State == IrcOperationState.Confirmed).ConfigureAwait(true);
+        await actionService.RefreshBanListAsync(banList).ConfigureAwait(true);
+        _alpha.EnqueueInboundLine(":alpha.server 367 nexAlpha #general *!*@quiet.demo");
+        _alpha.EnqueueInboundLine(":alpha.server 367 nexAlpha #general *!*@temp.demo");
+        _alpha.EnqueueInboundLine(":alpha.server 368 nexAlpha #general :End of channel ban list");
+        await WaitForAsync(() => banList.IsCompleted && banList.Result.Entries.Count == 2).ConfigureAwait(true);
+
+        var missingWhois = await sessions.RequestWhoisAsync(alpha.Id, "MissingDemo").ConfigureAwait(true);
+        _alpha.EnqueueInboundLine(":alpha.server 401 nexAlpha MissingDemo :No such nickname");
+        await WaitForAsync(() => missingWhois.View is WhoisView missing && !missing.IsLoading).ConfigureAwait(true);
+
+        var kickedMember = participantChannel.Members.FirstOrDefault(member => member.Nickname == "RookAway");
+        if (kickedMember is not null)
+        {
+            var kick = await actionService.KickAsync(viewModel.CreateParticipantContext(alpha, participantChannel, kickedMember), "demo cleanup").ConfigureAwait(true);
+            _alpha.EnqueueInboundLine(":alpha.server KICK #general RookAway :demo cleanup");
+            await WaitForAsync(() => kick.Operation is not null
+                && sessions.TryGetOperation(kick.Operation.Id, out var confirmedKick)
+                && confirmedKick!.State == IrcOperationState.Confirmed).ConfigureAwait(true);
+        }
+
         await dispatcher.DispatchAsync(alpha, alphaChannel, "/j #lounge").ConfigureAwait(true);
         await dispatcher.DispatchAsync(alpha, alphaChannel, "Local AlphaNet message").ConfigureAwait(true);
         await dispatcher.DispatchAsync(alpha, alphaChannel, "/me demonstrates a local action").ConfigureAwait(true);
@@ -291,7 +359,14 @@ public sealed class DemoScenario
         viewModel.SelectView(betaQueryForDraft);
         viewModel.PrepareInput("BetaNet/Mira has an independent draft.");
 
+        var pendingDisconnect = await sessions.RequestWhoisAsync(beta.Id, "PendingDisconnectDemo").ConfigureAwait(true);
+
         await sessions.DisconnectAsync(beta.Id).ConfigureAwait(true);
+        await WaitForAsync(() => sessions.TryGetOperation(pendingDisconnect.Operation.Id, out var disconnected)
+            && disconnected!.State == IrcOperationState.Disconnected).ConfigureAwait(true);
+
+        _alpha.EnqueueInboundLine(":alpha.server KICK #alpha nexAlpha :deterministic self-kick");
+        await WaitForAsync(() => !alpha.Channels.First(channel => channel.Channel == "#alpha").IsJoined).ConfigureAwait(true);
 
         sessions.ActivateView(alpha.StatusView.Id);
     }
@@ -350,4 +425,5 @@ public sealed class DemoScenario
             await Task.Delay(10).ConfigureAwait(true);
         }
     }
+
 }

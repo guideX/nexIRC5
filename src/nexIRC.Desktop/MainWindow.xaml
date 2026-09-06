@@ -4,6 +4,7 @@
         xmlns:app="clr-namespace:nexIRC.Application;assembly=nexIRC.Application"
         xmlns:local="clr-namespace:nexIRC.Desktop"
         Title="nexIRC 5"
+        AutomationProperties.AutomationId="MainWindow"
         Width="1280"
         Height="780"
         MinWidth="900"
@@ -158,7 +159,7 @@
                     <Border Grid.Column="1" Width="205" Margin="10,0,0,0" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="1" Visibility="{Binding DataContext.IsMemberListVisible, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource BooleanToVisibility}}">
                         <DockPanel>
                             <TextBlock DockPanel.Dock="Top" Text="Members" Style="{StaticResource PaneHeader}" />
-                            <ListBox ItemsSource="{Binding Members}" DisplayMemberPath="DisplayText" BorderThickness="0" Padding="8,0" MouseDoubleClick="OnMemberListDoubleClick" ToolTip="Double-click to open a private conversation. Right-click for participant actions." />
+                    <ListBox AutomationProperties.AutomationId="MemberList" AutomationProperties.Name="Channel members" ItemsSource="{Binding Members}" DisplayMemberPath="DisplayText" BorderThickness="0" Padding="8,0" MouseDoubleClick="OnMemberListDoubleClick" ToolTip="Double-click to open a private conversation. Right-click for participant actions." />
                         </DockPanel>
                     </Border>
                 </Grid>
@@ -199,11 +200,11 @@
                     <TextBlock Text="{Binding Result.Nickname}" FontSize="20" FontWeight="SemiBold" Foreground="#172033" />
                     <TextBlock Text="{Binding StateText}" Foreground="#2563EB" Margin="0,3,0,12" />
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
-                        <Button Content="Open Query" Click="OnWhoisOpenQueryClick" Padding="12,4" Margin="0,0,6,0" />
-                        <Button Content="Copy Nickname" Click="OnWhoisCopyNicknameClick" Padding="12,4" Margin="0,0,6,0" />
-                        <Button Content="Copy Hostmask" Click="OnWhoisCopyHostmaskClick" Padding="12,4" Margin="0,0,6,0" />
-                        <Button Content="Copy Account" Click="OnWhoisCopyAccountClick" Padding="12,4" Margin="0,0,6,0" />
-                        <Button Content="Copy Formatted" Click="OnWhoisCopyFormattedClick" Padding="12,4" />
+                        <Button Content="Open Query" Click="OnWhoisOpenQueryClick" Padding="12,4" Margin="0,0,6,0" AutomationProperties.AutomationId="Whois.OpenQuery" />
+                        <Button Content="Copy Nickname" Click="OnWhoisCopyNicknameClick" Padding="12,4" Margin="0,0,6,0" AutomationProperties.AutomationId="Whois.CopyNickname" />
+                        <Button Content="Copy Hostmask" Click="OnWhoisCopyHostmaskClick" Padding="12,4" Margin="0,0,6,0" AutomationProperties.AutomationId="Whois.CopyHostmask" />
+                        <Button Content="Copy Account" Click="OnWhoisCopyAccountClick" Padding="12,4" Margin="0,0,6,0" AutomationProperties.AutomationId="Whois.CopyAccount" />
+                        <Button Content="Copy Formatted" Click="OnWhoisCopyFormattedClick" Padding="12,4" AutomationProperties.AutomationId="Whois.CopyFormatted" />
                     </StackPanel>
                     <Grid>
                         <Grid.ColumnDefinitions>
@@ -272,6 +273,35 @@
                             <GridViewColumn Header="Channel" DisplayMemberBinding="{Binding Channel}" Width="180" />
                             <GridViewColumn Header="Users" DisplayMemberBinding="{Binding UsersText}" Width="80" />
                             <GridViewColumn Header="Topic" DisplayMemberBinding="{Binding TopicText}" Width="600" />
+                        </GridView>
+                    </ListView.View>
+                </ListView>
+            </Grid>
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type app:BanListView}" x:Key="BanListContentTemplate">
+            <Grid Margin="12">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <StackPanel Margin="0,0,0,10">
+                    <TextBlock Text="{Binding Channel, StringFormat=Ban List · {0}}" FontSize="20" FontWeight="SemiBold" Foreground="#172033" />
+                    <TextBlock Text="{Binding StateText}" Foreground="#2563EB" Margin="0,3,0,8" AutomationProperties.AutomationId="BanList.State" />
+                    <StackPanel Orientation="Horizontal">
+                        <Button Content="Refresh" Click="OnBanListRefreshClick" Padding="12,4" Margin="0,0,6,0" AutomationProperties.AutomationId="BanList.Refresh" />
+                        <TextBox Text="{Binding Result.NewMask, UpdateSourceTrigger=PropertyChanged}" Width="260" VerticalContentAlignment="Center" ToolTip="Enter an exact ban mask." AutomationProperties.AutomationId="BanList.MaskInput" />
+                        <Button Content="Add ban" Click="OnBanListAddClick" Padding="12,4" Margin="6,0,6,0" AutomationProperties.AutomationId="BanList.Add" />
+                        <Button Content="Copy mask" Click="OnBanListCopyClick" Padding="12,4" Margin="0,0,6,0" AutomationProperties.AutomationId="BanList.Copy" />
+                        <Button Content="Remove selected" Click="OnBanListRemoveClick" Padding="12,4" AutomationProperties.AutomationId="BanList.Remove" />
+                    </StackPanel>
+                    <TextBox Text="{Binding Result.FilterText, UpdateSourceTrigger=PropertyChanged}" Margin="0,8,0,0" Width="260" HorizontalAlignment="Left" ToolTip="Filter masks." AutomationProperties.AutomationId="BanList.Filter" />
+                </StackPanel>
+                <ListView Grid.Row="1" ItemsSource="{Binding Result.VisibleEntries}" SelectedItem="{Binding Result.SelectedEntry, Mode=TwoWay}" AutomationProperties.AutomationId="BanList.Entries" AutomationProperties.Name="Ban list entries">
+                    <ListView.View>
+                        <GridView>
+                            <GridViewColumn Header="Mask" DisplayMemberBinding="{Binding Mask}" Width="340" />
+                            <GridViewColumn Header="Set by" DisplayMemberBinding="{Binding SetByText}" Width="180" />
+                            <GridViewColumn Header="Set time" DisplayMemberBinding="{Binding SetAtText}" Width="180" />
                         </GridView>
                     </ListView.View>
                 </ListView>
@@ -352,9 +382,11 @@
         </ToolBarTray>
 
         <StatusBar DockPanel.Dock="Bottom" Visibility="{Binding IsStatusBarVisible, Converter={StaticResource BooleanToVisibility}}">
-            <StatusBarItem Content="{Binding StatusText}" />
+            <StatusBarItem Content="{Binding StatusText}" AutomationProperties.AutomationId="StatusText" />
             <Separator />
-             <StatusBarItem Content="nexIRC 5 · Phase 1H" />
+            <StatusBarItem Content="{Binding Sessions.OperationFeedback.LatestText}" ToolTip="Latest server operation feedback" AutomationProperties.AutomationId="OperationFeedback" />
+            <Separator />
+            <StatusBarItem Content="nexIRC 5 · Phase 1L" />
         </StatusBar>
 
         <Grid>

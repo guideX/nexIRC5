@@ -13,7 +13,8 @@ public enum WorkspaceViewKind
     Channel,
     Query,
     Whois,
-    ChannelList
+    ChannelList,
+    BanList
 }
 
 public enum WorkspaceActivity
@@ -855,6 +856,8 @@ public sealed class NetworkWorkspace : ObservableObject
 
     public ObservableCollection<ChannelListView> ChannelListViews { get; } = [];
 
+    public ObservableCollection<BanListView> BanListViews { get; } = [];
+
     public WorkspaceView? ActiveView
     {
         get => _activeView;
@@ -998,6 +1001,31 @@ public sealed class NetworkWorkspace : ObservableObject
         return view;
     }
 
+    internal BanListView EnsureBanList(string channel, bool beginRequest = false)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(channel);
+        var existing = BanListViews.FirstOrDefault(item => IrcCaseMappingComparer.Equals(item.Channel, channel, _snapshot.Features.CaseMapping));
+        if (existing is not null)
+        {
+            if (beginRequest)
+            {
+                existing.BeginRequest();
+            }
+
+            return existing;
+        }
+
+        var view = new BanListView(Id, Guid.NewGuid(), channel);
+        BanListViews.Add(view);
+        InsertView(view);
+        if (beginRequest)
+        {
+            view.BeginRequest();
+        }
+
+        return view;
+    }
+
     internal WhoisView? FindWhois(string nickname) =>
         WhoisViews.LastOrDefault(item => IrcCaseMappingComparer.Equals(item.RequestedNickname, nickname, _snapshot.Features.CaseMapping));
 
@@ -1052,7 +1080,7 @@ public sealed class NetworkWorkspace : ObservableObject
 
     private void InsertView(WorkspaceView view)
     {
-        if (view.Kind is WorkspaceViewKind.Query or WorkspaceViewKind.Whois or WorkspaceViewKind.ChannelList)
+        if (view.Kind is WorkspaceViewKind.Query or WorkspaceViewKind.Whois or WorkspaceViewKind.ChannelList or WorkspaceViewKind.BanList)
         {
             var insertIndex = Views.TakeWhile(item => item.Kind is not WorkspaceViewKind.Query).Count();
             Views.Insert(insertIndex, view);

@@ -156,11 +156,6 @@ public static class ParticipantActionCatalog
                 new("Ban…", ParticipantActionKind.Ban, canModerate, reason),
                 new("Kick and Ban…", ParticipantActionKind.KickAndBan, canModerate, reason)
             };
-            if (context.Member.Hostmask is not null)
-            {
-                moderationItems.Add(new ParticipantMenuItem("Unban…", ParticipantActionKind.Unban, canModerate, reason));
-            }
-
             groups.Add(new ParticipantMenuGroup("Moderation", moderationItems));
         }
 
@@ -290,9 +285,10 @@ public sealed class ParticipantActionService
         }
 
         var command = IrcParticipantCommandBuilder.BuildNotice(CommandBuilder(context), context.TargetNickname, text);
+        var operation = _sessions.StartOperation(IrcOperationType.Notice, context.NetworkId, context.TargetNickname, context.TargetNickname, command: "NOTICE");
         await context.Network.Session.SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
         _sessions.AppendLocal(context.Channel, IrcEventPresentation.CreateLocalMessage(context.Network.Snapshot.Nickname, text, OutgoingMessageKind.Notice));
-        return CommandDispatchResult.Success($"Notice sent to {context.TargetNickname}.", context.Channel);
+        return CommandDispatchResult.Success($"Notice requested for {context.TargetNickname}; waiting for server feedback.", context.Channel, operation);
     }
 
     public async ValueTask<CommandDispatchResult> SendCtcpAsync(ParticipantActionContext context, string commandName, string? arguments = null, CancellationToken cancellationToken = default)
@@ -308,9 +304,10 @@ public sealed class ParticipantActionService
         }
 
         var command = IrcParticipantCommandBuilder.BuildCtcp(CommandBuilder(context), context.TargetNickname, commandName, arguments);
+        var operation = _sessions.StartOperation(IrcOperationType.Ctcp, context.NetworkId, context.TargetNickname, context.TargetNickname, command: "PRIVMSG");
         await context.Network.Session.SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
         _sessions.AppendLocal(context.Channel, IrcEventPresentation.CreateLocalCtcp(commandName, arguments ?? string.Empty));
-        return CommandDispatchResult.Success($"CTCP {commandName.ToUpperInvariant()} sent to {context.TargetNickname}.", context.Channel);
+        return CommandDispatchResult.Success($"CTCP {commandName.ToUpperInvariant()} requested for {context.TargetNickname}.", context.Channel, operation);
     }
 
     public async ValueTask<CommandDispatchResult> SetPrivilegeAsync(ParticipantActionContext context, char mode, bool adding, CancellationToken cancellationToken = default)
@@ -321,8 +318,15 @@ public sealed class ParticipantActionService
         }
 
         var command = IrcParticipantCommandBuilder.BuildMemberMode(CommandBuilder(context), context.ChannelName, mode, adding, context.TargetNickname);
+        var operation = _sessions.StartOperation(
+            IrcOperationType.ModeChange,
+            context.NetworkId,
+            context.ChannelName,
+            context.TargetNickname,
+            $"{(adding ? '+' : '-')}{mode}",
+            command: "MODE");
         await context.Network.Session.SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
-        return CommandDispatchResult.Success($"Member mode {(adding ? "added" : "removed")} for {context.TargetNickname}.", context.Channel);
+        return CommandDispatchResult.Success($"Member mode {(adding ? "add" : "remove")} requested for {context.TargetNickname}.", context.Channel, operation);
     }
 
     public async ValueTask<CommandDispatchResult> KickAsync(ParticipantActionContext context, string? reason = null, CancellationToken cancellationToken = default)
@@ -338,8 +342,9 @@ public sealed class ParticipantActionService
         }
 
         var command = IrcParticipantCommandBuilder.BuildKick(CommandBuilder(context), context.ChannelName, context.TargetNickname, reason);
+        var operation = _sessions.StartOperation(IrcOperationType.Kick, context.NetworkId, context.ChannelName, context.TargetNickname, command: "KICK");
         await context.Network.Session.SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
-        return CommandDispatchResult.Success($"Kick requested for {context.TargetNickname}.", context.Channel);
+        return CommandDispatchResult.Success($"Kick requested for {context.TargetNickname}; waiting for server confirmation.", context.Channel, operation);
     }
 
     public async ValueTask<CommandDispatchResult> BanAsync(ParticipantActionContext context, string banMask, CancellationToken cancellationToken = default)
@@ -355,8 +360,10 @@ public sealed class ParticipantActionService
         }
 
         var command = IrcParticipantCommandBuilder.BuildBan(CommandBuilder(context), context.ChannelName, banMask, ResolveBanMode(context));
+        var mode = ResolveBanMode(context);
+        var operation = _sessions.StartOperation(IrcOperationType.Ban, context.NetworkId, context.ChannelName, requestedMode: $"+{mode}", requestedMask: banMask, command: "MODE");
         await context.Network.Session.SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
-        return CommandDispatchResult.Success($"Ban requested for {context.TargetNickname} using {banMask}.", context.Channel);
+        return CommandDispatchResult.Success($"Ban requested for {context.TargetNickname} using {banMask}; waiting for server confirmation.", context.Channel, operation);
     }
 
     public async ValueTask<CommandDispatchResult> KickAndBanAsync(ParticipantActionContext context, string banMask, string? reason = null, CancellationToken cancellationToken = default)
@@ -372,11 +379,14 @@ public sealed class ParticipantActionService
         }
 
         var builder = CommandBuilder(context);
-        var ban = IrcParticipantCommandBuilder.BuildBan(builder, context.ChannelName, banMask, ResolveBanMode(context));
+        var banMode = ResolveBanMode(context);
+        var ban = IrcParticipantCommandBuilder.BuildBan(builder, context.ChannelName, banMask, banMode);
         var kick = IrcParticipantCommandBuilder.BuildKick(builder, context.ChannelName, context.TargetNickname, reason);
+        _ = _sessions.StartOperation(IrcOperationType.Ban, context.NetworkId, context.ChannelName, requestedMode: $"+{banMode}", requestedMask: banMask, command: "MODE");
+        var kickOperation = _sessions.StartOperation(IrcOperationType.Kick, context.NetworkId, context.ChannelName, context.TargetNickname, command: "KICK");
         await context.Network.Session.SendCommandAsync(ban, cancellationToken).ConfigureAwait(false);
         await context.Network.Session.SendCommandAsync(kick, cancellationToken).ConfigureAwait(false);
-        return CommandDispatchResult.Success($"Ban and kick requested for {context.TargetNickname}.", context.Channel);
+        return CommandDispatchResult.Success($"Ban and kick requested for {context.TargetNickname}; waiting for server confirmation.", context.Channel, kickOperation);
     }
 
     public async ValueTask<CommandDispatchResult> UnbanAsync(ParticipantActionContext context, string banMask, CancellationToken cancellationToken = default)
@@ -392,8 +402,10 @@ public sealed class ParticipantActionService
         }
 
         var command = IrcParticipantCommandBuilder.BuildUnban(CommandBuilder(context), context.ChannelName, banMask, ResolveBanMode(context));
+        var mode = ResolveBanMode(context);
+        var operation = _sessions.StartOperation(IrcOperationType.Unban, context.NetworkId, context.ChannelName, requestedMode: $"-{mode}", requestedMask: banMask, command: "MODE");
         await context.Network.Session.SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
-        return CommandDispatchResult.Success($"Unban requested for {banMask}.", context.Channel);
+        return CommandDispatchResult.Success($"Unban requested for {banMask}; waiting for server confirmation.", context.Channel, operation);
     }
 
     public async ValueTask<CommandDispatchResult> InviteAsync(ParticipantActionContext context, string channel, CancellationToken cancellationToken = default)
@@ -409,8 +421,144 @@ public sealed class ParticipantActionService
         }
 
         var command = IrcParticipantCommandBuilder.BuildInvite(CommandBuilder(context), context.TargetNickname, channel);
+        var operation = _sessions.StartOperation(IrcOperationType.Invite, context.NetworkId, channel, context.TargetNickname, command: "INVITE");
         await context.Network.Session.SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
-        return CommandDispatchResult.Success($"Invite requested for {context.TargetNickname} to {channel}.", context.Channel);
+        return CommandDispatchResult.Success($"Invite requested for {context.TargetNickname} to {channel}; waiting for server acknowledgement.", context.Channel, operation);
+    }
+
+    public async ValueTask<CommandDispatchResult> OpenBanListAsync(
+        ParticipantActionContext context,
+        CancellationToken cancellationToken = default)
+    {
+        if (!RequireRegistered(context, out var failure))
+        {
+            return failure!;
+        }
+
+        if (!context.IsJoined)
+        {
+            return CommandDispatchResult.Failure("You are not joined to this channel.", context.Channel);
+        }
+
+        try
+        {
+            var request = await _sessions.RequestBanListAsync(context.NetworkId, context.ChannelName, cancellationToken).ConfigureAwait(false);
+            return CommandDispatchResult.Success(
+                request.WasCoalesced ? "A ban-list request is already in progress." : $"Ban list requested for {context.ChannelName}.",
+                request.View);
+        }
+        catch (InvalidOperationException exception)
+        {
+            return CommandDispatchResult.Failure(exception.Message, context.Channel);
+        }
+    }
+
+    public async ValueTask<CommandDispatchResult> AddBanAsync(
+        BanListView view,
+        string mask,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(view);
+        if (!_sessions.TryGet(view.NetworkId, out var network) || network is null)
+        {
+            return CommandDispatchResult.Failure("The network is no longer available.", view);
+        }
+
+        var channel = network.Channels.FirstOrDefault(item => IrcIdentity.Equals(item.Channel, view.Channel, network.Snapshot.Features.CaseMapping));
+        if (channel is null || !channel.IsJoined)
+        {
+            return CommandDispatchResult.Failure("You are not joined to this channel.", view);
+        }
+
+        if (network.Snapshot.Registration != RegistrationState.Registered
+            || network.Snapshot.State is ServerSessionState.Disconnected or ServerSessionState.Failed or ServerSessionState.ReconnectWaiting)
+        {
+            return CommandDispatchResult.Failure("The network is not registered.", view);
+        }
+
+        var grammar = network.Snapshot.Features.Prefix;
+        if (grammar is null || !PrivilegeModel.CanModerate(channel.LocalPrefixModes, grammar))
+        {
+            return CommandDispatchResult.Failure("The current privilege state does not authorize moderation.", view);
+        }
+
+        if (!IsValidBanMask(mask))
+        {
+            return CommandDispatchResult.Failure("Enter a non-empty ban mask without whitespace or control characters.", view);
+        }
+
+        var mode = ResolveBanMode(network);
+        var command = IrcParticipantCommandBuilder.BuildBan(CommandBuilder(network), view.Channel, mask, mode);
+        var operation = _sessions.StartOperation(IrcOperationType.Ban, network.Id, view.Channel, requestedMode: $"+{mode}", requestedMask: mask, command: "MODE");
+        await network.Session.SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success($"Ban requested for {mask}; waiting for server confirmation.", view, operation);
+    }
+
+    public async ValueTask<CommandDispatchResult> RemoveBanAsync(
+        BanListView view,
+        string mask,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(view);
+        if (!_sessions.TryGet(view.NetworkId, out var network) || network is null)
+        {
+            return CommandDispatchResult.Failure("The network is no longer available.", view);
+        }
+
+        var channel = network.Channels.FirstOrDefault(item => IrcIdentity.Equals(item.Channel, view.Channel, network.Snapshot.Features.CaseMapping));
+        if (channel is null || !channel.IsJoined)
+        {
+            return CommandDispatchResult.Failure("You are not joined to this channel.", view);
+        }
+
+        var grammar = network.Snapshot.Features.Prefix;
+        if (network.Snapshot.Registration != RegistrationState.Registered
+            || network.Snapshot.State is ServerSessionState.Disconnected or ServerSessionState.Failed or ServerSessionState.ReconnectWaiting)
+        {
+            return CommandDispatchResult.Failure("The network is not registered.", view);
+        }
+
+        if (grammar is null || !PrivilegeModel.CanModerate(channel.LocalPrefixModes, grammar))
+        {
+            return CommandDispatchResult.Failure("The current privilege state does not authorize moderation.", view);
+        }
+
+        if (!IsValidBanMask(mask))
+        {
+            return CommandDispatchResult.Failure("Enter a non-empty ban mask without whitespace or control characters.", view);
+        }
+
+        var mode = ResolveBanMode(network);
+        var command = IrcParticipantCommandBuilder.BuildUnban(CommandBuilder(network), view.Channel, mask, mode);
+        var operation = _sessions.StartOperation(IrcOperationType.Unban, network.Id, view.Channel, requestedMode: $"-{mode}", requestedMask: mask, command: "MODE");
+        await network.Session.SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success($"Unban requested for {mask}; waiting for server confirmation.", view, operation);
+    }
+
+    public ValueTask<CommandDispatchResult> RefreshBanListAsync(BanListView view, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(view);
+        return RefreshBanListCoreAsync(view, cancellationToken);
+    }
+
+    private async ValueTask<CommandDispatchResult> RefreshBanListCoreAsync(BanListView view, CancellationToken cancellationToken)
+    {
+        if (!_sessions.TryGet(view.NetworkId, out var network) || network is null)
+        {
+            return CommandDispatchResult.Failure("The network is no longer available.", view);
+        }
+
+        try
+        {
+            var request = await _sessions.RequestBanListAsync(view.NetworkId, view.Channel, cancellationToken).ConfigureAwait(false);
+            return CommandDispatchResult.Success(
+                request.WasCoalesced ? "A ban-list request is already in progress." : $"Refreshing the ban list for {view.Channel}.",
+                request.View);
+        }
+        catch (InvalidOperationException exception)
+        {
+            return CommandDispatchResult.Failure(exception.Message, view);
+        }
     }
 
     public bool IsIgnored(ParticipantActionContext context) =>
@@ -455,11 +603,17 @@ public sealed class ParticipantActionService
         && !banMask.Any(character => character is '\r' or '\n' or '\u0000' or '\u0001');
 
     private static char ResolveBanMode(ParticipantActionContext context) =>
-        context.Network.Snapshot.Features.ChannelModes?.ListModes.FirstOrDefault() ?? 'b';
+        ResolveBanMode(context.Network);
+
+    private static char ResolveBanMode(NetworkWorkspace network) =>
+        network.Snapshot.Features.ChannelModes?.ListModes.FirstOrDefault() ?? 'b';
 
     private static IrcCommandBuilder CommandBuilder(ParticipantActionContext context)
+        => CommandBuilder(context.Network);
+
+    private static IrcCommandBuilder CommandBuilder(NetworkWorkspace network)
     {
-        var maximum = Math.Min(context.Network.Session.MaximumOutboundLineBytes, context.Network.Snapshot.Features.LineLength);
+        var maximum = Math.Min(network.Session.MaximumOutboundLineBytes, network.Snapshot.Features.LineLength);
         return new IrcCommandBuilder(Math.Max(3, maximum));
     }
 

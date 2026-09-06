@@ -14,7 +14,9 @@ public sealed class ServerSession : IAsyncDisposable
     private static readonly HashSet<int> KnownNumerics =
     [
         1, 4, 5, 301, 307, 310, 311, 312, 313, 315, 317, 318, 319, 321, 322, 323, 324,
-        330, 335, 338, 352, 353, 366, 367, 368, 369, 372, 375, 376, 378, 379, 422,
+        330, 335, 338, 341, 352, 353, 366, 367, 368, 369, 372, 375, 376, 378, 379, 401,
+        403, 404, 405, 407, 411, 412, 421, 442, 443, 461, 471, 472, 473, 474, 475, 476,
+        477, 481, 482, 485, 422,
         671, 900, 903, 904, 905, 906, 907, 908
     ];
     private static readonly HashSet<int> NicknameFailureNumerics = [433, 436, 437];
@@ -733,7 +735,7 @@ public sealed class ServerSession : IAsyncDisposable
             {
                 await PublishSemanticAsync(new IrcUnknownNumericEvent(message, finalNumeric), epoch).ConfigureAwait(false);
             }
-            else if (finalNumeric is not 1)
+            else if (finalNumeric is not 1 && !IrcNumericCatalog.IsRecognized(finalNumeric))
             {
                 await PublishSemanticAsync(new IrcNumericEvent(message, finalNumeric), epoch).ConfigureAwait(false);
             }
