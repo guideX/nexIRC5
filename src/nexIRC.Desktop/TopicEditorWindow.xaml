@@ -1,0 +1,19 @@
+<Window x:Class="nexIRC.Desktop.TopicEditorWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Edit Topic" Width="500" Height="260" MinWidth="420" MinHeight="220"
+        WindowStartupLocation="CenterOwner"
+        AutomationProperties.AutomationId="TopicEditorWindow">
+    <DockPanel Margin="16">
+        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button Content="Cancel" Width="90" Margin="0,0,8,0" Click="OnCancelClick" />
+            <Button Content="Save topic" Width="100" Click="OnSaveClick" AutomationProperties.AutomationId="TopicEditor.Save" />
+        </StackPanel>
+        <StackPanel>
+            <TextBlock Text="Topic" FontSize="18" FontWeight="SemiBold" />
+            <TextBlock Text="{Binding ChannelName, StringFormat={}{0} · server-authoritative}" Foreground="#64748B" Margin="0,3,0,8" />
+            <TextBox x:Name="TopicBox" Text="{Binding TopicDraft, UpdateSourceTrigger=PropertyChanged}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="90" AutomationProperties.AutomationId="TopicEditor.Field" />
+            <TextBlock x:Name="StatusText" Foreground="#B91C1C" TextWrapping="Wrap" Margin="0,8,0,0" AutomationProperties.AutomationId="TopicEditor.OperationState" />
+        </StackPanel>
+    </DockPanel>
+</Window>

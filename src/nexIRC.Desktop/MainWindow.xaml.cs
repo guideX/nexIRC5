@@ -45,6 +45,17 @@ public partial class MainWindow : Window
 
     public MainWindowViewModel ViewModel { get; }
 
+    internal async Task CloseAfterSmokeAsync()
+    {
+        if (!_closing)
+        {
+            _closing = true;
+            await ViewModel.ShutdownAsync().ConfigureAwait(true);
+        }
+
+        Close();
+    }
+
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         var state = ViewModel.CurrentPreferences.ViewState;
@@ -308,7 +319,7 @@ public partial class MainWindow : Window
                 ("Reconnect", new Func<Task>(() => ViewModel.Sessions.ReconnectAsync(network.Id).AsTask())),
                 ("Open Status", () => { ViewModel.SelectView(network.StatusView); return Task.CompletedTask; }),
                 ("Remove", new Func<Task>(() => ViewModel.Sessions.RemoveAsync(network.Id).AsTask()))
-            ]);
+            ], "NetworkContextMenu");
             e.Handled = true;
             return;
         }
@@ -343,12 +354,24 @@ public partial class MainWindow : Window
                         actions.Add(("Remove historical view", () => { ViewModel.RemoveHistoricalConversation(channel); return Task.CompletedTask; }));
                     }
                 }
+                actions.Insert(0, ("Channel Properties…", () =>
+                {
+                    OpenChannelProperties(viewNetwork, channel);
+                    return Task.CompletedTask;
+                }
+                ));
                 actions.Add((IsFavorite(viewNetwork, DestinationKind.Channel, channel.Channel) ? "Remove favorite" : "Add to favorites", () => ToggleFavorite(viewNetwork, channel, DestinationKind.Channel, channel.Channel)));
                 actions.Add(("Copy channel name", () => CopyText(channel.Channel)));
-                actions.Add(("Request channel modes", () => ViewModel.ExecuteInputAsync($"/mode {channel.Channel}")));
-                actions.Add(("Request topic", () => ViewModel.ExecuteInputAsync($"/topic {channel.Channel}")));
                 if (channel.IsJoined)
                 {
+                    actions.Add(("Request channel modes", () => ViewModel.ExecuteInputAsync($"/mode {channel.Channel}")));
+                    actions.Add(("Request topic", () => ViewModel.ExecuteInputAsync($"/topic {channel.Channel}")));
+                    actions.Add(("Edit Topic…", () =>
+                    {
+                        OpenTopicEditor(viewNetwork, channel);
+                        return Task.CompletedTask;
+                    }
+                    ));
                     actions.Add(("Open Ban List", () => ViewModel.ExecuteInputAsync($"/banlist {channel.Channel}")));
                 }
                 actions.Add(("Open LIST", () => ViewModel.ExecuteInputAsync("/list")));
@@ -366,7 +389,7 @@ public partial class MainWindow : Window
                 actions.Add(("Close query", () => { ViewModel.CloseActiveView(); return Task.CompletedTask; }));
             }
 
-            OpenContextMenu(treeItem, actions);
+            OpenContextMenu(treeItem, actions, view is ChannelView ? "ChannelContextMenu" : "WorkspaceContextMenu");
             e.Handled = true;
             return;
         }
@@ -590,12 +613,28 @@ public partial class MainWindow : Window
         return CommandDispatchResult.Success("Copied to the clipboard.", view);
     }
 
-    private void OpenContextMenu(FrameworkElement target, IEnumerable<(string Header, Func<Task> Action)> actions)
+    private void OpenChannelProperties(NetworkWorkspace network, ChannelView channel)
+    {
+        var dialog = new ChannelPropertiesWindow(new ChannelPropertiesViewModel(ViewModel.Sessions, network, channel)) { Owner = this };
+        dialog.ShowDialog();
+    }
+
+    private void OpenTopicEditor(NetworkWorkspace network, ChannelView channel)
+    {
+        var dialog = new TopicEditorWindow(new ChannelPropertiesViewModel(ViewModel.Sessions, network, channel)) { Owner = this };
+        dialog.ShowDialog();
+    }
+
+    private void OpenContextMenu(FrameworkElement target, IEnumerable<(string Header, Func<Task> Action)> actions, string automationId = "WorkspaceContextMenu")
     {
         var menu = new ContextMenu { PlacementTarget = target };
+        AutomationProperties.SetAutomationId(menu, automationId);
+        AutomationProperties.SetName(menu, automationId == "ChannelContextMenu" ? "Channel actions" : "Workspace actions");
         foreach (var (header, action) in actions)
         {
             var item = new MenuItem { Header = header, Tag = action };
+            AutomationProperties.SetAutomationId(item, $"ContextAction.{header.Replace("…", string.Empty, StringComparison.Ordinal).Replace(" ", string.Empty, StringComparison.Ordinal)}");
+            AutomationProperties.SetName(item, header);
             item.Click += OnGeneratedContextMenuClick;
             menu.Items.Add(item);
         }

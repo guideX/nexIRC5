@@ -23,8 +23,9 @@ public static class IrcEventPresentation
             IrcPrivmsgEvent message => Entry(TranscriptEntryKind.Message, message.Message.Prefix?.Name, message.Text),
             IrcQueryMessageEvent query when query.IsNotice => Entry(TranscriptEntryKind.Notice, query.Nickname, query.Text),
             IrcQueryMessageEvent query => Entry(TranscriptEntryKind.Message, query.Nickname, query.Text),
-            IrcTopicEvent topic => Entry(TranscriptEntryKind.Topic, topic.Message.Prefix?.Name, $"set topic in {topic.Channel}: {topic.Topic}"),
+            IrcTopicEvent topic => Entry(TranscriptEntryKind.Topic, topic.Setter ?? topic.Message.Prefix?.Name, $"set topic in {topic.Channel}: {topic.Topic}"),
             IrcTopicUnsetEvent topic => Entry(TranscriptEntryKind.Topic, topic.Message.Prefix?.Name, $"cleared the topic in {topic.Channel}"),
+            IrcTopicMetadataEvent => null,
             IrcNamesEvent names => Entry(TranscriptEntryKind.Informational, null, $"NAMES {names.Channel}: {names.Nicknames.Count} member(s) observed."),
             IrcNamesCompleteEvent names => Entry(TranscriptEntryKind.Informational, null, $"Member list synchronized for {names.Channel}."),
             IrcModeEvent mode => Entry(TranscriptEntryKind.Mode, mode.Message.Prefix?.Name, $"changed modes in {mode.Channel}: {FormatModes(mode.Changes)}"),
@@ -75,7 +76,7 @@ public static class IrcEventPresentation
     private static string FormatCtcp(string command, string arguments) => string.IsNullOrWhiteSpace(arguments) ? command : $"{command} {arguments}";
 
     private static string FormatModes(IReadOnlyList<nexIRC.Core.State.IrcModeChange> changes) => string.Join(' ', changes.Select(change =>
-        $"{(change.IsAdding ? '+' : '-')}{change.Mode}{(change.Parameter is null ? string.Empty : $" {change.Parameter}")}"));
+        $"{(change.IsAdding ? '+' : '-')}{change.Mode}{(change.SafeParameter is null ? string.Empty : $" {change.SafeParameter}")}"));
 
     private static string MessageText(nexIRC.Core.Protocol.IrcMessage message) => message.HasTrailingParameter
         ? message.TrailingParameter ?? string.Empty

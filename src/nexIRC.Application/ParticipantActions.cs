@@ -57,6 +57,8 @@ public sealed record ParticipantActionContext(
 
     public IReadOnlySet<char> LocalModes => Channel.LocalPrefixModes;
 
+    public ChannelAuthority Authority => ChannelAuthority.Evaluate(Network, Channel, Member);
+
     public IReadOnlyList<ChannelView> OtherJoinedChannels => (JoinedChannels ?? Array.Empty<ChannelView>())
         .Where(channel => channel.NetworkId == Network.Id && channel.IsJoined && !IrcIdentity.Equals(channel.Channel, ChannelName, Network.Snapshot.Features.CaseMapping))
         .ToArray();
@@ -127,12 +129,15 @@ public static class ParticipantActionCatalog
             foreach (var mode in context.Prefix.Modes)
             {
                 var hasMode = context.TargetModes.Contains(mode);
-                var canChange = connected && !context.IsSelf && PrivilegeModel.CanChange(context.LocalModes, mode, context.Prefix);
+                var authority = context.Authority.MemberPrivilegeChanges.TryGetValue(mode, out var modeAuthority)
+                    ? modeAuthority
+                    : ChannelAuthorityDecision.Unknown("The advertised privilege is not known.");
+                var canChange = connected && !context.IsSelf && authority.IsAllowed;
                 var reason = !connected
                     ? "Connect to the network first"
                     : context.IsSelf
                         ? "Self moderation is not offered here"
-                        : canChange ? null : "Current channel privilege is insufficient or unknown";
+                        : canChange ? null : authority.Reason;
                 privilegeItems.Add(new ParticipantMenuItem(
                     $"{(hasMode ? "Remove" : "Give")} {PrivilegeModel.FriendlyName(mode)}",
                     hasMode ? ParticipantActionKind.RemovePrivilege : ParticipantActionKind.GivePrivilege,
@@ -146,10 +151,11 @@ public static class ParticipantActionCatalog
 
         if (channel && !context.IsSelf)
         {
-            var canModerate = connected && context.Prefix is not null && PrivilegeModel.CanModerate(context.LocalModes, context.Prefix);
+            var moderation = context.Authority.Kick;
+            var canModerate = connected && moderation.IsAllowed;
             var reason = !connected
                 ? "Connect to the network first"
-                : canModerate ? null : "Current channel privilege is insufficient or unknown";
+                : canModerate ? null : moderation.Reason;
             var moderationItems = new List<ParticipantMenuItem>
             {
                 new("Kick…", ParticipantActionKind.Kick, canModerate, reason),
@@ -163,12 +169,13 @@ public static class ParticipantActionCatalog
             new(isIgnored ? "Unignore" : "Ignore", isIgnored ? ParticipantActionKind.Unignore : ParticipantActionKind.Ignore, !context.IsSelf, context.IsSelf ? "Ignoring yourself is not useful" : null)
         ]));
 
+        var inviteAuthority = context.Authority.Invite;
         var inviteItems = context.OtherJoinedChannels
             .Select(channelView => new ParticipantMenuItem(
                 $"Invite to {channelView.Channel}",
                 ParticipantActionKind.Invite,
-                connected,
-                connected ? null : "Connect to the network first",
+                connected && inviteAuthority.IsAllowed,
+                !connected ? "Connect to the network first" : inviteAuthority.Reason,
                 TargetChannel: channelView.Channel))
             .ToArray();
         if (inviteItems.Length > 0)
@@ -420,6 +427,11 @@ public sealed class ParticipantActionService
             return CommandDispatchResult.Failure("Invite requires another joined channel in this network.", context.Channel);
         }
 
+        if (!context.Authority.Invite.IsAllowed)
+        {
+            return CommandDispatchResult.Failure($"Invite authority is {context.Authority.Invite.StateText}: {context.Authority.Invite.Reason}", context.Channel);
+        }
+
         var command = IrcParticipantCommandBuilder.BuildInvite(CommandBuilder(context), context.TargetNickname, channel);
         var operation = _sessions.StartOperation(IrcOperationType.Invite, context.NetworkId, channel, context.TargetNickname, command: "INVITE");
         await context.Network.Session.SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
@@ -476,10 +488,10 @@ public sealed class ParticipantActionService
             return CommandDispatchResult.Failure("The network is not registered.", view);
         }
 
-        var grammar = network.Snapshot.Features.Prefix;
-        if (grammar is null || !PrivilegeModel.CanModerate(channel.LocalPrefixModes, grammar))
+        var moderation = ChannelAuthority.Evaluate(network, channel).Ban;
+        if (!moderation.IsAllowed)
         {
-            return CommandDispatchResult.Failure("The current privilege state does not authorize moderation.", view);
+            return CommandDispatchResult.Failure($"The current privilege state is {moderation.StateText}: {moderation.Reason}", view);
         }
 
         if (!IsValidBanMask(mask))
@@ -511,16 +523,16 @@ public sealed class ParticipantActionService
             return CommandDispatchResult.Failure("You are not joined to this channel.", view);
         }
 
-        var grammar = network.Snapshot.Features.Prefix;
         if (network.Snapshot.Registration != RegistrationState.Registered
             || network.Snapshot.State is ServerSessionState.Disconnected or ServerSessionState.Failed or ServerSessionState.ReconnectWaiting)
         {
             return CommandDispatchResult.Failure("The network is not registered.", view);
         }
 
-        if (grammar is null || !PrivilegeModel.CanModerate(channel.LocalPrefixModes, grammar))
+        var moderation = ChannelAuthority.Evaluate(network, channel).Unban;
+        if (!moderation.IsAllowed)
         {
-            return CommandDispatchResult.Failure("The current privilege state does not authorize moderation.", view);
+            return CommandDispatchResult.Failure($"The current privilege state is {moderation.StateText}: {moderation.Reason}", view);
         }
 
         if (!IsValidBanMask(mask))
@@ -642,9 +654,12 @@ public sealed class ParticipantActionService
             return false;
         }
 
-        if (context.Prefix is null || !PrivilegeModel.CanChange(context.LocalModes, mode, context.Prefix) || context.IsSelf)
+        var authority = context.Authority.MemberPrivilegeChanges.TryGetValue(mode, out var modeAuthority)
+            ? modeAuthority
+            : ChannelAuthorityDecision.Unknown("The advertised privilege is not known.");
+        if (context.IsSelf || !authority.IsAllowed)
         {
-            failure = CommandDispatchResult.Failure("The current privilege state does not authorize this action.", context.Channel);
+            failure = CommandDispatchResult.Failure($"The current privilege state is {authority.StateText}: {authority.Reason}", context.Channel);
             return false;
         }
 
@@ -664,7 +679,7 @@ public sealed class ParticipantActionService
             return false;
         }
 
-        if (context.IsSelf || context.Prefix is null || !PrivilegeModel.CanModerate(context.LocalModes, context.Prefix))
+        if (context.IsSelf || !context.Authority.Kick.IsAllowed)
         {
             failure = CommandDispatchResult.Failure("The current privilege state does not authorize moderation.", context.Channel);
             return false;

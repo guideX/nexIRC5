@@ -16,9 +16,12 @@ public sealed record IrcModeChange(
     char Mode,
     bool IsAdding,
     string? Parameter,
-    IrcChannelModeKind Kind)
+    IrcChannelModeKind Kind,
+    bool IsSensitive = false)
 {
     public bool Adding => IsAdding;
+
+    public string? SafeParameter => IsSensitive ? null : Parameter;
 }
 
 public sealed record IrcChannelModeSnapshot(
@@ -36,6 +39,7 @@ public sealed record IrcChannelModeSnapshot(
 /// </summary>
 public sealed class IrcChannelModeState
 {
+    private const int MaximumTrackedListParameters = 512;
     private readonly HashSet<char> _modes = [];
     private readonly Dictionary<char, List<string>> _parameters = [];
     private Dictionary<string, HashSet<char>> _memberModes = new(StringComparer.Ordinal);
@@ -135,6 +139,12 @@ public sealed class IrcChannelModeState
         _memberModes.Clear();
     }
 
+    public void ResetChannelModes()
+    {
+        _modes.Clear();
+        _parameters.Clear();
+    }
+
     public IReadOnlySet<char> GetMemberModes(string nickname)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
@@ -219,9 +229,11 @@ public sealed class IrcChannelModeState
                 parameter = modeParameters[parameterIndex++];
             }
 
-            var change = new IrcModeChange(mode, adding, parameter, kind);
+            var change = new IrcModeChange(mode, adding, parameter, kind, IsSensitiveParameterMode(mode, kind));
             changes.Add(change);
-            if (!RequiresParameter(kind) || parameter is not null)
+            var parameterRequired = kind is IrcChannelModeKind.List or IrcChannelModeKind.ParameterAlways or IrcChannelModeKind.MemberPrefix
+                || kind == IrcChannelModeKind.ParameterWhenSet && adding;
+            if (!parameterRequired || parameter is not null || !adding && kind == IrcChannelModeKind.ParameterAlways)
             {
                 ApplyChange(change);
             }
@@ -264,7 +276,7 @@ public sealed class IrcChannelModeState
         if (change.IsAdding)
         {
             _modes.Add(change.Mode);
-            if (change.Parameter is not null && change.Kind is (IrcChannelModeKind.List or IrcChannelModeKind.ParameterAlways or IrcChannelModeKind.ParameterWhenSet))
+            if (change.Parameter is not null && !change.IsSensitive && change.Kind is (IrcChannelModeKind.List or IrcChannelModeKind.ParameterAlways or IrcChannelModeKind.ParameterWhenSet))
             {
                 if (!_parameters.TryGetValue(change.Mode, out var values))
                 {
@@ -274,7 +286,7 @@ public sealed class IrcChannelModeState
 
                 if (change.Kind == IrcChannelModeKind.List)
                 {
-                    if (!values.Contains(change.Parameter, StringComparer.Ordinal))
+                    if (!values.Contains(change.Parameter, StringComparer.Ordinal) && values.Count < MaximumTrackedListParameters)
                     {
                         values.Add(change.Parameter);
                     }
@@ -338,8 +350,8 @@ public sealed class IrcChannelModeState
         return IrcChannelModeKind.Unknown;
     }
 
-    private static bool RequiresParameter(IrcChannelModeKind kind) => kind is IrcChannelModeKind.List or
-        IrcChannelModeKind.ParameterAlways or IrcChannelModeKind.MemberPrefix;
+    private static bool IsSensitiveParameterMode(char mode, IrcChannelModeKind kind) =>
+        mode == 'k' && (kind is IrcChannelModeKind.ParameterAlways or IrcChannelModeKind.ParameterWhenSet);
 
     private string? FindMemberKey(string nickname) => _memberModes.Keys.FirstOrDefault(key => IrcCaseMappingComparer.Equals(key, nickname, _caseMapping));
 }

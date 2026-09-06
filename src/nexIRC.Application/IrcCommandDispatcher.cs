@@ -1,6 +1,7 @@
 using nexIRC.Core.Networking;
 using nexIRC.Core.Protocol;
 using nexIRC.Core.Session;
+using nexIRC.Core.State;
 
 namespace nexIRC.Application;
 
@@ -161,7 +162,7 @@ public sealed class IrcCommandDispatcher
                 case "MODE":
                     return await ModeAsync(network, activeView, parts, cancellationToken).ConfigureAwait(false);
                 case "TOPIC":
-                    return await TopicAsync(network, activeView, parts, cancellationToken).ConfigureAwait(false);
+                    return await TopicAsync(network, activeView, arguments, parts, cancellationToken).ConfigureAwait(false);
                 case "CLEAR":
                     activeView.ClearEntries();
                     return CommandDispatchResult.Success("Local view cleared.", activeView);
@@ -541,17 +542,36 @@ public sealed class IrcCommandDispatcher
         var parameters = parts.Length > 0 && IrcIdentity.Equals(parts[0], channel.Channel, network.Snapshot.Features.CaseMapping)
             ? parts.Skip(1).ToArray()
             : parts;
-        IrcOperationResult? operation = null;
         if (parameters.Length == 0)
         {
-            operation = _sessions.StartOperation(IrcOperationType.ChannelModeQuery, network.Id, channel.Channel, command: "MODE");
+            return await new ChannelActionService(_sessions).RequestCurrentModesAsync(network, channel, cancellationToken).ConfigureAwait(false);
         }
 
-        await network.Session.SendCommandAsync("MODE", new[] { channel.Channel }.Concat(parameters).ToArray(), cancellationToken: cancellationToken).ConfigureAwait(false);
-        return CommandDispatchResult.Success($"Mode requested for {channel.Channel}.", channel, operation);
+        if (parameters[0].Length == 2 && parameters[0][0] is '+' or '-' && char.IsLetter(parameters[0][1]))
+        {
+            var mode = parameters[0][1];
+            var adding = parameters[0][0] == '+';
+            var grammar = network.Snapshot.Features.ChannelModes ?? IrcChannelModeGrammar.Default;
+            var kind = grammar.ListModes.Contains(mode) ? IrcChannelModeKind.List
+                : grammar.ParameterAlwaysModes.Contains(mode) ? IrcChannelModeKind.ParameterAlways
+                : grammar.ParameterWhenSetModes.Contains(mode) ? IrcChannelModeKind.ParameterWhenSet
+                : grammar.NoParameterModes.Contains(mode) ? IrcChannelModeKind.NoParameter
+                : IrcChannelModeKind.Unknown;
+            if (kind == IrcChannelModeKind.NoParameter)
+            {
+                return await new ChannelActionService(_sessions).SetFlagModeAsync(network, channel, mode, adding, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (kind is IrcChannelModeKind.ParameterAlways or IrcChannelModeKind.ParameterWhenSet)
+            {
+                return await new ChannelActionService(_sessions).SetParameterizedModeAsync(network, channel, mode, adding, parameters.Skip(1).FirstOrDefault(), cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        return CommandDispatchResult.Failure("Only one safely modeled channel mode may be changed from this command surface.", channel);
     }
 
-    private async ValueTask<CommandDispatchResult> TopicAsync(NetworkWorkspace network, WorkspaceView activeView, string[] parts, CancellationToken cancellationToken)
+    private async ValueTask<CommandDispatchResult> TopicAsync(NetworkWorkspace network, WorkspaceView activeView, string arguments, string[] parts, CancellationToken cancellationToken)
     {
         var channel = activeView as ChannelView ?? (parts.Length > 0 ? network.Channels.FirstOrDefault(item => IrcIdentity.Equals(item.Channel, parts[0], network.Snapshot.Features.CaseMapping)) : null);
         if (channel is null)
@@ -559,8 +579,24 @@ public sealed class IrcCommandDispatcher
             return CommandDispatchResult.Failure("Usage: /topic [#channel]", activeView);
         }
 
-        await network.Session.SendCommandAsync("TOPIC", [channel.Channel], cancellationToken: cancellationToken).ConfigureAwait(false);
-        return CommandDispatchResult.Success($"Topic requested for {channel.Channel}.", channel);
+        var channelToken = parts.FirstOrDefault(item => IrcIdentity.Equals(item, channel.Channel, network.Snapshot.Features.CaseMapping));
+        var topic = channelToken is not null && parts.Length > 1
+            ? arguments[(arguments.IndexOf(channelToken, StringComparison.Ordinal) + channelToken.Length)..].TrimStart()
+            : channelToken is null && activeView is ChannelView && parts.Length > 0
+                ? arguments
+                : null;
+        if (topic?.StartsWith(':') == true)
+        {
+            topic = topic[1..];
+        }
+
+        if (topic is null)
+        {
+            await network.Session.SendCommandAsync("TOPIC", [channel.Channel], cancellationToken: cancellationToken).ConfigureAwait(false);
+            return CommandDispatchResult.Success($"Topic requested for {channel.Channel}.", channel);
+        }
+
+        return await new ChannelActionService(_sessions).EditTopicAsync(network, channel, topic, cancellationToken).ConfigureAwait(false);
     }
 
     private static (string? Target, string? Text) SplitTargetAndText(string arguments)

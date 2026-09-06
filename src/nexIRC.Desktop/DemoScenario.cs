@@ -17,6 +17,41 @@ public sealed class DemoScenario
         _beta = beta;
     }
 
+    internal FakeIrcTransport AlphaTransport => _alpha;
+
+    internal FakeIrcTransport BetaTransport => _beta;
+
+    internal async Task<(NetworkWorkspace Alpha, NetworkWorkspace Beta)> SeedSmokeAsync(MainWindowViewModel viewModel)
+    {
+        ArgumentNullException.ThrowIfNull(viewModel);
+        var sessions = viewModel.Sessions;
+        var alpha = sessions.Add(Options("AlphaNet", _alpha.Endpoint, "nexAlpha", "#general") with
+        {
+            RequestedCapabilities = Array.Empty<string>()
+        });
+        var beta = sessions.Add(Options("BetaNet", _beta.Endpoint, "nexBeta", "#general") with
+        {
+            RequestedCapabilities = Array.Empty<string>()
+        });
+
+        await sessions.ConnectAsync(alpha.Id).ConfigureAwait(true);
+        await sessions.ConnectAsync(beta.Id).ConfigureAwait(true);
+        await WaitForConditionAsync(sessions, () => _alpha.ConnectCount == 1 && _beta.ConnectCount == 1, "fake transports did not connect").ConfigureAwait(true);
+
+        Register(_alpha, "alpha.server", "nexAlpha", "AlphaNet", "(qaohv)~&@%+", "beI,k,l,imnpst");
+        Register(_beta, "beta.server", "nexBeta", "BetaNet", "(ov)@+", "be,k,s,im");
+        EnqueueSmokeChannel(_alpha, "alpha.server", "nexAlpha", "#general", "Alpha topic", "alpha-setter", "@nexAlpha +Alex", "+nt");
+        EnqueueSmokeChannel(_beta, "beta.server", "nexBeta", "#general", "Beta topic", "beta-setter", "+nexBeta Alex", "+i");
+
+        await WaitForConditionAsync(sessions, () =>
+            alpha.State == NetworkDisplayState.Registered
+            && beta.State == NetworkDisplayState.Registered
+            && alpha.Channels.Any(channel => channel.IsJoined && channel.Members.Any(member => member.Nickname == "Alex"))
+            && beta.Channels.Any(channel => channel.IsJoined && channel.Members.Any(member => member.Nickname == "Alex")),
+            "smoke channels did not reach their deterministic joined state").ConfigureAwait(true);
+        return (alpha, beta);
+    }
+
     public static IIrcTransportFactory CreateFactory(out DemoScenario scenario)
     {
         var factory = new FakeIrcTransportFactory();
@@ -60,8 +95,8 @@ public sealed class DemoScenario
         await sessions.ConnectAsync(beta.Id).ConfigureAwait(true);
         await WaitForAsync(() => _alpha.ConnectCount == 1 && _beta.ConnectCount == 1).ConfigureAwait(true);
 
-        Register(_alpha, "alpha.server", "nexAlpha", "AlphaNet", "(qaohv)~&@%+");
-        Register(_beta, "beta.server", "nexBeta", "BetaNet", "(ov)@+");
+        Register(_alpha, "alpha.server", "nexAlpha", "AlphaNet", "(qaohv)~&@%+", "beI,k,l,imnpst");
+        Register(_beta, "beta.server", "nexBeta", "BetaNet", "(ov)@+", "be,k,s,im");
 
         _alpha.EnqueueInboundLine(":nexAlpha!demo@alpha JOIN #general");
         _alpha.EnqueueInboundLine(":nexAlpha!demo@alpha JOIN #alpha");
@@ -70,6 +105,8 @@ public sealed class DemoScenario
         _alpha.EnqueueInboundLine(":alpha.server 352 nexAlpha #general alex alpha.example alpha.server Alex H :0 Alex Alpha participant");
         _alpha.EnqueueInboundLine(":alpha.server 366 nexAlpha #general :End of names");
         _alpha.EnqueueInboundLine(":alpha.server 332 nexAlpha #general :The participant action showcase");
+        _alpha.EnqueueInboundLine(":alpha.server 333 nexAlpha #general alpha-setter 1700000000");
+        _alpha.EnqueueInboundLine(":alpha.server 324 nexAlpha #general +nt");
         _alpha.EnqueueInboundLine(":alpha.server 353 nexAlpha = #alpha :~nexAlpha @Mira +Rook");
         _alpha.EnqueueInboundLine(":alpha.server 366 nexAlpha #alpha :End of names");
         _alpha.EnqueueInboundLine(":alpha.server 332 nexAlpha #alpha :A calm place for testing the nexIRC shell");
@@ -100,6 +137,8 @@ public sealed class DemoScenario
         _beta.EnqueueInboundLine(":beta.server 352 nexBeta #general alex beta.example beta.server Alex H :0 Alex Beta participant");
         _beta.EnqueueInboundLine(":beta.server 366 nexBeta #general :End of names");
         _beta.EnqueueInboundLine(":beta.server 332 nexBeta #general :The same #general name on another network");
+        _beta.EnqueueInboundLine(":beta.server 333 nexBeta #general beta-setter 1700000100");
+        _beta.EnqueueInboundLine(":beta.server 324 nexBeta #general +i");
         _beta.EnqueueInboundLine(":beta.server 353 nexBeta = #lounge :@nexBeta +Mira");
         _beta.EnqueueInboundLine(":beta.server 366 nexBeta #lounge :End of names");
         _beta.EnqueueInboundLine(":beta.server 332 nexBeta #lounge :Beta network topic");
@@ -405,11 +444,53 @@ public sealed class DemoScenario
             Text = text
         };
 
-    private static void Register(FakeIrcTransport transport, string server, string nickname, string network, string prefix)
+    private static void Register(FakeIrcTransport transport, string server, string nickname, string network, string prefix, string chanModes)
     {
         transport.EnqueueInboundLine($":{server} CAP * LS :");
-        transport.EnqueueInboundLine($":{server} 005 {nickname} NETWORK={network} PREFIX={prefix} CHANTYPES=#&+! :demo features");
+        transport.EnqueueInboundLine($":{server} 005 {nickname} NETWORK={network} PREFIX={prefix} CHANMODES={chanModes} CHANTYPES=#&+! :demo features");
         transport.EnqueueInboundLine($":{server} 001 {nickname} :Welcome to the nexIRC 5 demo workspace");
+    }
+
+    private static void EnqueueSmokeChannel(FakeIrcTransport transport, string server, string nickname, string channel, string topic, string setter, string names, string modes)
+    {
+        transport.EnqueueInboundLine($":{nickname}!demo@{server} JOIN {channel}");
+        transport.EnqueueInboundLine($":{server} 332 {nickname} {channel} :{topic}");
+        transport.EnqueueInboundLine($":{server} 333 {nickname} {channel} {setter} 1700000000");
+        transport.EnqueueInboundLine($":{server} 324 {nickname} {channel} {modes}");
+        transport.EnqueueInboundLine($":{server} 353 {nickname} = {channel} :{names}");
+        transport.EnqueueInboundLine($":{server} 366 {nickname} {channel} :End of names");
+    }
+
+    private static async Task WaitForConditionAsync(NetworkSessionManager sessions, Func<bool> condition, string failure)
+    {
+        if (condition())
+        {
+            return;
+        }
+
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        void Signal(object? sender, EventArgs args)
+        {
+            if (condition())
+            {
+                completion.TrySetResult(true);
+            }
+        }
+
+        sessions.NavigationChanged += Signal;
+        try
+        {
+            Signal(null, EventArgs.Empty);
+            await Task.WhenAny(completion.Task, Task.Delay(TimeSpan.FromSeconds(4))).ConfigureAwait(true);
+            if (!condition())
+            {
+                throw new TimeoutException(failure);
+            }
+        }
+        finally
+        {
+            sessions.NavigationChanged -= Signal;
+        }
     }
 
     private static async Task WaitForAsync(Func<bool> condition)

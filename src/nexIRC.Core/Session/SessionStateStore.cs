@@ -124,6 +124,8 @@ internal sealed class SessionStateStore
             channel.Members.Clear();
             channel.ModeState.Reset();
             channel.Topic = null;
+            channel.TopicSetter = null;
+            channel.TopicSetAt = null;
         }
 
         foreach (var query in _queries.Values)
@@ -178,6 +180,9 @@ internal sealed class SessionStateStore
                 break;
             case "331":
                 ApplyTopicUnset(message, events);
+                break;
+            case "333":
+                ApplyTopicMetadata(message, events);
                 break;
             case "324":
                 ApplyNumericMode(message, features, events);
@@ -449,7 +454,9 @@ internal sealed class SessionStateStore
         var channel = GetChannel(channelName);
         var topic = message.HasTrailingParameter ? message.TrailingParameter ?? string.Empty : Parameter(message, 1) ?? string.Empty;
         channel.Topic = topic;
-        events.Add(new IrcTopicEvent(message, channelName, topic));
+        channel.TopicSetter = message.Prefix?.Name;
+        channel.TopicSetAt = ParseServerTime(message);
+        events.Add(new IrcTopicEvent(message, channelName, topic, channel.TopicSetter, channel.TopicSetAt));
     }
 
     private void ApplyTopicReply(IrcMessage message, List<IrcSemanticEvent> events)
@@ -462,6 +469,8 @@ internal sealed class SessionStateStore
 
         var channel = GetChannel(channelName);
         channel.Topic = message.HasTrailingParameter ? message.TrailingParameter : Parameter(message, 2);
+        channel.TopicSetter = null;
+        channel.TopicSetAt = null;
         events.Add(new IrcTopicEvent(message, channelName, channel.Topic ?? string.Empty));
     }
 
@@ -475,7 +484,23 @@ internal sealed class SessionStateStore
 
         var channel = GetChannel(channelName);
         channel.Topic = null;
+        channel.TopicSetter = null;
+        channel.TopicSetAt = null;
         events.Add(new IrcTopicUnsetEvent(message, channelName));
+    }
+
+    private void ApplyTopicMetadata(IrcMessage message, List<IrcSemanticEvent> events)
+    {
+        var channelName = Parameter(message, 1);
+        if (string.IsNullOrEmpty(channelName))
+        {
+            return;
+        }
+
+        var channel = GetChannel(channelName);
+        channel.TopicSetter = Parameter(message, 2);
+        channel.TopicSetAt = ParseUnixTime(Parameter(message, 3));
+        events.Add(new IrcTopicMetadataEvent(message, channelName, channel.TopicSetter, channel.TopicSetAt));
     }
 
     private void ApplyMode(IrcMessage message, ServerFeatureSet features, List<IrcSemanticEvent> events)
@@ -504,6 +529,7 @@ internal sealed class SessionStateStore
         }
 
         var channel = GetChannel(channelName);
+        channel.ModeState.ResetChannelModes();
         var changes = channel.ModeState.Apply(message.Parameters, features, parameterOffset: 1);
         ApplyModeChangesToMembers(channel, changes);
         if (changes.Count > 0)
@@ -842,6 +868,8 @@ internal sealed class SessionStateStore
         public bool IsJoined { get; set; }
         public bool IsStale { get; set; }
         public string? Topic { get; set; }
+        public string? TopicSetter { get; set; }
+        public DateTimeOffset? TopicSetAt { get; set; }
         public int ConnectionGeneration { get; set; }
         public bool NamesInProgress { get; set; }
         public ChannelSynchronizationState Synchronization { get; set; }
@@ -855,10 +883,24 @@ internal sealed class SessionStateStore
             {
                 Modes = modeSnapshot.Modes,
                 ModeParameters = modeSnapshot.Parameters,
+                TopicSetter = TopicSetter,
+                TopicSetAt = TopicSetAt,
                 Synchronization = Synchronization
             };
         }
     }
+
+    private static DateTimeOffset? ParseServerTime(IrcMessage message) =>
+        message.TagValues.TryGetValue("time", out var value)
+            && DateTimeOffset.TryParse(value, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out var timestamp)
+                ? timestamp
+                : null;
+
+    private static DateTimeOffset? ParseUnixTime(string? value) =>
+        long.TryParse(value, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var seconds)
+            && seconds is >= -62135596800 and <= 253402300799
+            ? DateTimeOffset.FromUnixTimeSeconds(seconds)
+            : null;
 
     private sealed class MutableQuery
     {

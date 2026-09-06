@@ -331,6 +331,21 @@ public sealed record IrcPrefixGrammar(
     IReadOnlyDictionary<char, char> ModeToPrefix,
     IReadOnlyDictionary<char, char> PrefixToMode)
 {
+    public int RankOf(char mode)
+    {
+        for (var index = 0; index < Modes.Count; index++)
+        {
+            if (Modes[index] == mode)
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    public bool ContainsMode(char mode) => ModeToPrefix.ContainsKey(mode);
+
     public static IrcPrefixGrammar Default { get; } = new(
         "(ov)@+",
         ['o', 'v'],
@@ -696,7 +711,10 @@ public sealed class ISupportState
 
         var modeText = value[1..close];
         var prefixText = value[(close + 1)..];
-        if (modeText.Length != prefixText.Length)
+        if (modeText.Length == 0 || modeText.Length != prefixText.Length
+            || modeText.Any(static mode => !char.IsLetter(mode))
+            || modeText.Distinct().Count() != modeText.Length
+            || prefixText.Distinct().Count() != prefixText.Length)
         {
             return null;
         }
@@ -720,6 +738,10 @@ public sealed class ISupportState
         }
 
         var categories = value.Split(',', StringSplitOptions.None);
+        if (categories.Length > 4 || categories.Any(static category => category.Any(mode => !char.IsLetter(mode))))
+        {
+            return null;
+        }
         var sets = Enumerable.Range(0, 4)
             .Select(index => (categories.Length > index ? categories[index] : string.Empty).ToHashSet())
             .ToArray();

@@ -386,7 +386,7 @@
             <Separator />
             <StatusBarItem Content="{Binding Sessions.OperationFeedback.LatestText}" ToolTip="Latest server operation feedback" AutomationProperties.AutomationId="OperationFeedback" />
             <Separator />
-            <StatusBarItem Content="nexIRC 5 · Phase 1L" />
+            <StatusBarItem Content="nexIRC 5 · Phase 1M" />
         </StatusBar>
 
         <Grid>

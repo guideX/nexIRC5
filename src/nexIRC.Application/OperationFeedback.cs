@@ -9,6 +9,7 @@ public enum IrcOperationType
     Ban,
     Unban,
     Invite,
+    TopicChange,
     Whois,
     Notice,
     Ctcp,

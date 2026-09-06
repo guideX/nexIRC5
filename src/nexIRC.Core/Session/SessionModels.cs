@@ -195,7 +195,18 @@ public sealed record IrcCtcpEvent(
     string Arguments,
     bool IsNotice) : IrcSemanticEvent(Message);
 
-public sealed record IrcTopicEvent(IrcMessage Message, string Channel, string Topic) : IrcSemanticEvent(Message);
+public sealed record IrcTopicEvent(
+    IrcMessage Message,
+    string Channel,
+    string Topic,
+    string? Setter = null,
+    DateTimeOffset? SetAt = null) : IrcSemanticEvent(Message);
+
+public sealed record IrcTopicMetadataEvent(
+    IrcMessage Message,
+    string Channel,
+    string? Setter,
+    DateTimeOffset? SetAt) : IrcSemanticEvent(Message);
 
 public sealed record IrcNamesEvent(IrcMessage Message, string Channel, IReadOnlyList<string> Nicknames) : IrcSemanticEvent(Message);
 
@@ -305,6 +316,10 @@ public sealed record IrcChannelSnapshot(
     IReadOnlyDictionary<string, IrcChannelMemberSnapshot> Members,
     int ConnectionGeneration)
 {
+    public string? TopicSetter { get; init; }
+
+    public DateTimeOffset? TopicSetAt { get; init; }
+
     public IReadOnlySet<char> Modes { get; init; } = new HashSet<char>();
 
     public IReadOnlyDictionary<char, IReadOnlyList<string>> ModeParameters { get; init; } =

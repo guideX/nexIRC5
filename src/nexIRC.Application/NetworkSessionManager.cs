@@ -1175,6 +1175,31 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
     }
 
+    private void ReconcileTopicEvent(NetworkWorkspace workspace, IrcTopicEvent topic)
+    {
+        if (!string.Equals(topic.Message.Command, "TOPIC", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        PendingActionOperation? match = null;
+        lock (_operationsGate)
+        {
+            if (_operations.TryGetValue(workspace.Id, out var state))
+            {
+                match = state.Actions.Values.FirstOrDefault(item =>
+                    item.Result.Type == IrcOperationType.TopicChange
+                    && item.Result.ConnectionGeneration == workspace.Snapshot.ConnectionGeneration
+                    && IrcIdentity.Equals(item.Result.TargetConversation, topic.Channel, workspace.Snapshot.Features.CaseMapping));
+            }
+        }
+
+        if (match is not null)
+        {
+            CompleteAction(workspace, match, IrcOperationState.Confirmed, explanation: $"Server confirmed the topic change in {topic.Channel}.");
+        }
+    }
+
     private void ReconcileNumericOperation(NetworkWorkspace workspace, IrcServerNumericEvent numeric)
     {
         if (numeric.Numeric == 341)
@@ -2003,6 +2028,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 AppendRendered(workspace.EnsureChannel(kick.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcTopicEvent topic:
+                ReconcileTopicEvent(workspace, topic);
                 AppendRendered(workspace.EnsureChannel(topic.Channel, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcTopicUnsetEvent topic:
@@ -2141,6 +2167,14 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             return;
         }
 
+        // A transport may finish a callback while the manager is tearing down.
+        // Do not let a late presentation callback resolve an already-removed
+        // session or mutate recents/logs after disposal has begun.
+        if (!TryGet(view.NetworkId, out var workspace) || workspace is null)
+        {
+            return;
+        }
+
         var previousActivity = view.Activity;
         var isOwnMessage = semanticEvent switch
         {
@@ -2160,14 +2194,14 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         view.Append(entry, markActivity: false);
         if (view is ChannelView channel && semanticEvent is IrcJoinEvent)
         {
-            RecordRecent(GetWorkspace(view.NetworkId), DestinationKind.Channel, channel.Channel);
+            RecordRecent(workspace, DestinationKind.Channel, channel.Channel);
         }
         else if (view is QueryView query && view.EntriesSnapshot.Count == 1 && semanticEvent is IrcQueryMessageEvent or IrcCtcpEvent)
         {
-            RecordRecent(GetWorkspace(view.NetworkId), DestinationKind.Query, query.Nickname);
+            RecordRecent(workspace, DestinationKind.Query, query.Nickname);
         }
 
-        _logging?.Record(view.NetworkId, GetWorkspace(view.NetworkId).ProfileId, view, entry);
+        _logging?.Record(view.NetworkId, workspace.ProfileId, view, entry);
         if (!view.IsActive && effectiveActivity != WorkspaceActivity.None)
         {
             view.MarkActivity(effectiveActivity);

@@ -38,6 +38,10 @@ public static class IrcNumericCatalog
     private static readonly IReadOnlyDictionary<int, IrcNumericDefinition> Definitions =
         new Dictionary<int, IrcNumericDefinition>
         {
+            [324] = new(324, "RPL_CHANNELMODEIS", IrcNumericCategory.Information),
+            [331] = new(331, "RPL_NOTOPIC", IrcNumericCategory.Information),
+            [332] = new(332, "RPL_TOPIC", IrcNumericCategory.Information),
+            [333] = new(333, "RPL_TOPICWHOTIME", IrcNumericCategory.Information),
             [341] = new(341, "RPL_INVITING", IrcNumericCategory.Success),
             [401] = new(401, "ERR_NOSUCHNICK", IrcNumericCategory.Error),
             [403] = new(403, "ERR_NOSUCHCHANNEL", IrcNumericCategory.Error),
@@ -77,6 +81,7 @@ public static class IrcNumericCatalog
 
         var channel = numeric switch
         {
+            324 or 331 or 332 or 333 => Parameter(message, 1),
             341 => Parameter(message, 2),
             403 or 404 or 405 or 442 or 471 or 473 or 474 or 475 or 476 or 477 or 482 => Parameter(message, 1),
             443 => Parameter(message, 2),

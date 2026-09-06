@@ -17,6 +17,21 @@ public partial class App : System.Windows.Application
         base.OnStartup(e);
 
         var demo = e.Args.Any(argument => string.Equals(argument, "--demo", StringComparison.OrdinalIgnoreCase));
+        var smokeScenario = ReadSmokeScenario(e.Args);
+        if (smokeScenario is not null && !demo)
+        {
+            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": UI smoke requires --demo so no real network session can be used.");
+            Shutdown(2);
+            return;
+        }
+
+        if (smokeScenario is not null && !UiSmokeHarness.IsKnownScenario(smokeScenario))
+        {
+            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": unknown scenario. Expected participant, moderation, channel-properties, or multi-network.");
+            Shutdown(2);
+            return;
+        }
+
         IIrcTransportFactory transportFactory;
         DemoScenario? demoScenario = null;
         if (demo)
@@ -63,7 +78,7 @@ public partial class App : System.Windows.Application
         MainWindow = window;
         window.Show();
         _ = CleanupLogsAsync(logStore, configuration);
-        if (demo && demoScenario is not null)
+        if (demo && demoScenario is not null && smokeScenario is null)
         {
             try
             {
@@ -74,7 +89,7 @@ public partial class App : System.Windows.Application
                 MessageBox.Show(window, exception.Message, "Demo mode", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
-        else
+        else if (!demo)
         {
             if (loadResult?.Diagnostic is { } diagnostic && loadResult.UsedDefaults)
             {
@@ -82,6 +97,29 @@ public partial class App : System.Windows.Application
             }
 
             await window.ViewModel.RestoreProfilesAsync().ConfigureAwait(true);
+        }
+
+        if (smokeScenario is not null && demoScenario is not null)
+        {
+            try
+            {
+                await UiSmokeHarness.RunAsync(smokeScenario, window, demoScenario).ConfigureAwait(true);
+                await window.CloseAfterSmokeAsync().ConfigureAwait(true);
+                Shutdown(0);
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine($"FAIL_UI_SMOKE {smokeScenario}: {exception.Message}");
+                try
+                {
+                    await window.CloseAfterSmokeAsync().ConfigureAwait(true);
+                }
+                catch
+                {
+                }
+
+                Shutdown(1);
+            }
         }
     }
 
@@ -112,5 +150,18 @@ public partial class App : System.Windows.Application
         {
             // Retention is maintenance; it cannot prevent the client from launching.
         }
+    }
+
+    private static string? ReadSmokeScenario(string[] args)
+    {
+        for (var index = 0; index + 1 < args.Length; index++)
+        {
+            if (string.Equals(args[index], "--ui-smoke", StringComparison.OrdinalIgnoreCase))
+            {
+                return args[index + 1].Trim();
+            }
+        }
+
+        return null;
     }
 }

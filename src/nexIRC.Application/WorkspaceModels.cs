@@ -562,6 +562,19 @@ public sealed class ChannelMemberView : ObservableObject
     }
 }
 
+public sealed record ChannelModeProjection(
+    char Mode,
+    string DisplayName,
+    IrcChannelModeKind Kind,
+    bool IsActive,
+    string ParameterText,
+    bool IsEditable)
+{
+    public string AutomationId => $"ChannelMode.{Mode}";
+
+    public bool IsParameterMode => Kind is IrcChannelModeKind.List or IrcChannelModeKind.ParameterAlways or IrcChannelModeKind.ParameterWhenSet;
+}
+
 public sealed class ChannelView : WorkspaceView
 {
     private readonly object _membersGate = new();
@@ -572,6 +585,12 @@ public sealed class ChannelView : WorkspaceView
     private string _modeSummary = string.Empty;
     private IReadOnlySet<char> _localPrefixModes = new HashSet<char>();
     private string _localPrefixText = string.Empty;
+    private IReadOnlySet<char> _modes = new HashSet<char>();
+    private IReadOnlyDictionary<char, IReadOnlyList<string>> _modeParameters = new Dictionary<char, IReadOnlyList<string>>();
+    private IReadOnlyList<ChannelModeProjection> _modeProjections = Array.Empty<ChannelModeProjection>();
+    private string? _topicSetter;
+    private DateTimeOffset? _topicSetAt;
+    private bool _localMemberKnown;
 
     internal ChannelView(Guid networkId, Guid id, string channel)
         : base(networkId, id, WorkspaceViewKind.Channel, channel)
@@ -601,6 +620,22 @@ public sealed class ChannelView : WorkspaceView
 
     public string TopicText => string.IsNullOrWhiteSpace(Topic) ? "(no topic)" : Topic!;
 
+    public string? TopicSetter
+    {
+        get => _topicSetter;
+        private set => SetProperty(ref _topicSetter, value);
+    }
+
+    public DateTimeOffset? TopicSetAt
+    {
+        get => _topicSetAt;
+        private set => SetProperty(ref _topicSetAt, value);
+    }
+
+    public string TopicMetadataText => TopicSetter is null
+        ? "setter/time unknown"
+        : $"set by {TopicSetter}{(TopicSetAt is null ? string.Empty : $" at {TopicSetAt:yyyy-MM-dd HH:mm:ss} UTC")}";
+
     public ChannelSynchronizationState Synchronization
     {
         get => _synchronization;
@@ -614,6 +649,20 @@ public sealed class ChannelView : WorkspaceView
         get => _modeSummary;
         private set => SetProperty(ref _modeSummary, value);
     }
+
+    public IReadOnlySet<char> Modes => _modes;
+
+    public IReadOnlyDictionary<char, IReadOnlyList<string>> ModeParameters => _modeParameters;
+
+    public IReadOnlyList<ChannelModeProjection> ModeProjections => _modeProjections;
+
+    public bool IsLocalMemberKnown => _localMemberKnown;
+
+    public string ApparentPrivilegeText => !IsJoined
+        ? "not joined"
+        : !_localMemberKnown
+            ? "unknown/server-dependent"
+            : string.IsNullOrEmpty(LocalPrefixText) ? "ordinary member" : LocalPrefixText;
 
     public IReadOnlySet<char> LocalPrefixModes => _localPrefixModes;
 
@@ -647,6 +696,7 @@ public sealed class ChannelView : WorkspaceView
     internal void ApplySnapshot(
         IrcChannelSnapshot? snapshot,
         IrcPrefixGrammar? grammar,
+        IrcChannelModeGrammar? channelModes = null,
         string? localNickname = null,
         IrcCaseMapping mapping = IrcCaseMapping.Rfc1459,
         bool networkAvailable = true,
@@ -661,6 +711,8 @@ public sealed class ChannelView : WorkspaceView
                 : networkAvailable && !isDesired ? ConversationLifecycleState.HistoricalOnly : ConversationLifecycleState.Disconnected);
             Synchronization = ChannelSynchronizationState.NotRequested;
             Topic = null;
+            TopicSetter = null;
+            TopicSetAt = null;
             lock (_membersGate)
             {
                 Members.Clear();
@@ -669,6 +721,10 @@ public sealed class ChannelView : WorkspaceView
             _localPrefixModes = new HashSet<char>();
             LocalPrefixText = string.Empty;
             CanModerate = false;
+            _modes = new HashSet<char>();
+            _modeParameters = new Dictionary<char, IReadOnlyList<string>>();
+            _modeProjections = Array.Empty<ChannelModeProjection>();
+            _localMemberKnown = false;
         }
         else
         {
@@ -681,6 +737,10 @@ public sealed class ChannelView : WorkspaceView
                     : !isDesired && LifecycleState is not ConversationLifecycleState.HistoricalOnly ? ConversationLifecycleState.Parted : ConversationLifecycleState.HistoricalOnly);
             Synchronization = snapshot.Synchronization;
             Topic = snapshot.Topic;
+            TopicSetter = snapshot.TopicSetter;
+            TopicSetAt = snapshot.TopicSetAt;
+            _modes = new HashSet<char>(snapshot.Modes);
+            _modeParameters = snapshot.ModeParameters.ToDictionary(pair => pair.Key, pair => (IReadOnlyList<string>)pair.Value.ToArray());
             ModeSummary = new string(snapshot.Modes.OrderBy(static mode => mode).ToArray());
             var projected = snapshot.Members.Values
                 .OrderBy(member => PrefixRank(member, grammar))
@@ -703,15 +763,42 @@ public sealed class ChannelView : WorkspaceView
             _localPrefixModes = localMember?.PrefixModes is { } localModes
                 ? new HashSet<char>(localModes)
                 : new HashSet<char>();
+            _localMemberKnown = localMember is not null;
             LocalPrefixText = ChannelMemberView.HighestPrefix(_localPrefixModes, grammar);
             var moderationModes = grammar?.Modes.Count > 1
                 ? grammar.Modes.Take(grammar.Modes.Count - 1).ToHashSet()
                 : grammar?.Modes.ToHashSet() ?? new HashSet<char>();
             CanModerate = _localPrefixModes.Any(moderationModes.Contains);
+            _modeProjections = BuildModeProjections(snapshot, channelModes);
         }
 
         OnPropertyChanged(nameof(TopicText));
+        OnPropertyChanged(nameof(TopicMetadataText));
         OnPropertyChanged(nameof(SynchronizationText));
+        OnPropertyChanged(nameof(ApparentPrivilegeText));
+        OnPropertyChanged(nameof(ModeProjections));
+    }
+
+    private static ChannelModeProjection[] BuildModeProjections(IrcChannelSnapshot snapshot, IrcChannelModeGrammar? grammar)
+    {
+        var effective = grammar ?? IrcChannelModeGrammar.Default;
+        var modes = effective.AllModes.Concat(snapshot.Modes).Distinct().OrderBy(static mode => mode).ToArray();
+        return modes.Select(mode =>
+        {
+            var kind = effective.ListModes.Contains(mode) ? IrcChannelModeKind.List
+                : effective.ParameterAlwaysModes.Contains(mode) ? IrcChannelModeKind.ParameterAlways
+                : effective.ParameterWhenSetModes.Contains(mode) ? IrcChannelModeKind.ParameterWhenSet
+                : effective.NoParameterModes.Contains(mode) ? IrcChannelModeKind.NoParameter
+                : IrcChannelModeKind.Unknown;
+            var active = snapshot.Modes.Contains(mode);
+            var parameterText = mode == 'k' && active
+                ? "set (hidden)"
+                : snapshot.ModeParameters.TryGetValue(mode, out var values)
+                    ? string.Join(", ", values)
+                    : string.Empty;
+            var displayName = mode is 'b' or 'e' or 'I' ? $"{PrivilegeModel.FriendlyName(mode)} list" : PrivilegeModel.FriendlyName(mode);
+            return new ChannelModeProjection(mode, displayName, kind, active, parameterText, kind is IrcChannelModeKind.NoParameter or IrcChannelModeKind.ParameterAlways or IrcChannelModeKind.ParameterWhenSet);
+        }).ToArray();
     }
 
     private static int PrefixRank(IrcChannelMemberSnapshot member, IrcPrefixGrammar? grammar)
@@ -792,7 +879,7 @@ public sealed class NetworkWorkspace : ObservableObject
         StatusView.ApplySnapshot(_snapshot);
         foreach (var channel in Channels)
         {
-            channel.ApplySnapshot(null, _snapshot.Features.Prefix, _snapshot.Nickname, _snapshot.Features.CaseMapping, networkAvailable: false, isDesired: true);
+            channel.ApplySnapshot(null, _snapshot.Features.Prefix, _snapshot.Features.ChannelModes, _snapshot.Nickname, _snapshot.Features.CaseMapping, networkAvailable: false, isDesired: true);
         }
 
         foreach (var query in Queries)
@@ -880,7 +967,7 @@ public sealed class NetworkWorkspace : ObservableObject
         foreach (var channel in snapshot.Channels)
         {
             var isDesired = snapshot.DesiredChannels.Any(item => IrcCaseMappingComparer.Equals(item, channel.Name, snapshot.Features.CaseMapping));
-            EnsureChannel(channel.Name, reopen: false).ApplySnapshot(channel, snapshot.Features.Prefix, snapshot.Nickname, snapshot.Features.CaseMapping, networkAvailable, isDesired);
+            EnsureChannel(channel.Name, reopen: false).ApplySnapshot(channel, snapshot.Features.Prefix, snapshot.Features.ChannelModes, snapshot.Nickname, snapshot.Features.CaseMapping, networkAvailable, isDesired);
         }
 
         foreach (var channel in Channels)
@@ -891,6 +978,7 @@ public sealed class NetworkWorkspace : ObservableObject
                 channel.ApplySnapshot(
                     null,
                     snapshot.Features.Prefix,
+                    snapshot.Features.ChannelModes,
                     snapshot.Nickname,
                     snapshot.Features.CaseMapping,
                     networkAvailable,
