@@ -107,6 +107,8 @@ public sealed class ServerSession : IAsyncDisposable
 
     public Task Completion => _runTask ?? Task.CompletedTask;
 
+    public int MaximumOutboundLineBytes => _options.MaximumOutboundLineBytes;
+
     public IAsyncEnumerable<RawIrcLineEvent> ReadRawEventsAsync(CancellationToken cancellationToken = default) => _rawEvents.Reader.ReadAllAsync(cancellationToken);
 
     public IAsyncEnumerable<ParsedIrcMessageEvent> ReadParsedEventsAsync(CancellationToken cancellationToken = default) => _parsedEvents.Reader.ReadAllAsync(cancellationToken);
@@ -200,6 +202,17 @@ public sealed class ServerSession : IAsyncDisposable
     public async ValueTask SendCommandAsync(string command, IReadOnlyList<string>? middleParameters = null, string? trailingParameter = null, CancellationToken cancellationToken = default)
     {
         var message = new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build(command, middleParameters, trailingParameter);
+        await QueueOutboundAsync(message, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask SendCommandAsync(IrcOutboundMessage message, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        if (message.FramedBytes.Length > _options.MaximumOutboundLineBytes)
+        {
+            throw new InvalidOperationException($"The IRC command exceeds the configured maximum of {_options.MaximumOutboundLineBytes} bytes.");
+        }
+
         await QueueOutboundAsync(message, cancellationToken).ConfigureAwait(false);
     }
 

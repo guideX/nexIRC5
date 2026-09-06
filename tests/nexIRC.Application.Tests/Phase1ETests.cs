@@ -375,6 +375,7 @@ public sealed class Phase1ETests
         await dispatcher.DispatchAsync(network, channel, "/kick Other cleanup");
         await dispatcher.DispatchAsync(network, channel, "/notice Other hello");
         await dispatcher.DispatchAsync(network, channel, "/ctcp Other VERSION");
+        await WaitForAsync(() => transport.OutboundLines.Contains("PRIVMSG Other :\u0001VERSION\u0001"));
 
         Assert.Contains("MODE #ops +o Other", transport.OutboundLines);
         Assert.Contains("MODE #ops +v Other", transport.OutboundLines);

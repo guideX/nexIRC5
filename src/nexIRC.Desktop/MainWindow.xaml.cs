@@ -133,6 +133,51 @@ public partial class MainWindow : Window
         InputBox.Focus();
     }
 
+    private void OnWhoisOpenQueryClick(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.ActiveView is WhoisView whois)
+        {
+            var query = ViewModel.Sessions.EnsureQuery(whois.NetworkId, whois.RequestedNickname);
+            ViewModel.SelectView(query);
+        }
+    }
+
+    private void OnWhoisCopyNicknameClick(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.ActiveView is WhoisView whois)
+        {
+            CopyText(whois.Result.Nickname);
+            ViewModel.StatusText = "Copied nickname to the clipboard.";
+        }
+    }
+
+    private void OnWhoisCopyHostmaskClick(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.ActiveView is WhoisView whois)
+        {
+            var result = CopyTextResult(whois.Result.Hostmask, whois, "No hostmask was returned by WHOIS.");
+            ViewModel.StatusText = result.Message;
+        }
+    }
+
+    private void OnWhoisCopyAccountClick(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.ActiveView is WhoisView whois)
+        {
+            var result = CopyTextResult(whois.Result.Account, whois, "No account was returned by WHOIS.");
+            ViewModel.StatusText = result.Message;
+        }
+    }
+
+    private void OnWhoisCopyFormattedClick(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.ActiveView is WhoisView whois)
+        {
+            CopyText(whois.Result.FormattedText);
+            ViewModel.StatusText = "Copied formatted WHOIS information to the clipboard.";
+        }
+    }
+
     private void OnListClick(object sender, RoutedEventArgs e)
     {
         ViewModel.PrepareInput("/list ");
@@ -268,31 +313,213 @@ public partial class MainWindow : Window
             var channel = FindAncestor<ListBox>(memberItem)?.DataContext as ChannelView;
             if (channel is not null)
             {
-                ViewModel.SelectView(channel);
-                var actions = new List<(string, Func<Task>)>
+                if (!ViewModel.Sessions.TryGet(channel.NetworkId, out var memberNetwork) || memberNetwork is null)
                 {
-                    ("Query / open private conversation", () => ViewModel.ExecuteInputAsync($"/query {member.Nickname}")),
-                    ("WHOIS", () => ViewModel.ExecuteInputAsync($"/whois {member.Nickname}")),
-                    ("Mention / insert nickname", () => { ViewModel.PrepareInput($"{member.Nickname}: "); InputBox.Focus(); return Task.CompletedTask; }),
-                    ("Copy nickname", () => CopyText(member.Nickname)),
-                    ("Notice", () => { ViewModel.PrepareInput($"/notice {member.Nickname} "); InputBox.Focus(); return Task.CompletedTask; }),
-                    ("CTCP VERSION", () => ViewModel.ExecuteInputAsync($"/ctcp {member.Nickname} VERSION")),
-                    ("CTCP TIME", () => ViewModel.ExecuteInputAsync($"/ctcp {member.Nickname} TIME")),
-                    ("CTCP PING", () => ViewModel.ExecuteInputAsync($"/ctcp {member.Nickname} PING"))
-                };
-                if (channel.CanModerate)
-                {
-                    actions.Add(("Give operator", () => ViewModel.ExecuteInputAsync($"/op {member.Nickname}")));
-                    actions.Add(("Remove operator", () => ViewModel.ExecuteInputAsync($"/deop {member.Nickname}")));
-                    actions.Add(("Give voice", () => ViewModel.ExecuteInputAsync($"/voice {member.Nickname}")));
-                    actions.Add(("Remove voice", () => ViewModel.ExecuteInputAsync($"/devoice {member.Nickname}")));
-                    actions.Add(("Kick", () => ViewModel.ExecuteInputAsync($"/kick {member.Nickname} ")));
+                    return;
                 }
 
-                OpenContextMenu(memberItem, actions);
+                ViewModel.SelectView(channel);
+                var context = ViewModel.CreateParticipantContext(memberNetwork, channel, member);
+                OpenParticipantContextMenu(memberItem, context);
                 e.Handled = true;
             }
         }
+    }
+
+    private void OnMemberListDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is not ListBox list
+            || list.DataContext is not ChannelView channel
+            || list.SelectedItem is not ChannelMemberView member
+            || !ViewModel.Sessions.TryGet(channel.NetworkId, out var network)
+            || network is null)
+        {
+            return;
+        }
+
+        ViewModel.OpenParticipantQuery(ViewModel.CreateParticipantContext(network, channel, member));
+        e.Handled = true;
+    }
+
+    private void OpenParticipantContextMenu(FrameworkElement target, ParticipantActionContext context)
+    {
+        var menu = new ContextMenu { PlacementTarget = target };
+        var groups = ParticipantActionCatalog.Build(context, ViewModel.ParticipantActions.IsIgnored(context));
+        var firstGroup = true;
+        foreach (var group in groups)
+        {
+            if (!firstGroup)
+            {
+                menu.Items.Add(new Separator());
+            }
+
+            firstGroup = false;
+            var submenu = new MenuItem { Header = group.Header };
+            foreach (var action in group.Items)
+            {
+                submenu.Items.Add(CreateParticipantMenuItem(context, action));
+            }
+
+            menu.Items.Add(submenu);
+        }
+
+        menu.IsOpen = true;
+    }
+
+    private MenuItem CreateParticipantMenuItem(ParticipantActionContext context, ParticipantMenuItem action)
+    {
+        var item = new MenuItem
+        {
+            Header = action.Header,
+            IsEnabled = action.IsEnabled,
+            ToolTip = action.DisabledReason,
+            Tag = new ParticipantMenuInvocation(context, action)
+        };
+        if (action.Children is { Count: > 0 })
+        {
+            foreach (var child in action.Children)
+            {
+                item.Items.Add(CreateParticipantMenuItem(context, child));
+            }
+        }
+        else
+        {
+            item.Click += OnParticipantMenuClick;
+        }
+
+        return item;
+    }
+
+    private async void OnParticipantMenuClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is MenuItem { Tag: ParticipantMenuInvocation invocation })
+        {
+            CommandDispatchResult result;
+            try
+            {
+                result = await ExecuteParticipantActionAsync(invocation.Context, invocation.Action);
+            }
+            catch (ArgumentException exception)
+            {
+                result = CommandDispatchResult.Failure(exception.Message, invocation.Context.Channel);
+            }
+            catch (InvalidOperationException exception)
+            {
+                result = CommandDispatchResult.Failure(exception.Message, invocation.Context.Channel);
+            }
+
+            ViewModel.StatusText = result.Message;
+            if (result.View is not null)
+            {
+                ViewModel.SelectView(result.View);
+            }
+        }
+    }
+
+    private async Task<CommandDispatchResult> ExecuteParticipantActionAsync(ParticipantActionContext context, ParticipantMenuItem action)
+    {
+        switch (action.Action)
+        {
+            case ParticipantActionKind.OpenQuery:
+                ViewModel.OpenParticipantQuery(context);
+                return CommandDispatchResult.Success($"Query opened for {context.TargetNickname}.", ViewModel.ActiveView);
+            case ParticipantActionKind.Mention:
+                ViewModel.InsertParticipantMention(context);
+                InputBox.Focus();
+                return CommandDispatchResult.Success($"Inserted {context.TargetNickname} into the composer.", context.Channel);
+            case ParticipantActionKind.Whois:
+                return await ViewModel.ParticipantActions.SendWhoisAsync(context);
+            case ParticipantActionKind.Notice:
+                {
+                    var text = ParticipantInputWindow.Show(this, "Send NOTICE", $"Message to {context.TargetNickname}:");
+                    return text is null
+                        ? CommandDispatchResult.Failure("NOTICE canceled.", context.Channel)
+                        : await ViewModel.ParticipantActions.SendNoticeAsync(context, text);
+                }
+            case ParticipantActionKind.CtcpPing:
+                return await ViewModel.ParticipantActions.SendCtcpAsync(context, "PING");
+            case ParticipantActionKind.CtcpVersion:
+                return await ViewModel.ParticipantActions.SendCtcpAsync(context, "VERSION");
+            case ParticipantActionKind.CtcpTime:
+                return await ViewModel.ParticipantActions.SendCtcpAsync(context, "TIME");
+            case ParticipantActionKind.CopyNickname:
+                return CopyTextResult(context.TargetNickname, context.Channel);
+            case ParticipantActionKind.CopyHostmask:
+                return CopyTextResult(context.Member.Hostmask, context.Channel, "No hostmask is known.");
+            case ParticipantActionKind.CopyAccount:
+                return CopyTextResult(context.Member.Account, context.Channel, "No account is known.");
+            case ParticipantActionKind.CopyIdentity:
+                return CopyTextResult(
+                    string.Join(
+                        Environment.NewLine,
+                        new[]
+                        {
+                            $"Nickname: {context.TargetNickname}",
+                            context.Member.Hostmask is null ? null : $"Hostmask: {context.Member.Hostmask}",
+                            string.IsNullOrWhiteSpace(context.Member.Account) ? null : $"Account: {context.Member.Account}"
+                        }.Where(line => line is not null)!),
+                    context.Channel);
+            case ParticipantActionKind.GivePrivilege:
+            case ParticipantActionKind.RemovePrivilege:
+                return action.ModeLetter is char mode
+                    ? await ViewModel.ParticipantActions.SetPrivilegeAsync(context, mode, action.Action == ParticipantActionKind.GivePrivilege)
+                    : CommandDispatchResult.Failure("The advertised privilege mode is unavailable.", context.Channel);
+            case ParticipantActionKind.Kick:
+                {
+                    var reason = ParticipantInputWindow.Show(this, "Kick participant", $"Optional reason for kicking {context.TargetNickname}:");
+                    return reason is null
+                        ? CommandDispatchResult.Failure("Kick canceled.", context.Channel)
+                        : await ViewModel.ParticipantActions.KickAsync(context, reason);
+                }
+            case ParticipantActionKind.Ban:
+                {
+                    var mask = ParticipantInputWindow.Show(this, "Ban participant", $"Ban mask for {context.TargetNickname} (edit before sending):", ParticipantActionService.GetConservativeBanMask(context.Member), selectAll: context.Member.Hostmask is not null);
+                    return mask is null
+                        ? CommandDispatchResult.Failure("Ban canceled.", context.Channel)
+                        : await ViewModel.ParticipantActions.BanAsync(context, mask);
+                }
+            case ParticipantActionKind.KickAndBan:
+                {
+                    var mask = ParticipantInputWindow.Show(this, "Ban and kick participant", $"Ban mask for {context.TargetNickname} (edit before sending):", ParticipantActionService.GetConservativeBanMask(context.Member), selectAll: context.Member.Hostmask is not null);
+                    if (mask is null)
+                    {
+                        return CommandDispatchResult.Failure("Ban and kick canceled.", context.Channel);
+                    }
+
+                    var reason = ParticipantInputWindow.Show(this, "Ban and kick participant", $"Optional reason for kicking {context.TargetNickname}:");
+                    return reason is null
+                        ? CommandDispatchResult.Failure("Ban and kick canceled.", context.Channel)
+                        : await ViewModel.ParticipantActions.KickAndBanAsync(context, mask, reason);
+                }
+            case ParticipantActionKind.Unban:
+                {
+                    var mask = ParticipantInputWindow.Show(this, "Unban participant", $"Ban mask to remove for {context.TargetNickname}:", ParticipantActionService.GetConservativeBanMask(context.Member), selectAll: context.Member.Hostmask is not null);
+                    return mask is null
+                        ? CommandDispatchResult.Failure("Unban canceled.", context.Channel)
+                        : await ViewModel.ParticipantActions.UnbanAsync(context, mask);
+                }
+            case ParticipantActionKind.Ignore:
+                return await ViewModel.ParticipantActions.SetIgnoredAsync(context, true);
+            case ParticipantActionKind.Unignore:
+                return await ViewModel.ParticipantActions.SetIgnoredAsync(context, false);
+            case ParticipantActionKind.Invite:
+                return action.TargetChannel is null
+                    ? CommandDispatchResult.Failure("No joined target channel was selected.", context.Channel)
+                    : await ViewModel.ParticipantActions.InviteAsync(context, action.TargetChannel);
+            default:
+                return CommandDispatchResult.Failure("The participant action is not supported.", context.Channel);
+        }
+    }
+
+    private static CommandDispatchResult CopyTextResult(string? text, WorkspaceView view, string missing = "Nothing is available to copy.")
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return CommandDispatchResult.Failure(missing, view);
+        }
+
+        System.Windows.Clipboard.SetText(text);
+        return CommandDispatchResult.Success("Copied to the clipboard.", view);
     }
 
     private void OpenContextMenu(FrameworkElement target, IEnumerable<(string Header, Func<Task> Action)> actions)
@@ -364,6 +591,8 @@ public partial class MainWindow : Window
 
     private void OnAboutClick(object sender, RoutedEventArgs e) =>
         MessageBox.Show(this, "nexIRC 5\nA reconnect-aware, multi-network IRC client shell.", "About nexIRC", MessageBoxButton.OK, MessageBoxImage.Information);
+
+    private sealed record ParticipantMenuInvocation(ParticipantActionContext Context, ParticipantMenuItem Action);
 
     private async void OnClosing(object? sender, CancelEventArgs e)
     {

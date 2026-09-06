@@ -28,6 +28,7 @@ public sealed class WhoisResult : ObservableObject
     private string? _idleText;
     private string? _signOnText;
     private bool _isSecure;
+    private string? _errorText;
 
     public WhoisResult(string requestedNickname)
     {
@@ -62,12 +63,19 @@ public sealed class WhoisResult : ObservableObject
     {
         RichResultState.Loading => "WHOIS in progress…",
         RichResultState.Completed => "WHOIS complete",
+        RichResultState.Failed => string.IsNullOrWhiteSpace(ErrorText) ? "WHOIS failed" : $"WHOIS failed: {ErrorText}",
         _ => "WHOIS not started"
     };
 
     public bool IsLoading => State == RichResultState.Loading;
 
     public bool IsCompleted => State == RichResultState.Completed;
+
+    public string? ErrorText
+    {
+        get => _errorText;
+        private set => SetProperty(ref _errorText, value);
+    }
 
     public string? Username
     {
@@ -143,6 +151,31 @@ public sealed class WhoisResult : ObservableObject
 
     public ObservableCollection<WhoisAdditionalField> AdditionalFields { get; } = [];
 
+    public string? Hostmask => string.IsNullOrWhiteSpace(Username) || string.IsNullOrWhiteSpace(Hostname)
+        ? null
+        : $"{Nickname}!{Username}@{Hostname}";
+
+    public string FormattedText
+    {
+        get
+        {
+            var lines = new List<string> { $"WHOIS {Nickname}" };
+            AddLine(lines, "Username", Username);
+            AddLine(lines, "Hostname", Hostname);
+            AddLine(lines, "Real name", RealName);
+            AddLine(lines, "Server", ServerText);
+            AddLine(lines, "Account", Account);
+            AddLine(lines, "Operator", OperatorStatus);
+            AddLine(lines, "Idle", IdleText);
+            AddLine(lines, "Sign-on", SignOnText);
+            if (IsSecure) lines.Add("Secure/TLS: yes");
+            if (Channels.Count > 0) lines.Add($"Channels: {string.Join(' ', Channels)}");
+            if (!string.IsNullOrWhiteSpace(AwayMessage)) AddLine(lines, "Away", AwayMessage);
+            lines.AddRange(AdditionalFields.Select(additional => additional.DisplayText));
+            return string.Join(Environment.NewLine, lines);
+        }
+    }
+
     public void Begin()
     {
         Username = null;
@@ -156,6 +189,7 @@ public sealed class WhoisResult : ObservableObject
         IdleText = null;
         SignOnText = null;
         IsSecure = false;
+        ErrorText = null;
         Channels.Clear();
         AdditionalFields.Clear();
         State = RichResultState.Loading;
@@ -195,10 +229,12 @@ public sealed class WhoisResult : ObservableObject
                 SignOnText = FormatSignOn(Parameter(parameters, 3));
                 break;
             case 319:
-                Channels.Clear();
                 foreach (var channel in text.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                 {
-                    Channels.Add(channel);
+                    if (!Channels.Contains(channel, StringComparer.OrdinalIgnoreCase))
+                    {
+                        Channels.Add(channel);
+                    }
                 }
                 break;
             case 330 when parameters.Count > 2:
@@ -211,6 +247,18 @@ public sealed class WhoisResult : ObservableObject
                 Account ??= "registered nickname";
                 break;
             case 338:
+                if (parameters.Count > 3)
+                {
+                    Hostname = Parameter(parameters, 3);
+                }
+                else if (parameters.Count > 2 && !string.IsNullOrWhiteSpace(Parameter(parameters, 2)))
+                {
+                    Hostname ??= Parameter(parameters, 2);
+                }
+
+                OnPropertyChanged(nameof(Hostname));
+                IsSecure = true;
+                break;
             case 671:
                 IsSecure = true;
                 break;
@@ -223,6 +271,8 @@ public sealed class WhoisResult : ObservableObject
         }
 
         OnPropertyChanged(nameof(Channels));
+        OnPropertyChanged(nameof(Hostmask));
+        OnPropertyChanged(nameof(FormattedText));
     }
 
     public void ApplyAdditional(int numeric, string text)
@@ -233,6 +283,13 @@ public sealed class WhoisResult : ObservableObject
         }
 
         AddAdditional(numeric, text);
+        OnPropertyChanged(nameof(FormattedText));
+    }
+
+    public void Fail(string message)
+    {
+        ErrorText = string.IsNullOrWhiteSpace(message) ? "The WHOIS request did not complete." : message;
+        State = RichResultState.Failed;
     }
 
     private void AddAdditional(int numeric, string text)
@@ -243,6 +300,15 @@ public sealed class WhoisResult : ObservableObject
         }
 
         AdditionalFields.Add(new WhoisAdditionalField(numeric, text));
+        OnPropertyChanged(nameof(FormattedText));
+    }
+
+    private static void AddLine(List<string> lines, string label, string? value)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            lines.Add($"{label}: {value}");
+        }
     }
 
     private static string? Parameter(IReadOnlyList<string> parameters, int index) => index < parameters.Count ? parameters[index] : null;
@@ -307,9 +373,13 @@ public sealed class WhoisView : WorkspaceView
 
     public bool IsCompleted => Result.IsCompleted;
 
+    public string? ErrorText => Result.ErrorText;
+
     internal void BeginRequest() => Result.Begin();
 
     internal void Apply(IrcWhoisEvent item) => Result.Apply(item);
 
     internal void ApplyAdditional(int numeric, string text) => Result.ApplyAdditional(numeric, text);
+
+    internal void Fail(string message) => Result.Fail(message);
 }

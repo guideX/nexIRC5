@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using nexIRC.Core.Session;
+using nexIRC.Core.Protocol;
 using nexIRC.Core.State;
 
 namespace nexIRC.Application;
@@ -66,6 +67,23 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     public IConversationLogStore? LogStore => _logStore;
 
     public ConversationLoggingService? Logging => _logging;
+
+    public bool IsIgnored(NetworkWorkspace workspace, IrcPrefix? prefix, string? account = null)
+    {
+        if (Configuration is null || prefix?.Name is null)
+        {
+            return false;
+        }
+
+        var identity = new IgnoreIdentity(
+            prefix.Name,
+            prefix.User,
+            prefix.Host,
+            account,
+            workspace.ProfileId,
+            workspace.NetworkName ?? workspace.Snapshot.Features.NetworkName ?? workspace.DisplayName);
+        return Configuration.IsIgnored(identity, workspace.Snapshot.Features.CaseMapping);
+    }
 
     public void ApplyPreferences(ApplicationPreferences preferences)
     {
@@ -983,6 +1001,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             await Task.Delay(TimeSpan.FromSeconds(30), operation.Lifetime.Token).ConfigureAwait(false);
             if (operation.Operation.Kind == "WHOIS")
             {
+                if (operation.View is WhoisView whois)
+                {
+                    whois.Fail("Timed out waiting for numeric 318.");
+                }
+
                 RemoveWhoisOperation(networkId, operation);
             }
             else
@@ -1114,6 +1137,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
         foreach (var operation in operations)
         {
+            if (operation.View is WhoisView whois && whois.IsLoading)
+            {
+                whois.Fail("The network disconnected before numeric 318.");
+            }
+
             RetireOperation(operation);
         }
     }
@@ -1323,6 +1351,19 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     private void RouteSemanticEvent(NetworkWorkspace workspace, IrcSemanticEvent semanticEvent, ServerSessionSnapshot snapshot)
     {
+        if (semanticEvent switch
+        {
+            IrcPrivmsgEvent message => IsIgnored(workspace, message.Message.Prefix, AccountTag(message.Message)),
+            IrcQueryMessageEvent query => IsIgnored(workspace, query.Message.Prefix, AccountTag(query.Message)),
+            IrcCtcpEvent ctcp => IsIgnored(workspace, ctcp.Message.Prefix, AccountTag(ctcp.Message)),
+            _ => false
+        })
+        {
+            // StateStore has already applied structural protocol state.  Ignore
+            // only presentation/activity/notification for matching identities.
+            return;
+        }
+
         switch (semanticEvent)
         {
             case IrcCtcpEvent ctcp when snapshot.Features.ChannelTypes.Contains(ctcp.Target.FirstOrDefault()):
@@ -1452,6 +1493,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 break;
         }
     }
+
+    private static string? AccountTag(IrcMessage message) =>
+        message.TagValues.TryGetValue("account", out var account) && !string.Equals(account, "*", StringComparison.Ordinal)
+            ? account
+            : null;
 
     private void AppendRendered(WorkspaceView view, IrcSemanticEvent semanticEvent, ServerSessionSnapshot snapshot, WorkspaceActivity? activity = null)
     {

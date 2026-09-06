@@ -41,6 +41,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             _notificationAdapter = new DesktopNotificationAdapter(Sessions.Notifications, () => CurrentPreferences, notification => { RouteNotification(notification); });
         }
         _commands = new IrcCommandDispatcher(Sessions);
+        ParticipantActions = new ParticipantActionService(Sessions);
         InputHistory = new InputHistory();
         Completion = new CompletionEngine(() => Configuration?.Aliases ?? Array.Empty<AliasDefinition>());
         if (configuration is not null)
@@ -100,6 +101,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public event Action? ExitRequested;
 
     public NetworkSessionManager Sessions { get; }
+
+    public ParticipantActionService ParticipantActions { get; }
 
     public ConfigurationService? Configuration { get; }
 
@@ -668,6 +671,25 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     }
 
     public void PrepareInput(string text) => InputText = text;
+
+    public ParticipantActionContext CreateParticipantContext(NetworkWorkspace network, ChannelView channel, ChannelMemberView member) =>
+        new(network, channel, member, network.Channels.Where(candidate => candidate.IsJoined).ToArray());
+
+    public void InsertParticipantMention(ParticipantActionContext context)
+    {
+        if (!ReferenceEquals(ActiveView, context.Channel))
+        {
+            SelectView(context.Channel);
+        }
+
+        InputText = ParticipantMention.Insert(InputText, context.TargetNickname, InputText.Length == 0);
+    }
+
+    public void OpenParticipantQuery(ParticipantActionContext context)
+    {
+        var query = ParticipantActions.OpenQuery(context);
+        SelectView(query);
+    }
 
     public void ClearActiveView()
     {

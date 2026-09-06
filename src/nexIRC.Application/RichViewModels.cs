@@ -8,7 +8,8 @@ public enum RichResultState
 {
     Idle,
     Loading,
-    Completed
+    Completed,
+    Failed
 }
 
 public sealed record ChannelListRow(string Channel, int VisibleUsers, string Topic)

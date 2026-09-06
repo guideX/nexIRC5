@@ -304,13 +304,19 @@ internal sealed class SessionStateStore
         }
         var existingKey = FindMemberKey(channel, nickname);
         var existing = existingKey is not null ? channel.Members[existingKey] : null;
+        var account = message.Parameters.Count > 1 ? Parameter(message, 1) : null;
+        if (string.Equals(account, "*", StringComparison.Ordinal))
+        {
+            account = null;
+        }
         SetMember(channel, existing is null
-            ? MemberFromPrefix(nickname, message.Prefix)
+            ? MemberFromPrefix(nickname, message.Prefix) with { Account = account }
             : existing with
             {
                 Nickname = nickname,
                 Username = message.Prefix?.User ?? existing.Username,
-                Host = message.Prefix?.Host ?? existing.Host
+                Host = message.Prefix?.Host ?? existing.Host,
+                Account = account ?? existing.Account
             });
         events.Add(new IrcJoinEvent(message, channelName, nickname));
     }
@@ -371,6 +377,16 @@ internal sealed class SessionStateStore
         if (string.IsNullOrEmpty(target))
         {
             return;
+        }
+
+        if (IsChannelTarget(target, features.ChannelTypes)
+            && message.Prefix?.Name is { } sender
+            && message.TagValues.TryGetValue("account", out var account)
+            && !string.Equals(account, "*", StringComparison.Ordinal)
+            && _channels.TryGetValue(ChannelKey(target), out var channel)
+            && FindMemberKey(channel, sender) is { } memberKey)
+        {
+            channel.Members[memberKey] = channel.Members[memberKey] with { Account = account };
         }
 
         if (TryParseCtcp(text, out var ctcpCommand, out var ctcpArguments))

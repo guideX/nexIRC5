@@ -42,7 +42,7 @@ public sealed class DemoScenario
             Nickname = "nexAlpha",
             Username = "nexAlpha",
             RealName = "nexIRC 5 deterministic demo",
-            AutoJoinChannels = ["#alpha", "#lounge"]
+            AutoJoinChannels = ["#general", "#alpha", "#lounge"]
         };
         var betaProfile = alphaProfile with
         {
@@ -50,12 +50,12 @@ public sealed class DemoScenario
             DisplayName = "BetaNet",
             Host = _beta.Endpoint.Host,
             Nickname = "nexBeta",
-            AutoJoinChannels = ["#lounge"]
+            AutoJoinChannels = ["#general", "#lounge"]
         };
         sessions.Configuration?.Profiles.AddOrUpdate(alphaProfile);
         sessions.Configuration?.Profiles.AddOrUpdate(betaProfile);
-        var alpha = sessions.Add(Options("AlphaNet", _alpha.Endpoint, "nexAlpha", "#alpha", "#lounge") with { ProfileId = alphaProfile.Id });
-        var beta = sessions.Add(Options("BetaNet", _beta.Endpoint, "nexBeta", "#lounge") with { ProfileId = betaProfile.Id });
+        var alpha = sessions.Add(Options("AlphaNet", _alpha.Endpoint, "nexAlpha", "#general", "#alpha", "#lounge") with { ProfileId = alphaProfile.Id });
+        var beta = sessions.Add(Options("BetaNet", _beta.Endpoint, "nexBeta", "#general", "#lounge") with { ProfileId = betaProfile.Id });
         await sessions.ConnectAsync(alpha.Id).ConfigureAwait(true);
         await sessions.ConnectAsync(beta.Id).ConfigureAwait(true);
         await WaitForAsync(() => _alpha.ConnectCount == 1 && _beta.ConnectCount == 1).ConfigureAwait(true);
@@ -63,8 +63,13 @@ public sealed class DemoScenario
         Register(_alpha, "alpha.server", "nexAlpha", "AlphaNet", "(qaohv)~&@%+");
         Register(_beta, "beta.server", "nexBeta", "BetaNet", "(ov)@+");
 
+        _alpha.EnqueueInboundLine(":nexAlpha!demo@alpha JOIN #general");
         _alpha.EnqueueInboundLine(":nexAlpha!demo@alpha JOIN #alpha");
         _alpha.EnqueueInboundLine(":nexAlpha!demo@alpha JOIN #lounge");
+        _alpha.EnqueueInboundLine(":alpha.server 353 nexAlpha = #general :~nexAlpha @Mira +Alex Rook");
+        _alpha.EnqueueInboundLine(":alpha.server 352 nexAlpha #general alex alpha.example alpha.server Alex H :0 Alex Alpha participant");
+        _alpha.EnqueueInboundLine(":alpha.server 366 nexAlpha #general :End of names");
+        _alpha.EnqueueInboundLine(":alpha.server 332 nexAlpha #general :The participant action showcase");
         _alpha.EnqueueInboundLine(":alpha.server 353 nexAlpha = #alpha :~nexAlpha @Mira +Rook");
         _alpha.EnqueueInboundLine(":alpha.server 366 nexAlpha #alpha :End of names");
         _alpha.EnqueueInboundLine(":alpha.server 332 nexAlpha #alpha :A calm place for testing the nexIRC shell");
@@ -89,7 +94,12 @@ public sealed class DemoScenario
         _alpha.EnqueueInboundLine(":alpha.server 322 nexAlpha #random 0 :");
         _alpha.EnqueueInboundLine(":alpha.server 323 nexAlpha :End of LIST");
 
+        _beta.EnqueueInboundLine(":nexBeta!demo@beta JOIN #general");
         _beta.EnqueueInboundLine(":nexBeta!demo@beta JOIN #lounge");
+        _beta.EnqueueInboundLine(":beta.server 353 nexBeta = #general :@nexBeta Alex +Mira");
+        _beta.EnqueueInboundLine(":beta.server 352 nexBeta #general alex beta.example beta.server Alex H :0 Alex Beta participant");
+        _beta.EnqueueInboundLine(":beta.server 366 nexBeta #general :End of names");
+        _beta.EnqueueInboundLine(":beta.server 332 nexBeta #general :The same #general name on another network");
         _beta.EnqueueInboundLine(":beta.server 353 nexBeta = #lounge :@nexBeta +Mira");
         _beta.EnqueueInboundLine(":beta.server 366 nexBeta #lounge :End of names");
         _beta.EnqueueInboundLine(":beta.server 332 nexBeta #lounge :Beta network topic");
@@ -99,8 +109,8 @@ public sealed class DemoScenario
 
         await WaitForAsync(() => alpha.State == NetworkDisplayState.Registered
             && beta.State == NetworkDisplayState.Registered
-            && alpha.Channels.Any(channel => channel.Channel == "#alpha")
-            && beta.Channels.Any(channel => channel.Channel == "#lounge")).ConfigureAwait(true);
+            && alpha.Channels.Any(channel => channel.Channel == "#general" && channel.Members.Any(member => member.Nickname == "Alex"))
+            && beta.Channels.Any(channel => channel.Channel == "#general" && channel.Members.Any(member => member.Nickname == "Alex"))).ConfigureAwait(true);
 
         sessions.Configuration?.AddOrUpdateAlias(new AliasDefinition { Name = "j", Expansion = "/join $1", Description = "Join a channel quickly." });
         sessions.Configuration?.AddOrUpdateAlias(new AliasDefinition { Name = "w", Expansion = "/whois $1", Description = "Open WHOIS quickly." });
@@ -125,6 +135,19 @@ public sealed class DemoScenario
             throw new InvalidOperationException("The deterministic demo alias completion did not return a result.");
         }
         var alphaChannel = alpha.Channels.First(channel => channel.Channel == "#alpha");
+        var participantChannel = alpha.Channels.First(channel => channel.Channel == "#general");
+        var participant = participantChannel.Members.First(member => member.Nickname == "Alex");
+        var syntheticWhois = await viewModel.ParticipantActions.SendWhoisAsync(
+            viewModel.CreateParticipantContext(alpha, participantChannel, participant)).ConfigureAwait(true);
+        _alpha.EnqueueInboundLine(":alpha.server 311 nexAlpha Alex alex alpha.example * :Alex Alpha demo participant");
+        _alpha.EnqueueInboundLine(":alpha.server 312 nexAlpha Alex alpha.server :AlphaNet synthetic WHOIS");
+        _alpha.EnqueueInboundLine(":alpha.server 313 nexAlpha Alex :is an IRC operator");
+        _alpha.EnqueueInboundLine(":alpha.server 317 nexAlpha Alex 12 1735689600 :idle and signon");
+        _alpha.EnqueueInboundLine(":alpha.server 319 nexAlpha Alex :@#general +#alpha");
+        _alpha.EnqueueInboundLine(":alpha.server 330 nexAlpha Alex alex-account :is logged in as");
+        _alpha.EnqueueInboundLine(":alpha.server 671 nexAlpha Alex :is using a secure connection");
+        _alpha.EnqueueInboundLine(":alpha.server 318 nexAlpha Alex :End of WHOIS list");
+        await WaitForAsync(() => syntheticWhois.View is WhoisView whois && whois.IsCompleted).ConfigureAwait(true);
         await dispatcher.DispatchAsync(alpha, alphaChannel, "/j #lounge").ConfigureAwait(true);
         await dispatcher.DispatchAsync(alpha, alphaChannel, "Local AlphaNet message").ConfigureAwait(true);
         await dispatcher.DispatchAsync(alpha, alphaChannel, "/me demonstrates a local action").ConfigureAwait(true);

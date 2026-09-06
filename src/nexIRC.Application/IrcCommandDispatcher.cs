@@ -21,7 +21,7 @@ public sealed class IrcCommandDispatcher
     [
         "server", "join", "rejoin", "part", "msg", "query", "q", "nick", "me", "quit",
         "disconnect", "whois", "list", "notice", "ctcp", "op", "deop", "voice",
-        "devoice", "kick", "mode", "topic", "clear", "close", "raw", "quote", "help"
+        "devoice", "kick", "ban", "unban", "invite", "mode", "topic", "clear", "close", "raw", "quote", "help"
     ];
 
     private readonly NetworkSessionManager _sessions;
@@ -147,6 +147,12 @@ public sealed class IrcCommandDispatcher
                     return await MemberModeAsync(network, activeView, parts, 'v', adding: false, cancellationToken).ConfigureAwait(false);
                 case "KICK":
                     return await KickAsync(network, activeView, arguments, parts, cancellationToken).ConfigureAwait(false);
+                case "BAN":
+                    return await BanAsync(network, activeView, parts, cancellationToken).ConfigureAwait(false);
+                case "UNBAN":
+                    return await UnbanAsync(network, activeView, parts, cancellationToken).ConfigureAwait(false);
+                case "INVITE":
+                    return await InviteAsync(network, activeView, parts, cancellationToken).ConfigureAwait(false);
                 case "MODE":
                     return await ModeAsync(network, activeView, parts, cancellationToken).ConfigureAwait(false);
                 case "TOPIC":
@@ -365,9 +371,10 @@ public sealed class IrcCommandDispatcher
             return CommandDispatchResult.Failure("Usage: /notice <target> <message>", network.StatusView);
         }
 
+        var message = IrcParticipantCommandBuilder.BuildNotice(CommandBuilder(network), target, text);
+        await network.Session.SendCommandAsync(message, cancellationToken).ConfigureAwait(false);
         var view = _sessions.EnsureQuery(network.Id, target);
         _sessions.ActivateView(view.Id);
-        await network.Session.SendCommandAsync("NOTICE", [target], text, cancellationToken).ConfigureAwait(false);
         _sessions.AppendLocal(view, IrcEventPresentation.CreateLocalMessage(network.Session.Snapshot.Nickname, text, OutgoingMessageKind.Notice));
         return CommandDispatchResult.Success($"Notice sent to {target}.", view);
     }
@@ -390,8 +397,9 @@ public sealed class IrcCommandDispatcher
         var data = parts.Length > 1 ? string.Join(' ', parts.Skip(1)) : string.Empty;
         var view = _sessions.EnsureQuery(network.Id, target);
         _sessions.ActivateView(view.Id);
+        var message = IrcParticipantCommandBuilder.BuildCtcp(CommandBuilder(network), target, command, data);
+        await network.Session.SendCommandAsync(message, cancellationToken).ConfigureAwait(false);
         var ctcp = command + (data.Length == 0 ? string.Empty : $" {data}");
-        await network.Session.SendCommandAsync("PRIVMSG", [target], $"\u0001{ctcp}\u0001", cancellationToken).ConfigureAwait(false);
         _sessions.AppendLocal(view, IrcEventPresentation.CreateLocalCtcp(command, data));
         return CommandDispatchResult.Success($"CTCP {command} sent to {target}.", view);
     }
@@ -410,15 +418,14 @@ public sealed class IrcCommandDispatcher
         }
 
         var grammar = network.Snapshot.Features.Prefix;
-        var mode = fallbackMode == 'v'
-            ? grammar is { Modes.Count: > 0 } ? grammar.Modes[^1] : fallbackMode
-            : grammar?.Modes.FirstOrDefault(candidate => candidate == 'o') ?? (grammar is { Modes.Count: > 1 } ? grammar.Modes.Take(grammar.Modes.Count - 1).FirstOrDefault() : default);
+        var mode = grammar?.Modes.Contains(fallbackMode) == true ? fallbackMode : default;
         if (mode == default)
         {
             return CommandDispatchResult.Failure("The server did not advertise a suitable member mode.", channel);
         }
 
-        await network.Session.SendCommandAsync("MODE", [channel.Channel, $"{(adding ? '+' : '-')}{mode}", parts[0]], cancellationToken: cancellationToken).ConfigureAwait(false);
+        var message = IrcParticipantCommandBuilder.BuildMemberMode(CommandBuilder(network), channel.Channel, mode, adding, parts[0]);
+        await network.Session.SendCommandAsync(message, cancellationToken).ConfigureAwait(false);
         return CommandDispatchResult.Success($"Member mode {(adding ? "added" : "removed")} for {parts[0]}.", channel);
     }
 
@@ -430,8 +437,60 @@ public sealed class IrcCommandDispatcher
         }
 
         var reason = arguments.Length > parts[0].Length ? arguments[parts[0].Length..].Trim() : string.Empty;
-        await network.Session.SendCommandAsync("KICK", [channel.Channel, parts[0]], string.IsNullOrWhiteSpace(reason) ? null : reason, cancellationToken).ConfigureAwait(false);
+        var message = IrcParticipantCommandBuilder.BuildKick(CommandBuilder(network), channel.Channel, parts[0], reason);
+        await network.Session.SendCommandAsync(message, cancellationToken).ConfigureAwait(false);
         return CommandDispatchResult.Success($"Kick requested for {parts[0]}.", channel);
+    }
+
+    private async ValueTask<CommandDispatchResult> BanAsync(NetworkWorkspace network, WorkspaceView activeView, string[] parts, CancellationToken cancellationToken)
+    {
+        if (activeView is not ChannelView channel || parts.Length == 0)
+        {
+            return CommandDispatchResult.Failure("Usage: /ban <mask>", activeView);
+        }
+
+        var mask = parts[0];
+        if (!ParticipantActionService.IsValidBanMask(mask))
+        {
+            return CommandDispatchResult.Failure("Enter a non-empty ban mask without whitespace or control characters.", channel);
+        }
+
+        var mode = network.Snapshot.Features.ChannelModes?.ListModes.FirstOrDefault() ?? 'b';
+        var message = IrcParticipantCommandBuilder.BuildBan(CommandBuilder(network), channel.Channel, mask, mode);
+        await network.Session.SendCommandAsync(message, cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success($"Ban requested for {mask}.", channel);
+    }
+
+    private async ValueTask<CommandDispatchResult> UnbanAsync(NetworkWorkspace network, WorkspaceView activeView, string[] parts, CancellationToken cancellationToken)
+    {
+        if (activeView is not ChannelView channel || parts.Length == 0)
+        {
+            return CommandDispatchResult.Failure("Usage: /unban <mask>", activeView);
+        }
+
+        var mask = parts[0];
+        if (!ParticipantActionService.IsValidBanMask(mask))
+        {
+            return CommandDispatchResult.Failure("Enter a non-empty ban mask without whitespace or control characters.", channel);
+        }
+
+        var mode = network.Snapshot.Features.ChannelModes?.ListModes.FirstOrDefault() ?? 'b';
+        var message = IrcParticipantCommandBuilder.BuildUnban(CommandBuilder(network), channel.Channel, mask, mode);
+        await network.Session.SendCommandAsync(message, cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success($"Unban requested for {mask}.", channel);
+    }
+
+    private async ValueTask<CommandDispatchResult> InviteAsync(NetworkWorkspace network, WorkspaceView activeView, string[] parts, CancellationToken cancellationToken)
+    {
+        if (activeView is not ChannelView channel || parts.Length == 0 || !channel.IsJoined)
+        {
+            return CommandDispatchResult.Failure("Usage: /invite <nickname> from a joined channel.", activeView);
+        }
+
+        var targetChannel = parts.Length > 1 ? parts[1] : channel.Channel;
+        var message = IrcParticipantCommandBuilder.BuildInvite(CommandBuilder(network), parts[0], targetChannel);
+        await network.Session.SendCommandAsync(message, cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success($"Invite requested for {parts[0]} to {targetChannel}.", channel);
     }
 
     private async ValueTask<CommandDispatchResult> ModeAsync(NetworkWorkspace network, WorkspaceView activeView, string[] parts, CancellationToken cancellationToken)
@@ -472,6 +531,12 @@ public sealed class IrcCommandDispatcher
         var target = arguments[..separator];
         var text = arguments[(separator + 1)..].Trim();
         return string.IsNullOrWhiteSpace(text) ? (null, null) : (target, text);
+    }
+
+    private static IrcCommandBuilder CommandBuilder(NetworkWorkspace network)
+    {
+        var maximum = Math.Min(network.Session.MaximumOutboundLineBytes, network.Snapshot.Features.LineLength);
+        return new IrcCommandBuilder(Math.Max(3, maximum));
     }
 
     private CommandDispatchResult Help(NetworkWorkspace network, WorkspaceView activeView)

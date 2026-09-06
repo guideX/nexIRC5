@@ -481,6 +481,7 @@ public sealed class ChannelMemberView : ObservableObject
     private string _prefixText = string.Empty;
     private string? _username;
     private string? _host;
+    private string? _account;
     private IReadOnlySet<char> _prefixModes = new HashSet<char>();
 
     internal ChannelMemberView(string nickname)
@@ -502,6 +503,14 @@ public sealed class ChannelMemberView : ObservableObject
         private set => SetProperty(ref _host, value);
     }
 
+    public string? Account
+    {
+        get => _account;
+        private set => SetProperty(ref _account, value);
+    }
+
+    public string? Hostmask => Username is null || Host is null ? null : $"*!{Username}@{Host}";
+
     public string PrefixText
     {
         get => _prefixText;
@@ -516,6 +525,7 @@ public sealed class ChannelMemberView : ObservableObject
     {
         Username = snapshot.Username;
         Host = snapshot.Host;
+        Account = snapshot.Account;
         _prefixModes = new HashSet<char>(snapshot.PrefixModes);
         PrefixText = HighestPrefix(snapshot.PrefixModes, grammar);
         OnPropertyChanged(nameof(DisplayText));
@@ -617,6 +627,8 @@ public sealed class ChannelView : WorkspaceView
     /// the final (normally voice) rank as moderation-capable.
     /// </summary>
     public bool CanModerate { get; private set; }
+
+    public bool IsConnected => LifecycleState is ConversationLifecycleState.Joined or ConversationLifecycleState.Active;
 
     public ObservableCollection<ChannelMemberView> Members { get; } = [];
 

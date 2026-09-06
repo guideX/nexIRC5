@@ -48,6 +48,7 @@ public static class ConfigurationLimits
     public const int MaximumDraftLength = 4096;
     public const int MaximumLogRecordBytes = 32_768;
     public const int MaximumNotificationCoalescingEntries = 256;
+    public const int MaximumIgnoreRules = 256;
 }
 
 public static class ConfigurationSchema
@@ -207,6 +208,8 @@ public sealed record NexIrcConfiguration
     public List<RecentDestination> RecentDestinations { get; init; } = [];
 
     public List<AliasDefinition> Aliases { get; init; } = [];
+
+    public List<IgnoreRule> IgnoreRules { get; init; } = [];
 }
 
 public sealed record ConfigurationLoadResult(
@@ -309,6 +312,63 @@ public sealed class ConfigurationService
     public IReadOnlyList<RecentDestination> RecentDestinations => Current.RecentDestinations;
 
     public IReadOnlyList<AliasDefinition> Aliases => Current.Aliases;
+
+    public IReadOnlyList<IgnoreRule> IgnoreRules => Current.IgnoreRules;
+
+    public bool AddIgnore(IgnoreRule rule)
+    {
+        var normalized = IgnoreRuleValidator.Normalize(rule);
+        if (normalized is null)
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            var rules = _configuration.IgnoreRules.ToList();
+            if (rules.Any(existing => SameIgnore(existing, normalized)))
+            {
+                return true;
+            }
+
+            if (rules.Count >= ConfigurationLimits.MaximumIgnoreRules)
+            {
+                return false;
+            }
+
+            rules.Add(normalized);
+            _configuration = _configuration with { IgnoreRules = rules };
+            return true;
+        }
+    }
+
+    public bool RemoveIgnore(IgnoreRule rule)
+    {
+        ArgumentNullException.ThrowIfNull(rule);
+        lock (_gate)
+        {
+            var rules = _configuration.IgnoreRules.ToList();
+            var index = rules.FindIndex(existing => SameIgnore(existing, rule));
+            if (index < 0)
+            {
+                return false;
+            }
+
+            rules.RemoveAt(index);
+            _configuration = _configuration with { IgnoreRules = rules };
+            return true;
+        }
+    }
+
+    public bool IsIgnored(IgnoreIdentity identity, IrcCaseMapping mapping = IrcCaseMapping.Rfc1459) =>
+        IgnoreRules.Any(rule => IgnoreMatcher.Matches(rule, identity, mapping));
+
+    private static bool SameIgnore(IgnoreRule left, IgnoreRule right) =>
+        left.NetworkProfileId == right.NetworkProfileId
+        && string.Equals(left.NetworkName, right.NetworkName, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(left.Nickname, right.Nickname, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(left.Hostmask, right.Hostmask, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(left.Account, right.Account, StringComparison.OrdinalIgnoreCase);
 
     public bool AddOrUpdateFavorite(FavoriteDestination favorite)
     {
@@ -899,6 +959,14 @@ public static class ConfigurationValidator
             .Select(group => group.First())
             .Take(ConfigurationLimits.MaximumAliases)
             .ToList();
+        var ignores = (configuration.IgnoreRules ?? [])
+            .Select(IgnoreRuleValidator.Normalize)
+            .Where(static value => value is not null)
+            .Select(static value => value!)
+            .GroupBy(rule => $"{rule.NetworkProfileId}|{rule.NetworkName}|{rule.Nickname}|{rule.Hostmask}|{rule.Account}", StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .Take(ConfigurationLimits.MaximumIgnoreRules)
+            .ToList();
         return new NexIrcConfiguration
         {
             SchemaVersion = ConfigurationSchema.CurrentVersion,
@@ -913,7 +981,8 @@ public static class ConfigurationValidator
             Favorites = favorites,
             FavoriteGroups = favoriteGroups,
             RecentDestinations = recents,
-            Aliases = aliases
+            Aliases = aliases,
+            IgnoreRules = ignores
         };
     }
 

@@ -158,7 +158,7 @@
                     <Border Grid.Column="1" Width="205" Margin="10,0,0,0" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="1" Visibility="{Binding DataContext.IsMemberListVisible, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource BooleanToVisibility}}">
                         <DockPanel>
                             <TextBlock DockPanel.Dock="Top" Text="Members" Style="{StaticResource PaneHeader}" />
-                            <ListBox ItemsSource="{Binding Members}" DisplayMemberPath="DisplayText" BorderThickness="0" Padding="8,0" />
+                            <ListBox ItemsSource="{Binding Members}" DisplayMemberPath="DisplayText" BorderThickness="0" Padding="8,0" MouseDoubleClick="OnMemberListDoubleClick" ToolTip="Double-click to open a private conversation. Right-click for participant actions." />
                         </DockPanel>
                     </Border>
                 </Grid>
@@ -198,6 +198,13 @@
                 <StackPanel>
                     <TextBlock Text="{Binding Result.Nickname}" FontSize="20" FontWeight="SemiBold" Foreground="#172033" />
                     <TextBlock Text="{Binding StateText}" Foreground="#2563EB" Margin="0,3,0,12" />
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+                        <Button Content="Open Query" Click="OnWhoisOpenQueryClick" Padding="12,4" Margin="0,0,6,0" />
+                        <Button Content="Copy Nickname" Click="OnWhoisCopyNicknameClick" Padding="12,4" Margin="0,0,6,0" />
+                        <Button Content="Copy Hostmask" Click="OnWhoisCopyHostmaskClick" Padding="12,4" Margin="0,0,6,0" />
+                        <Button Content="Copy Account" Click="OnWhoisCopyAccountClick" Padding="12,4" Margin="0,0,6,0" />
+                        <Button Content="Copy Formatted" Click="OnWhoisCopyFormattedClick" Padding="12,4" />
+                    </StackPanel>
                     <Grid>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="145" />

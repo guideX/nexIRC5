@@ -265,7 +265,8 @@ public sealed record IrcChannelMemberSnapshot(
     string Nickname,
     string? Username,
     string? Host,
-    IReadOnlySet<char> PrefixModes);
+    IReadOnlySet<char> PrefixModes,
+    string? Account = null);
 
 public sealed record IrcChannelSnapshot(
     string Name,
