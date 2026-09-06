@@ -225,6 +225,8 @@ public abstract class ObservableObject : INotifyPropertyChanged
 
 public abstract class WorkspaceView : ObservableObject
 {
+    public const int MaximumEntries = 500;
+
     private readonly object _entriesGate = new();
     private WorkspaceActivity _activity;
     private int _unreadCount;
@@ -236,13 +238,14 @@ public abstract class WorkspaceView : ObservableObject
     private DateTimeOffset _lastActivity;
     private long _lastActivitySequence;
     private string? _historyContextMatch;
+    private string _title;
 
     protected WorkspaceView(Guid networkId, Guid id, WorkspaceViewKind kind, string title)
     {
         NetworkId = networkId;
         Id = id;
         Kind = kind;
-        Title = title;
+        _title = title;
     }
 
     public Guid NetworkId { get; }
@@ -251,7 +254,16 @@ public abstract class WorkspaceView : ObservableObject
 
     public WorkspaceViewKind Kind { get; }
 
-    public string Title { get; }
+    public string Title => _title;
+
+    protected void SetTitle(string title)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(title);
+        if (SetProperty(ref _title, title))
+        {
+            OnPropertyChanged(nameof(DisplayLabel));
+        }
+    }
 
     public string DisplayLabel => Activity switch
     {
@@ -369,6 +381,8 @@ public abstract class WorkspaceView : ObservableObject
         }
     }
 
+    public int EntryCount => Entries.Count;
+
     internal void Append(
         TranscriptEntry entry,
         bool markActivity = true,
@@ -383,7 +397,7 @@ public abstract class WorkspaceView : ObservableObject
         lock (_entriesGate)
         {
             Entries.Add(entry);
-            while (Entries.Count > 500)
+            while (Entries.Count > MaximumEntries)
             {
                 Entries.RemoveAt(0);
             }
@@ -621,6 +635,16 @@ public sealed class ChannelMemberView : ObservableObject
         OnPropertyChanged(nameof(DisplayText));
     }
 
+    internal bool IsEquivalent(IrcChannelMemberSnapshot snapshot, IrcPrefixGrammar? grammar)
+    {
+        var prefixText = HighestPrefix(snapshot.PrefixModes, grammar);
+        return string.Equals(Username, snapshot.Username, StringComparison.Ordinal)
+            && string.Equals(Host, snapshot.Host, StringComparison.Ordinal)
+            && string.Equals(Account, snapshot.Account, StringComparison.Ordinal)
+            && string.Equals(PrefixText, prefixText, StringComparison.Ordinal)
+            && PrefixModes.SetEquals(snapshot.PrefixModes);
+    }
+
     internal static string HighestPrefix(IEnumerable<char> modes, IrcPrefixGrammar? grammar)
     {
         var modeSet = modes.ToHashSet();
@@ -842,12 +866,38 @@ public sealed class ChannelView : WorkspaceView
                 .ToArray();
             lock (_membersGate)
             {
-                Members.Clear();
-                foreach (var member in projected)
+                var rebuild = Members.Count != projected.Length;
+                if (!rebuild)
                 {
-                    var view = new ChannelMemberView(member.Nickname);
-                    view.Apply(member, grammar);
-                    Members.Add(view);
+                    for (var index = 0; index < projected.Length; index++)
+                    {
+                        if (!string.Equals(Members[index].Nickname, projected[index].Nickname, StringComparison.Ordinal))
+                        {
+                            rebuild = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (rebuild)
+                {
+                    Members.Clear();
+                    foreach (var member in projected)
+                    {
+                        var view = new ChannelMemberView(member.Nickname);
+                        view.Apply(member, grammar);
+                        Members.Add(view);
+                    }
+                }
+                else
+                {
+                    for (var index = 0; index < projected.Length; index++)
+                    {
+                        if (!Members[index].IsEquivalent(projected[index], grammar))
+                        {
+                            Members[index].Apply(projected[index], grammar);
+                        }
+                    }
                 }
             }
 
@@ -924,13 +974,60 @@ public sealed class ChannelView : WorkspaceView
 
 public sealed class QueryView : WorkspaceView
 {
+    private string _nickname;
+
     internal QueryView(Guid networkId, Guid id, string nickname)
         : base(networkId, id, WorkspaceViewKind.Query, nickname)
     {
-        Nickname = nickname;
+        _nickname = nickname;
+        HistoryConversationKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.PrivateConversation, nickname);
     }
 
-    public string Nickname { get; }
+    public string Nickname => _nickname;
+
+    /// <summary>
+    /// The runtime logical identity is the view id. This key keeps JSONL
+    /// history on the original, network-scoped conversation path while the
+    /// visible peer nickname changes during an active session.
+    /// </summary>
+    public string HistoryConversationKey { get; }
+
+    public int IdentityConnectionGeneration { get; private set; }
+
+    public bool IsIdentityBoundToCurrentSession { get; private set; }
+
+    internal bool TryApplyNicknameChange(string previousNickname, string newNickname, IrcCaseMapping mapping, int connectionGeneration)
+    {
+        if (!IrcCaseMappingComparer.Equals(Nickname, previousNickname, mapping))
+        {
+            return false;
+        }
+
+        if (IrcCaseMappingComparer.Equals(Nickname, newNickname, mapping))
+        {
+            return true;
+        }
+
+        _nickname = newNickname;
+        SetTitle(newNickname);
+        IdentityConnectionGeneration = connectionGeneration;
+        IsIdentityBoundToCurrentSession = true;
+        OnPropertyChanged(nameof(Nickname));
+        OnPropertyChanged(nameof(HistoryConversationKey));
+        return true;
+    }
+
+    internal void MarkIdentityBoundary(int connectionGeneration)
+    {
+        IdentityConnectionGeneration = connectionGeneration;
+        IsIdentityBoundToCurrentSession = false;
+    }
+
+    internal void MarkCurrentSessionIdentity(int connectionGeneration)
+    {
+        IdentityConnectionGeneration = connectionGeneration;
+        IsIdentityBoundToCurrentSession = true;
+    }
 
     internal void ApplyConnectionState(bool connected)
     {
@@ -979,6 +1076,7 @@ public sealed class NetworkWorkspace : ObservableObject
         foreach (var query in Queries)
         {
             query.ApplyConnectionState(connected: false);
+            query.MarkIdentityBoundary(session.Snapshot.ConnectionGeneration);
         }
     }
 
@@ -1080,14 +1178,13 @@ public sealed class NetworkWorkspace : ObservableObject
             }
         }
 
-        foreach (var query in snapshot.Queries)
-        {
-            EnsureQuery(query.Nickname, reopen: false).ApplyConnectionState(networkAvailable);
-        }
-
         foreach (var query in Queries)
         {
             query.ApplyConnectionState(networkAvailable);
+            if (query.IdentityConnectionGeneration != snapshot.ConnectionGeneration)
+            {
+                query.MarkIdentityBoundary(snapshot.ConnectionGeneration);
+            }
         }
     }
 
@@ -1111,10 +1208,12 @@ public sealed class NetworkWorkspace : ObservableObject
         return view;
     }
 
-    internal QueryView EnsureQuery(string nickname, bool reopen = true)
+    internal QueryView EnsureQuery(string nickname, bool reopen = true, bool includeUnboundIdentity = true)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
-        var existing = Queries.FirstOrDefault(item => IrcCaseMappingComparer.Equals(item.Nickname, nickname, _snapshot.Features.CaseMapping));
+        var existing = Queries.FirstOrDefault(item =>
+            (includeUnboundIdentity || item.IsIdentityBoundToCurrentSession)
+            && IrcCaseMappingComparer.Equals(item.Nickname, nickname, _snapshot.Features.CaseMapping));
         if (existing is not null)
         {
             if (reopen)
@@ -1126,11 +1225,21 @@ public sealed class NetworkWorkspace : ObservableObject
         }
 
         var view = new QueryView(Id, Guid.NewGuid(), nickname);
+        view.MarkCurrentSessionIdentity(_snapshot.ConnectionGeneration);
         view.ApplyConnectionState(_snapshot.State is not (ServerSessionState.Disconnected or ServerSessionState.Failed or ServerSessionState.ReconnectWaiting));
         Queries.Add(view);
         InsertView(view);
         return view;
     }
+
+    internal QueryView EnsureIncomingQuery(string nickname)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
+        return EnsureQuery(nickname, reopen: true, includeUnboundIdentity: false);
+    }
+
+    internal QueryView? FindQuery(string nickname) =>
+        Queries.FirstOrDefault(item => IrcCaseMappingComparer.Equals(item.Nickname, nickname, _snapshot.Features.CaseMapping));
 
     internal WhoisView EnsureWhois(string nickname, bool beginRequest = false, bool forceNew = false)
     {

@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Windows;
 using nexIRC.Application;
+using nexIRC.Core.State;
 
 namespace nexIRC.Desktop;
 
@@ -252,6 +253,7 @@ public partial class LogViewerWindow : Window
             ScopeId = request.ScopeId,
             ConversationKind = request.ConversationKind,
             ConversationName = request.ConversationName,
+            ConversationKey = request.ConversationKey,
             From = request.Around is null ? null : request.Around.Value - request.AroundWindow,
             To = request.Around is null ? null : request.Around.Value + request.AroundWindow
         }, dialog.FileName, format, _lifetimeCancellation.Token);
@@ -338,6 +340,9 @@ public partial class LogViewerWindow : Window
             NetworkId = network?.Id,
             ConversationKind = kind,
             ConversationName = conversation,
+            ConversationKey = kind == LogConversationKind.PrivateConversation
+                ? network?.Queries.FirstOrDefault(query => IrcCaseMappingComparer.Equals(query.Nickname, conversation, network.Snapshot.Features.CaseMapping))?.HistoryConversationKey
+                : null,
             Sender = string.IsNullOrWhiteSpace(SenderBox.Text) ? null : SenderBox.Text.Trim(),
             MessageKind = (MessageKindBox.SelectedItem as LogMessageKindOption)?.Kind,
             From = from,
@@ -361,7 +366,9 @@ public partial class LogViewerWindow : Window
         {
             ScopeId = network.ProfileId ?? network.Id,
             ConversationKind = network.Snapshot.Features.ChannelTypes.Contains(conversation[0]) ? LogConversationKind.Channel : LogConversationKind.PrivateConversation,
-            ConversationName = conversation
+            ConversationName = conversation,
+            ConversationKey = network.Queries.FirstOrDefault(query =>
+                    IrcCaseMappingComparer.Equals(query.Nickname, conversation, network.Snapshot.Features.CaseMapping))?.HistoryConversationKey
         };
         return true;
     }

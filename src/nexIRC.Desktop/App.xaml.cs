@@ -28,7 +28,7 @@ public partial class App : System.Windows.Application
 
         if (smokeScenario is not null && !UiSmokeHarness.IsKnownScenario(smokeScenario))
         {
-            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": unknown scenario. Expected participant, moderation, channel-properties, multi-network, lifecycle, read-state, or reconnect.");
+            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": unknown scenario. Expected participant, moderation, channel-properties, multi-network, lifecycle, read-state, reconnect, burst, or query-nick.");
             Environment.ExitCode = 2;
             Shutdown(2);
             return;

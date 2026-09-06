@@ -190,4 +190,37 @@ public sealed class ConversationNavigationHistory
             _cursor = Math.Min(_cursor, _entries.Count - 1);
         }
     }
+
+    public void Rename(
+        Guid networkId,
+        WorkspaceViewKind kind,
+        string oldName,
+        string newName,
+        nexIRC.Core.State.IrcCaseMapping mapping)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(oldName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(newName);
+        for (var index = 0; index < _entries.Count; index++)
+        {
+            var entry = _entries[index];
+            if (entry.NetworkId == networkId
+                && entry.Kind == kind
+                && nexIRC.Core.State.IrcCaseMappingComparer.Equals(entry.Name, oldName, mapping))
+            {
+                _entries[index] = entry with { Name = newName };
+            }
+        }
+
+        for (var index = _entries.Count - 1; index > 0; index--)
+        {
+            if (_entries.Take(index).Any(entry => entry.SameAs(_entries[index])))
+            {
+                _entries.RemoveAt(index);
+                if (_cursor >= index)
+                {
+                    _cursor = Math.Max(0, _cursor - 1);
+                }
+            }
+        }
+    }
 }

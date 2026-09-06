@@ -60,6 +60,13 @@ public sealed record ConversationLogQuery
     public Guid? ProfileId { get; init; }
     public LogConversationKind? ConversationKind { get; init; }
     public string? ConversationName { get; init; }
+
+    /// <summary>
+    /// Optional stable storage key for a mutable logical conversation. When
+    /// present, it takes precedence over nickname equality for current-query
+    /// navigation and search.
+    /// </summary>
+    public string? ConversationKey { get; init; }
     public string? Sender { get; init; }
     public LogMessageKind? MessageKind { get; init; }
     public DateTimeOffset? From { get; init; }
@@ -163,6 +170,7 @@ public sealed record HistoryPageRequest
     public required Guid ScopeId { get; init; }
     public required LogConversationKind ConversationKind { get; init; }
     public required string ConversationName { get; init; }
+    public string? ConversationKey { get; init; }
     public int PageSize { get; init; } = ConfigurationLimits.MaximumHistoryPageSize;
     public DateTimeOffset? Before { get; init; }
     public DateTimeOffset? After { get; init; }
@@ -196,6 +204,7 @@ public sealed record HistoryExportRequest
     public required Guid ScopeId { get; init; }
     public required LogConversationKind ConversationKind { get; init; }
     public required string ConversationName { get; init; }
+    public string? ConversationKey { get; init; }
     public DateTimeOffset? From { get; init; }
     public DateTimeOffset? To { get; init; }
     public int MaximumRecords { get; init; } = ConfigurationLimits.MaximumHistoryExportRecords;
@@ -250,6 +259,9 @@ public sealed class ConversationLoggingService
             _ => LogConversationKind.Status
         };
         var name = view is ChannelView channel ? channel.Channel : view is QueryView query ? query.Nickname : "status";
+        var conversationKey = view is QueryView queryView
+            ? queryView.HistoryConversationKey
+            : BuildConversationKey(kind, name);
         var text = RedactConversationText(entry.Text);
         var record = new ConversationLogRecord
         {
@@ -259,7 +271,7 @@ public sealed class ConversationLoggingService
             ProfileId = profileId,
             ConversationKind = kind,
             ConversationName = name,
-            ConversationKey = BuildConversationKey(kind, name),
+            ConversationKey = conversationKey,
             Sender = entry.Sender,
             MessageKind = ToLogKind(entry.Kind),
             Direction = entry.IsOutgoing ? LogDirection.Outgoing : LogDirection.Incoming,
@@ -271,6 +283,11 @@ public sealed class ConversationLoggingService
 
     public static string BuildConversationKey(LogConversationKind kind, string name) =>
         $"{kind}:{IrcCaseMappingComparer.Fold(name, IrcCaseMapping.Rfc1459)}";
+
+    internal static string EffectiveConversationKey(ConversationLogRecord record) =>
+        string.IsNullOrWhiteSpace(record.ConversationKey)
+            ? BuildConversationKey(record.ConversationKind, record.ConversationName)
+            : record.ConversationKey;
 
     public static async ValueTask<ConversationHistoryRange> ExportAsync(
         IConversationLogStore store,
@@ -476,7 +493,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         ArgumentNullException.ThrowIfNull(request);
         await FlushAsync(cancellationToken).ConfigureAwait(false);
         var pageSize = Math.Clamp(request.PageSize, 1, ConfigurationLimits.MaximumHistoryPageSize);
-        var conversationKey = ConversationLoggingService.BuildConversationKey(request.ConversationKind, request.ConversationName);
+        var conversationKey = request.ConversationKey ?? ConversationLoggingService.BuildConversationKey(request.ConversationKind, request.ConversationName);
         var paths = GetConversationPaths(request.ScopeId, conversationKey);
         if (paths.Length == 0)
         {
@@ -539,7 +556,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         ArgumentNullException.ThrowIfNull(request);
         await FlushAsync(cancellationToken).ConfigureAwait(false);
         var maximum = Math.Clamp(request.MaximumRecords, 1, ConfigurationLimits.MaximumHistoryExportRecords);
-        var conversationKey = ConversationLoggingService.BuildConversationKey(request.ConversationKind, request.ConversationName);
+        var conversationKey = request.ConversationKey ?? ConversationLoggingService.BuildConversationKey(request.ConversationKind, request.ConversationName);
         var paths = GetConversationPaths(request.ScopeId, conversationKey);
         if (paths.Length == 0)
         {
@@ -593,7 +610,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         {
             await foreach (var record in ReadFileAsync(path, cancellationToken).ConfigureAwait(false))
             {
-                if (!IsConversationRecord(record, request.ScopeId, request.ConversationKind, request.ConversationName))
+                if (!IsConversationRecord(record, request.ScopeId, request.ConversationKind, request.ConversationName, request.ConversationKey))
                 {
                     continue;
                 }
@@ -643,7 +660,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             return new SegmentRangeRead(Array.Empty<ConversationLogRecord>(), false);
         }
 
-        var index = await GetHistoryIndexAsync(path, request.ScopeId, request.ConversationKind, request.ConversationName, cancellationToken).ConfigureAwait(false);
+        var index = await GetHistoryIndexAsync(path, request.ScopeId, request.ConversationKind, request.ConversationName, request.ConversationKey, cancellationToken).ConfigureAwait(false);
         if (index is not null)
         {
             var indexedEntries = index.Entries
@@ -656,6 +673,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                 request.ScopeId,
                 request.ConversationKind,
                 request.ConversationName,
+                request.ConversationKey,
                 cancellationToken).ConfigureAwait(false);
             if (indexedRecords is not null)
             {
@@ -669,7 +687,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         {
             await foreach (var record in ReadFileAsync(path, cancellationToken).ConfigureAwait(false))
             {
-                if (!IsConversationRecord(record, request.ScopeId, request.ConversationKind, request.ConversationName)
+                if (!IsConversationRecord(record, request.ScopeId, request.ConversationKind, request.ConversationName, request.ConversationKey)
                     || request.From is not null && record.Timestamp < request.From.Value
                     || request.To is not null && record.Timestamp > request.To.Value)
                 {
@@ -697,10 +715,18 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         ConversationLogRecord record,
         Guid scopeId,
         LogConversationKind conversationKind,
-        string conversationName) =>
+        string conversationName,
+        string? conversationKey = null) =>
         record.ScopeId == scopeId
         && record.ConversationKind == conversationKind
-        && IrcIdentity.Equals(record.ConversationName, conversationName, IrcCaseMapping.Rfc1459);
+        && (string.IsNullOrWhiteSpace(conversationKey)
+            ? IrcIdentity.Equals(record.ConversationName, conversationName, IrcCaseMapping.Rfc1459)
+            : string.Equals(EffectiveConversationKey(record), conversationKey, StringComparison.Ordinal));
+
+    internal static string EffectiveConversationKey(ConversationLogRecord record) =>
+        string.IsNullOrWhiteSpace(record.ConversationKey)
+            ? ConversationLoggingService.BuildConversationKey(record.ConversationKind, record.ConversationName)
+            : record.ConversationKey;
 
     public async ValueTask<IReadOnlyList<ConversationLogSearchResult>> SearchAsync(ConversationLogQuery query, CancellationToken cancellationToken = default)
     {
@@ -1347,7 +1373,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             && query.ConversationKind is LogConversationKind conversationKind
             && !string.IsNullOrWhiteSpace(query.ConversationName))
         {
-            return GetConversationPaths(conversationScope, ConversationLoggingService.BuildConversationKey(conversationKind, query.ConversationName));
+            return GetConversationPaths(conversationScope, query.ConversationKey ?? ConversationLoggingService.BuildConversationKey(conversationKind, query.ConversationName));
         }
 
         var knownScope = query.HistoryScopeId ?? query.ProfileId;
@@ -1425,11 +1451,14 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
 
     internal static bool Matches(ConversationLogRecord record, ConversationLogQuery query, string text)
     {
+        var conversationMatches = string.IsNullOrWhiteSpace(query.ConversationKey)
+            ? string.IsNullOrWhiteSpace(query.ConversationName) || IrcIdentity.Equals(record.ConversationName, query.ConversationName, IrcCaseMapping.Rfc1459)
+            : string.Equals(EffectiveConversationKey(record), query.ConversationKey, StringComparison.Ordinal);
         if (query.Scope == ConversationLogSearchScope.CurrentConversation
             && (query.NetworkId is null || string.IsNullOrWhiteSpace(query.ConversationName)
                 || record.NetworkId != query.NetworkId
                 || query.ConversationKind is not null && record.ConversationKind != query.ConversationKind
-                || !IrcIdentity.Equals(record.ConversationName, query.ConversationName, IrcCaseMapping.Rfc1459)))
+                || !conversationMatches))
         {
             return false;
         }
@@ -1444,7 +1473,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             && (query.HistoryScopeId is null || record.ScopeId == query.HistoryScopeId)
             && (query.ProfileId is null || record.ProfileId == query.ProfileId || record.ScopeId == query.ProfileId)
             && (query.ConversationKind is null || record.ConversationKind == query.ConversationKind)
-            && (string.IsNullOrWhiteSpace(query.ConversationName) || IrcIdentity.Equals(record.ConversationName, query.ConversationName, IrcCaseMapping.Rfc1459))
+            && conversationMatches
             && (string.IsNullOrWhiteSpace(query.Sender) || record.Sender is not null && IrcCaseMappingComparer.Equals(record.Sender, query.Sender, IrcCaseMapping.Rfc1459))
             && (query.MessageKind is null || record.MessageKind == query.MessageKind)
             && (query.From is null || record.Timestamp >= query.From)
@@ -1517,7 +1546,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         int pageSize,
         CancellationToken cancellationToken)
     {
-        var index = await GetHistoryIndexAsync(path, request.ScopeId, request.ConversationKind, request.ConversationName, cancellationToken).ConfigureAwait(false);
+        var index = await GetHistoryIndexAsync(path, request.ScopeId, request.ConversationKind, request.ConversationName, request.ConversationKey, cancellationToken).ConfigureAwait(false);
         if (index is null)
         {
             return null;
@@ -1545,6 +1574,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             request.ScopeId,
             request.ConversationKind,
             request.ConversationName,
+            request.ConversationKey,
             cancellationToken).ConfigureAwait(false);
         if (loaded is null || loaded.Count != selected.Length)
         {
@@ -1567,6 +1597,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         Guid scopeId,
         LogConversationKind conversationKind,
         string conversationName,
+        string? conversationKey,
         CancellationToken cancellationToken)
     {
         try
@@ -1595,6 +1626,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                 scopeId,
                 conversationKind,
                 conversationName,
+                conversationKey,
                 _maximumRecordBytes,
                 cancellationToken).ConfigureAwait(false);
             if (index is not null)
@@ -1620,6 +1652,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         Guid scopeId,
         LogConversationKind conversationKind,
         string conversationName,
+        string? conversationKey,
         CancellationToken cancellationToken)
     {
         var entries = selected.ToArray();
@@ -1642,7 +1675,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                     || record!.Text.Length > ConfigurationLimits.MaximumLogRecordBytes
                     || record.ScopeId != scopeId
                     || record.ConversationKind != conversationKind
-                    || !IrcIdentity.Equals(record.ConversationName, conversationName, IrcCaseMapping.Rfc1459)
+                    || !IsConversationRecord(record, scopeId, conversationKind, conversationName, conversationKey)
                     || record.Timestamp.UtcTicks != entry.TimestampTicks)
                 {
                     return null;
@@ -1754,11 +1787,25 @@ internal sealed class SearchResultCollector
 
 internal static class HistoryPageSelector
 {
+    internal static bool MatchesHistoryRecord(ConversationLogRecord record, HistoryPageRequest request) =>
+        record.ScopeId == request.ScopeId
+        && record.ConversationKind == request.ConversationKind
+        && (string.IsNullOrWhiteSpace(request.ConversationKey)
+            ? IrcIdentity.Equals(record.ConversationName, request.ConversationName, IrcCaseMapping.Rfc1459)
+            : string.Equals(ConversationLoggingService.EffectiveConversationKey(record), request.ConversationKey, StringComparison.Ordinal));
+
+    internal static bool MatchesHistoryRecord(ConversationLogRecord record, HistoryExportRequest request) =>
+        record.ScopeId == request.ScopeId
+        && record.ConversationKind == request.ConversationKind
+        && (string.IsNullOrWhiteSpace(request.ConversationKey)
+            ? IrcIdentity.Equals(record.ConversationName, request.ConversationName, IrcCaseMapping.Rfc1459)
+            : string.Equals(ConversationLoggingService.EffectiveConversationKey(record), request.ConversationKey, StringComparison.Ordinal));
+
     public static HistoryPage Select(IEnumerable<ConversationLogRecord> source, HistoryPageRequest request)
     {
         var matching = source
             .Where(record => record.ConversationKind == request.ConversationKind
-                && IrcIdentity.Equals(record.ConversationName, request.ConversationName, IrcCaseMapping.Rfc1459))
+                && MatchesHistoryRecord(record, request))
             .ToArray();
         if (matching.Length == 0)
         {
@@ -1828,7 +1875,7 @@ public sealed class InMemoryConversationLogStore : IConversationLogStore
         {
             records = _records.Where(record => record.ScopeId == request.ScopeId
                     && record.ConversationKind == request.ConversationKind
-                    && IrcIdentity.Equals(record.ConversationName, request.ConversationName, IrcCaseMapping.Rfc1459))
+                    && HistoryPageSelector.MatchesHistoryRecord(record, request))
                 .ToArray();
         }
 
@@ -1845,7 +1892,7 @@ public sealed class InMemoryConversationLogStore : IConversationLogStore
         {
             var matching = _records.Where(record => record.ScopeId == request.ScopeId
                     && record.ConversationKind == request.ConversationKind
-                    && IrcIdentity.Equals(record.ConversationName, request.ConversationName, IrcCaseMapping.Rfc1459)
+                    && HistoryPageSelector.MatchesHistoryRecord(record, request)
                     && (request.From is null || record.Timestamp >= request.From.Value)
                     && (request.To is null || record.Timestamp <= request.To.Value))
                 .OrderBy(record => record.Timestamp)

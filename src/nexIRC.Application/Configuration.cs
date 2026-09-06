@@ -573,6 +573,52 @@ public sealed class ConfigurationService
         }
     }
 
+    public bool RenameDestination(
+        Guid scopeId,
+        DestinationKind kind,
+        string oldName,
+        string newName,
+        IrcCaseMapping mapping = IrcCaseMapping.Rfc1459)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(oldName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(newName);
+        lock (_gate)
+        {
+            var hasTarget = _configuration.Favorites.Any(item => item.ScopeId == scopeId
+                    && item.Kind == kind
+                    && IrcCaseMappingComparer.Equals(item.Name, newName, mapping))
+                || _configuration.RecentDestinations.Any(item => item.ScopeId == scopeId
+                    && item.Kind == kind
+                    && IrcCaseMappingComparer.Equals(item.Name, newName, mapping));
+            if (hasTarget)
+            {
+                return false;
+            }
+
+            var favorites = _configuration.Favorites
+                .Select(item => item.ScopeId == scopeId
+                    && item.Kind == kind
+                    && IrcCaseMappingComparer.Equals(item.Name, oldName, mapping)
+                        ? item with { Name = newName }
+                        : item)
+                .ToList();
+            var recents = _configuration.RecentDestinations
+                .Select(item => item.ScopeId == scopeId
+                    && item.Kind == kind
+                    && IrcCaseMappingComparer.Equals(item.Name, oldName, mapping)
+                        ? item with { Name = newName }
+                        : item)
+                .ToList();
+            if (favorites.SequenceEqual(_configuration.Favorites) && recents.SequenceEqual(_configuration.RecentDestinations))
+            {
+                return false;
+            }
+
+            _configuration = _configuration with { Favorites = favorites, RecentDestinations = recents };
+            return true;
+        }
+    }
+
     public void ClearRecent(Guid? scopeId = null)
         => ClearRecent(scopeId, null);
 

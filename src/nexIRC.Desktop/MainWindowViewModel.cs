@@ -16,6 +16,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private bool _isToolbarVisible = true;
     private bool _isStatusBarVisible = true;
     private bool _shutdownStarted;
+    private int _navigationRefreshPending;
     private readonly DesktopNotificationAdapter? _notificationAdapter;
     private readonly System.Windows.Threading.Dispatcher _uiDispatcher;
     private readonly Dictionary<Guid, MemorySaslCredentialProvider> _sessionCredentials = [];
@@ -521,9 +522,15 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             WorkspaceView view = result.ConversationKind switch
             {
                 LogConversationKind.Channel => Sessions.OpenHistoricalConversation(network.Id, DestinationKind.Channel, result.ConversationName),
-                LogConversationKind.PrivateConversation => Sessions.OpenHistoricalConversation(network.Id, DestinationKind.Query, result.ConversationName),
+                LogConversationKind.PrivateConversation => network.Queries.FirstOrDefault(query =>
+                        string.Equals(query.HistoryConversationKey, result.Location.ConversationKey, StringComparison.Ordinal))
+                    ?? Sessions.OpenHistoricalConversation(network.Id, DestinationKind.Query, result.ConversationName),
                 _ => network.StatusView
             };
+            if (!view.IsViewOpen)
+            {
+                Sessions.ReopenView(view.Id);
+            }
             SelectView(view);
             if (Sessions.LogStore is { } store)
             {
@@ -532,6 +539,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                     ScopeId = result.Location.ScopeId,
                     ConversationKind = result.ConversationKind,
                     ConversationName = result.ConversationName,
+                    ConversationKey = result.Location.ConversationKey,
                     PageSize = ConfigurationLimits.MaximumHistoryContextEntries,
                     Around = result.Timestamp
                 }, cancellationToken).ConfigureAwait(true);
@@ -856,18 +864,23 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private void OnNavigationChanged(object? sender, EventArgs e)
     {
-        if (_uiDispatcher.CheckAccess())
+        if (Interlocked.Exchange(ref _navigationRefreshPending, 1) != 0)
         {
-            RefreshConversationNavigator();
-            RefreshCommandStates();
             return;
         }
 
         _uiDispatcher.BeginInvoke(new Action(() =>
         {
-            RefreshConversationNavigator();
-            RefreshCommandStates();
-        }));
+            try
+            {
+                RefreshConversationNavigator();
+                RefreshCommandStates();
+            }
+            finally
+            {
+                Volatile.Write(ref _navigationRefreshPending, 0);
+            }
+        }), System.Windows.Threading.DispatcherPriority.ContextIdle);
     }
 
     private void RefreshConversationNavigator()

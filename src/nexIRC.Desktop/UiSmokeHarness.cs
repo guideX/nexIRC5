@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Windows;
 using nexIRC.Application;
 using nexIRC.Core.Networking;
@@ -13,7 +14,7 @@ namespace nexIRC.Desktop;
 /// </summary>
 internal static class UiSmokeHarness
 {
-    private static readonly string[] Scenarios = ["participant", "moderation", "channel-properties", "multi-network", "lifecycle", "read-state", "reconnect"];
+    private static readonly string[] Scenarios = ["participant", "moderation", "channel-properties", "multi-network", "lifecycle", "read-state", "reconnect", "burst", "query-nick"];
 
     public static bool IsKnownScenario(string? scenario) =>
         scenario is not null && Scenarios.Contains(scenario, StringComparer.OrdinalIgnoreCase);
@@ -47,6 +48,12 @@ internal static class UiSmokeHarness
                 break;
             case "reconnect":
                 await ReconnectAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "burst":
+                await BurstAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "query-nick":
+                await QueryNickAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
             default:
                 throw new ArgumentException($"Unknown UI smoke scenario '{scenario}'.", nameof(scenario));
@@ -267,6 +274,85 @@ internal static class UiSmokeHarness
         Require(!channel.Modes.Contains('s'), "an old-generation MODE contaminated the reconnected channel");
     }
 
+    private static async Task BurstAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var viewModel = window.ViewModel;
+        var channel = RequiredChannel(network);
+        viewModel.SelectView(channel);
+        viewModel.SelectView(network.StatusView);
+
+        const int burstSize = 2_000;
+        for (var index = 0; index < burstSize; index++)
+        {
+            demo.AlphaTransport.EnqueueInboundLine($":BurstUser!burst@demo PRIVMSG #general :burst-{index:0000}");
+        }
+
+        await Task.Yield();
+        var selectionTimer = Stopwatch.StartNew();
+        viewModel.SelectView(channel);
+        selectionTimer.Stop();
+        var selectionMilliseconds = selectionTimer.Elapsed.TotalMilliseconds;
+
+        try
+        {
+            await WaitForAsync(viewModel.Sessions, () =>
+            {
+                var currentEntries = channel.EntriesSnapshot;
+                return currentEntries.Count == WorkspaceView.MaximumEntries
+                    && currentEntries[^1].Text == "burst-1999";
+            }, "burst input did not reach its deterministic tail", 15_000).ConfigureAwait(true);
+        }
+        catch (TimeoutException exception)
+        {
+            var currentEntries = channel.EntriesSnapshot;
+            throw new InvalidOperationException($"Burst tail did not settle: count={currentEntries.Count} last={(currentEntries.Count == 0 ? string.Empty : currentEntries[^1].Text)} queued={viewModel.Sessions.Diagnostics.QueuedStateActions} processed={viewModel.Sessions.Diagnostics.ProcessedStateActions}", exception);
+        }
+        await viewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+        var entries = channel.EntriesSnapshot;
+        Require(entries.Count == WorkspaceView.MaximumEntries, "burst projection did not retain its bounded transcript window");
+        Require(entries[0].Text == "burst-1500" && entries[^1].Text == "burst-1999", "burst transcript ordering or tail retention was incorrect");
+        Require(entries.Zip(entries.Skip(1)).All(pair => string.CompareOrdinal(pair.First.Text, pair.Second.Text) < 0), "burst transcript ordering was not FIFO");
+
+        var unreadBeforeRead = channel.UnreadCount;
+        viewModel.SelectView(channel);
+        Require(channel.Activity == WorkspaceActivity.None && channel.UnreadCount == 0, "burst selection did not clear accumulated unread state");
+        viewModel.SelectView(network.StatusView);
+        demo.AlphaTransport.EnqueueInboundLine(":BurstUser!burst@demo PRIVMSG #general :post-burst unread");
+        await WaitForAsync(viewModel.Sessions, () => channel.UnreadCount == 1, "post-burst unread state did not accumulate").ConfigureAwait(true);
+        viewModel.SelectView(channel);
+        Require(channel.Activity == WorkspaceActivity.None && channel.UnreadCount == 0, "post-burst selection did not restore read state");
+
+        var diagnostics = viewModel.Sessions.Diagnostics.StateDispatch;
+        Console.WriteLine($"BURST_UI_METRICS events={burstSize} selection_ms={selectionMilliseconds:F3} unread_before_read={unreadBeforeRead} max_queue_depth={diagnostics.MaximumQueueDepth} p95_queue_wait_ms={diagnostics.P95QueueWaitMilliseconds:F3} p95_wpf_schedule_wait_ms={diagnostics.P95WpfScheduleWaitMilliseconds:F3} p95_mutation_ms={diagnostics.P95MutationDurationMilliseconds:F3} tail_ordered=true");
+    }
+
+    private static async Task QueryNickAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var viewModel = window.ViewModel;
+        var channel = RequiredChannel(network);
+        var query = viewModel.Sessions.EnsureQuery(network.Id, "Alex");
+        var historyKey = query.HistoryConversationKey;
+        viewModel.SelectView(query);
+        const string draft = "draft survives the query nickname transition";
+        viewModel.PrepareInput(draft);
+        viewModel.SelectView(network.StatusView);
+
+        demo.AlphaTransport.EnqueueInboundLine(":Alex!demo@alpha NICK Alex2");
+        await WaitForAsync(viewModel.Sessions, () => query.Nickname == "Alex2" && channel.MembersSnapshot.Any(member => member.Nickname == "Alex2"), "query nickname transition was not projected").ConfigureAwait(true);
+        Require(ReferenceEquals(query, network.Queries.Single(item => item.Nickname == "Alex2")), "query nickname transition created a duplicate view");
+        Require(query.HistoryConversationKey == historyKey, "query nickname transition changed the stable history identity");
+        Require(query.EntriesSnapshot.Any(entry => entry.Kind == TranscriptEntryKind.Nick && entry.Text.Contains("Alex2", StringComparison.Ordinal)), "query nickname transition was not rendered in the query transcript");
+
+        viewModel.SelectView(query);
+        Require(viewModel.InputText == draft, "query draft was not restored after the nickname transition");
+        Require(viewModel.CloseActiveView(), "renamed query did not close through the UI view-model path");
+        var renamedMember = RequiredMember(channel, "Alex2");
+        viewModel.OpenParticipantQuery(viewModel.CreateParticipantContext(network, channel, renamedMember));
+        Require(ReferenceEquals(viewModel.ActiveView, query), "participant reopen created a duplicate query after nickname transition");
+        Require(viewModel.InputText == draft, "query draft was not restored after close and participant reopen");
+        Console.WriteLine($"QUERY_NICK_UI_METRICS same_view=true history_key_stable=true draft_restored=true query_count={network.Queries.Count}");
+    }
+
     private static void Register(FakeIrcTransport transport, string nickname)
     {
         transport.EnqueueInboundLine(":alpha.server CAP * LS :");
@@ -283,7 +369,7 @@ internal static class UiSmokeHarness
     private static ParticipantMenuGroup RequiredGroup(IReadOnlyList<ParticipantMenuGroup> groups, string header) =>
         groups.Single(group => group.Header == header);
 
-    private static async Task WaitForAsync(NetworkSessionManager sessions, Func<bool> condition, string failure)
+    private static async Task WaitForAsync(NetworkSessionManager sessions, Func<bool> condition, string failure, int timeoutMilliseconds = 4_000)
     {
         if (condition())
         {
@@ -304,7 +390,7 @@ internal static class UiSmokeHarness
         try
         {
             Signal(null, EventArgs.Empty);
-            await Task.WhenAny(completed.Task, Task.Delay(TimeSpan.FromSeconds(4))).ConfigureAwait(true);
+            await Task.WhenAny(completed.Task, Task.Delay(timeoutMilliseconds)).ConfigureAwait(true);
             if (!condition())
             {
                 throw new TimeoutException(failure);

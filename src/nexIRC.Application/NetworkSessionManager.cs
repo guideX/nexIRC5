@@ -928,6 +928,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         {
             entry.Started = true;
             entry.RunTask = entry.Session.RunAsync(cancellationToken);
+            entry.EventDrainTasks = StartEventDrainers(entry.Session);
             _ = ObserveCompletionAsync(entry, entry.RunTask);
         }
 
@@ -1344,6 +1345,61 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
     }
 
+    private QueryView? ReconcileQueryNicknameChange(
+        NetworkWorkspace workspace,
+        IrcNicknameChangedEvent nick,
+        ServerSessionSnapshot snapshot)
+    {
+        if (nick.PreviousNickname is null)
+        {
+            return null;
+        }
+
+        var query = workspace.FindQuery(nick.PreviousNickname);
+        if (query is null
+            || !query.IsIdentityBoundToCurrentSession
+            || query.IdentityConnectionGeneration != snapshot.ConnectionGeneration)
+        {
+            return null;
+        }
+
+        var collision = workspace.FindQuery(nick.NewNickname);
+        if (collision is not null && !ReferenceEquals(collision, query))
+        {
+            // Two existing query views do not prove that the targets are the
+            // same person. Keep both logical conversations separate.
+            return null;
+        }
+
+        if (!query.TryApplyNicknameChange(
+                nick.PreviousNickname,
+                nick.NewNickname,
+                snapshot.Features.CaseMapping,
+                snapshot.ConnectionGeneration))
+        {
+            return null;
+        }
+
+        _navigationHistory.Rename(
+            workspace.Id,
+            WorkspaceViewKind.Query,
+            nick.PreviousNickname,
+            nick.NewNickname,
+            snapshot.Features.CaseMapping);
+        if (Configuration is not null)
+        {
+            Configuration.RenameDestination(
+                workspace.ProfileId ?? workspace.Id,
+                DestinationKind.Query,
+                nick.PreviousNickname,
+                nick.NewNickname,
+                snapshot.Features.CaseMapping);
+            SaveConfigurationInBackground();
+        }
+
+        return query;
+    }
+
     private BanListView? RouteBanListItemEvent(NetworkWorkspace workspace, IrcBanListItemEvent item)
     {
         ActiveOperation? operation = null;
@@ -1584,7 +1640,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 {
                     CompleteListOperation(networkId, operation);
                 }
-            });
+            }, WorkspaceDispatchActionCategory.OperationFeedback);
         }
         catch (OperationCanceledException) when (operation.Lifetime.IsCancellationRequested)
         {
@@ -1811,7 +1867,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 {
                     CompleteAction(workspace, operation, IrcOperationState.TimedOut, explanation: "Server confirmation was not observed before the operation timeout.");
                 }
-            });
+            }, WorkspaceDispatchActionCategory.OperationFeedback);
         }
         catch (OperationCanceledException) when (operation.Lifetime.IsCancellationRequested)
         {
@@ -1895,6 +1951,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         try
         {
             await entry.Session.DisposeAsync().ConfigureAwait(false);
+            await Task.WhenAll(entry.EventDrainTasks).ConfigureAwait(false);
         }
         catch (InvalidOperationException)
         {
@@ -1921,7 +1978,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 }
 
                 entry.Workspace.StatusView.Append(new TranscriptEntry(DateTimeOffset.Now, TranscriptEntryKind.Error, null, $"Session stopped unexpectedly: {exception.Message}"));
-            });
+            }, WorkspaceDispatchActionCategory.Lifecycle);
         }
         finally
         {
@@ -1987,7 +2044,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                     entry.Workspace.StatusView.IsActive,
                     nameof(SessionStateChangedEvent)));
             }
-        });
+        }, WorkspaceDispatchActionCategory.Lifecycle);
     }
 
     private void OnSessionSemanticEvent(object? sender, SessionSemanticEvent item)
@@ -2019,7 +2076,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
             entry.Workspace.ApplySnapshot(snapshot);
             RouteSemanticEvent(entry.Workspace, item.Event, snapshot);
-        });
+        }, DispatchCategory(item.Event));
     }
 
     private void RouteSemanticEvent(NetworkWorkspace workspace, IrcSemanticEvent semanticEvent, ServerSessionSnapshot snapshot)
@@ -2037,10 +2094,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 AppendRendered(workspace.EnsureChannel(ctcp.Target, reopen: false), semanticEvent, snapshot);
                 break;
             case IrcCtcpEvent ctcp when IrcIdentity.Equals(ctcp.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping):
-                AppendRendered(workspace.EnsureQuery(ctcp.Target, reopen: false), semanticEvent, snapshot);
+                AppendRendered(workspace.EnsureIncomingQuery(ctcp.Target), semanticEvent, snapshot);
                 break;
             case IrcCtcpEvent ctcp when ctcp.Message.Prefix?.Name is { } sender:
-                AppendRendered(workspace.EnsureQuery(sender, reopen: false), semanticEvent, snapshot, WorkspaceActivity.Important);
+                AppendRendered(workspace.EnsureIncomingQuery(sender), semanticEvent, snapshot, WorkspaceActivity.Important);
                 break;
             case IrcPrivmsgEvent message when snapshot.Features.ChannelTypes.Contains(message.Target.FirstOrDefault()):
                 AppendRendered(workspace.EnsureChannel(message.Target, reopen: false), semanticEvent, snapshot);
@@ -2053,7 +2110,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 // event below; do not duplicate it in server status.
                 break;
             case IrcQueryMessageEvent query:
-                AppendRendered(workspace.EnsureQuery(query.Nickname, reopen: false), semanticEvent, snapshot, WorkspaceActivity.Important);
+                AppendRendered(workspace.EnsureIncomingQuery(query.Nickname), semanticEvent, snapshot, WorkspaceActivity.Important);
                 break;
             case IrcJoinEvent join:
                 AppendRendered(workspace.EnsureChannel(join.Channel, reopen: false), semanticEvent, snapshot);
@@ -2176,9 +2233,21 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 break;
             case IrcNicknameChangedEvent nickname:
                 ReconcileNicknameChange(workspace, nickname);
+                var followedQuery = ReconcileQueryNicknameChange(workspace, nickname, snapshot);
                 foreach (var channel in workspace.Channels)
                 {
                     AppendRendered(channel, semanticEvent, snapshot);
+                }
+
+                if (followedQuery is not null)
+                {
+                    AppendRendered(
+                        followedQuery,
+                        semanticEvent,
+                        snapshot,
+                        WorkspaceActivity.None,
+                        publishNotification: false,
+                        updateLastActivity: false);
                 }
 
                 AppendRendered(workspace.StatusView, semanticEvent, snapshot);
@@ -2263,7 +2332,13 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             ? account
             : null;
 
-    private void AppendRendered(WorkspaceView view, IrcSemanticEvent semanticEvent, ServerSessionSnapshot snapshot, WorkspaceActivity? activity = null)
+    private void AppendRendered(
+        WorkspaceView view,
+        IrcSemanticEvent semanticEvent,
+        ServerSessionSnapshot snapshot,
+        WorkspaceActivity? activity = null,
+        bool publishNotification = true,
+        bool updateLastActivity = true)
     {
         var entry = IrcEventPresentation.Render(semanticEvent, snapshot);
         if (entry is null)
@@ -2304,7 +2379,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         entry = entry with { Sequence = NextActivitySequence() };
-        view.Append(entry, markActivity: false, updateLastActivity: !isResynchronization);
+        view.Append(entry, markActivity: false, updateLastActivity: updateLastActivity && !isResynchronization);
         if (entry.IsHighlight && !isResynchronization)
         {
             view.MarkHighlight();
@@ -2314,7 +2389,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         {
             RecordRecent(workspace, DestinationKind.Channel, channel.Channel);
         }
-        else if (!isResynchronization && view is QueryView query && view.EntriesSnapshot.Count == 1 && semanticEvent is (IrcQueryMessageEvent or IrcCtcpEvent))
+        else if (!isResynchronization && view is QueryView query && view.EntryCount == 1 && semanticEvent is (IrcQueryMessageEvent or IrcCtcpEvent))
         {
             RecordRecent(workspace, DestinationKind.Query, query.Nickname);
         }
@@ -2338,7 +2413,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
         NotifyNavigationChanged();
 
-        if (isResynchronization)
+        if (isResynchronization || !publishNotification)
         {
             return;
         }
@@ -2508,12 +2583,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         ? message.TrailingParameter ?? string.Empty
         : string.Join(' ', message.Parameters);
 
-    private void Dispatch(Action action)
+    private void Dispatch(Action action, WorkspaceDispatchActionCategory category = WorkspaceDispatchActionCategory.Other)
     {
         Task task;
         try
         {
-            task = _dispatcher.InvokeAsync(action).AsTask();
+            task = _dispatcher.InvokeAsync(action, category).AsTask();
         }
         catch
         {
@@ -2527,6 +2602,17 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
         _ = RemovePendingAsync(task);
     }
+
+    private static WorkspaceDispatchActionCategory DispatchCategory(IrcSemanticEvent semanticEvent) => semanticEvent switch
+    {
+        IrcPrivmsgEvent or IrcQueryMessageEvent or IrcCtcpEvent => WorkspaceDispatchActionCategory.IncomingMessage,
+        IrcJoinEvent or IrcPartEvent or IrcQuitEvent or IrcKickEvent or IrcNamesEvent or IrcNamesCompleteEvent or IrcWhoEvent or IrcWhoEndEvent => WorkspaceDispatchActionCategory.Membership,
+        IrcModeEvent or IrcTopicEvent or IrcTopicUnsetEvent or IrcTopicMetadataEvent => WorkspaceDispatchActionCategory.ModeOrTopic,
+        IrcNicknameChangedEvent or IrcChannelSynchronizationEvent or IrcWelcomeEvent or IrcRegistrationStateEvent or IrcCapabilityChangedEvent or IrcSaslStateChangedEvent or IrcMotdEvent => WorkspaceDispatchActionCategory.Lifecycle,
+        IrcWhoisEvent or IrcBanListItemEvent or IrcBanListEndEvent or IrcListStartEvent or IrcListItemEvent or IrcListEndEvent => WorkspaceDispatchActionCategory.HistoryProjection,
+        IrcServerErrorEvent or IrcServerNumericEvent or IrcUnknownCommandEvent or IrcUnknownNumericEvent => WorkspaceDispatchActionCategory.Notification,
+        _ => WorkspaceDispatchActionCategory.Other
+    };
 
     private async Task RemovePendingAsync(Task task)
     {
@@ -2569,6 +2655,28 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         && ReferenceEquals(entry.Session, entry.Workspace.Session)
         && generation == session.Snapshot.ConnectionGeneration
         && generation >= entry.Workspace.Snapshot.ConnectionGeneration;
+
+    private static Task[] StartEventDrainers(ServerSession session) =>
+    [
+        DrainAsync(session.ReadRawEventsAsync()),
+        DrainAsync(session.ReadParsedEventsAsync()),
+        DrainAsync(session.ReadParseErrorsAsync()),
+        DrainAsync(session.ReadSemanticEventsAsync()),
+        DrainAsync(session.ReadOutboundEventsAsync())
+    ];
+
+    private static async Task DrainAsync<T>(IAsyncEnumerable<T> events)
+    {
+        try
+        {
+            await foreach (var _ in events.ConfigureAwait(false))
+            {
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
 
     private SessionEntry GetEntry(Guid networkId) =>
         TryGetEntry(networkId, out var entry) ? entry : throw new KeyNotFoundException($"No network session exists for {networkId}.");
@@ -2616,6 +2724,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         public Task? RunTask { get; set; }
 
         public bool NeedsReplacement { get; set; }
+
+        public Task[] EventDrainTasks { get; set; } = [];
 
         public HashSet<string> RecentSemanticEventIds { get; } = new(StringComparer.Ordinal);
 

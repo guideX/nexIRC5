@@ -8,6 +8,9 @@ public sealed class WpfWorkspaceDispatcher(Dispatcher dispatcher) : IWorkspaceDi
     private readonly Dispatcher _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
 
     public ValueTask InvokeAsync(Action action)
+        => InvokeAsync(action, WorkspaceDispatchActionCategory.Other);
+
+    public ValueTask InvokeAsync(Action action, WorkspaceDispatchActionCategory category)
     {
         ArgumentNullException.ThrowIfNull(action);
         if (_dispatcher.CheckAccess())
@@ -16,6 +19,12 @@ public sealed class WpfWorkspaceDispatcher(Dispatcher dispatcher) : IWorkspaceDi
             return ValueTask.CompletedTask;
         }
 
-        return new ValueTask(_dispatcher.InvokeAsync(action).Task);
+        var priority = category is WorkspaceDispatchActionCategory.UserSelection
+            or WorkspaceDispatchActionCategory.ReadState
+            or WorkspaceDispatchActionCategory.OperationFeedback
+            or WorkspaceDispatchActionCategory.UiDemoCommand
+            ? DispatcherPriority.Input
+            : DispatcherPriority.Background;
+        return new ValueTask(_dispatcher.InvokeAsync(action, priority).Task);
     }
 }

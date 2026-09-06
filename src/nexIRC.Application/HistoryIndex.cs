@@ -39,6 +39,7 @@ internal static class JsonlHistoryIndex
         Guid scopeId,
         LogConversationKind conversationKind,
         string conversationName,
+        string? conversationKey,
         int maximumRecordBytes,
         CancellationToken cancellationToken)
     {
@@ -63,6 +64,7 @@ internal static class JsonlHistoryIndex
             scopeId,
             conversationKind,
             conversationName,
+            conversationKey,
             maximumRecordBytes,
             cancellationToken).ConfigureAwait(false);
         if (entries is null)
@@ -110,6 +112,7 @@ internal static class JsonlHistoryIndex
         Guid scopeId,
         LogConversationKind conversationKind,
         string conversationName,
+        string? conversationKey,
         int maximumRecordBytes,
         CancellationToken cancellationToken)
     {
@@ -130,7 +133,13 @@ internal static class JsonlHistoryIndex
                 || record!.Text.Length > ConfigurationLimits.MaximumLogRecordBytes
                 || record.ScopeId != scopeId
                 || record.ConversationKind != conversationKind
-                || !IrcCaseMappingComparer.Equals(record.ConversationName, conversationName, IrcCaseMapping.Rfc1459))
+                || !string.IsNullOrWhiteSpace(conversationKey) && !string.Equals(
+                    string.IsNullOrWhiteSpace(record.ConversationKey)
+                        ? ConversationLoggingService.BuildConversationKey(record.ConversationKind, record.ConversationName)
+                        : record.ConversationKey,
+                    conversationKey,
+                    StringComparison.Ordinal)
+                || string.IsNullOrWhiteSpace(conversationKey) && !IrcCaseMappingComparer.Equals(record.ConversationName, conversationName, IrcCaseMapping.Rfc1459))
             {
                 continue;
             }
