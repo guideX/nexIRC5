@@ -267,9 +267,52 @@ public sealed class ServerSessionTests
         Assert.Equal(1, transport.ConnectCount);
     }
 
+    [Fact]
+    public async Task ConcurrentDisposeDuringPartialRegistrationIsIdempotentAndDoesNotReconnect()
+    {
+        var endpoint = new IrcEndpoint("shutdown.example", 6667, false);
+        var first = new FakeIrcTransport(endpoint);
+        var second = new FakeIrcTransport(endpoint);
+        var factory = new FakeIrcTransportFactory();
+        factory.Add(first);
+        factory.Add(second);
+        await using var session = CreateSession(
+            endpoint,
+            factory,
+            "nex",
+            reconnect: new ReconnectPolicy(true, 2, TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(20)));
+
+        var run = session.RunAsync();
+        await WaitForAsync(() => first.ConnectCount == 1);
+        var disposeTasks = new[] { session.DisposeAsync().AsTask(), session.DisposeAsync().AsTask() };
+        await Task.WhenAll(disposeTasks);
+        await run;
+
+        Assert.All(disposeTasks, task => Assert.True(task.IsCompletedSuccessfully));
+        Assert.Equal(1, first.ConnectCount);
+        Assert.Equal(0, second.ConnectCount);
+        Assert.Equal(ServerSessionState.Disconnected, session.Snapshot.State);
+    }
+
+    [Fact]
+    public async Task DisposeDuringTransportCreationCancelsTheConnectBoundary()
+    {
+        var endpoint = new IrcEndpoint("dns-boundary.example", 6697);
+        var factory = new BlockingTransportFactory();
+        await using var session = CreateSession(endpoint, factory, "nex");
+
+        var run = session.RunAsync();
+        await factory.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await session.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+        await run.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(ServerSessionState.Disconnected, session.Snapshot.State);
+        Assert.Equal(0, factory.CreatedTransportCount);
+    }
+
     private static ServerSession CreateSession(
         IrcEndpoint endpoint,
-        FakeIrcTransportFactory factory,
+        IIrcTransportFactory factory,
         string nickname,
         string? password = null,
         string? alternateNickname = null,
@@ -286,6 +329,21 @@ public sealed class ServerSessionTests
             RequestedCapabilities = requestedCapabilities ?? Array.Empty<string>(),
             Reconnect = reconnect ?? new ReconnectPolicy(Enabled: false)
         }, factory);
+
+    private sealed class BlockingTransportFactory : IIrcTransportFactory
+    {
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int CreatedTransportCount { get; private set; }
+
+        public async ValueTask<IIrcTransport> CreateAsync(IrcEndpoint endpoint, CancellationToken cancellationToken)
+        {
+            Started.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            CreatedTransportCount++;
+            throw new InvalidOperationException("The cancellation boundary should have ended transport creation.");
+        }
+    }
 
     private static async Task WaitForAsync(Func<bool> condition, int timeoutMilliseconds = 3000)
     {

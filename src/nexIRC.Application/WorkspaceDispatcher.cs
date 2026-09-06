@@ -176,7 +176,9 @@ public sealed class SerializedWorkspaceDispatcher : IWorkspaceDispatcher
     }
 
     /// <summary>
-    /// Stops accepting new work and waits for already accepted state actions.
+    /// Stops accepting new work and waits for every already accepted state
+    /// action. Completion is the presentation shutdown fence: after it
+    /// finishes, no queued callback can execute through this dispatcher.
     /// The wrapped UI dispatcher is owned by the caller and is not disposed.
     /// </summary>
     public async ValueTask CompleteAsync()

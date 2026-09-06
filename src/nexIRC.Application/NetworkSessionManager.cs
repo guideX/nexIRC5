@@ -23,12 +23,14 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private readonly bool _ownsNotifications;
     private readonly bool _ownsLogStore;
     private readonly IrcOperationTimeoutPolicy _operationTimeouts;
+    private readonly object _disposeGate = new();
     private long _operationSequence;
     private long _activitySequence;
     private long _staleGenerationEventsDiscarded;
     private long _duplicateSemanticEventsDiscarded;
     private long _resynchronizationEventsSuppressed;
     private bool _disposed;
+    private Task? _disposeTask;
 
     private const int MaximumOutstandingOperations = 64;
 
@@ -980,13 +982,16 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         DisposeCredentialProviders(entry.Options);
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (_disposed)
+        lock (_disposeGate)
         {
-            return;
+            return new ValueTask(_disposeTask ??= DisposeCoreAsync());
         }
+    }
 
+    private async Task DisposeCoreAsync()
+    {
         _disposed = true;
         SessionEntry[] entries;
         lock (_entriesGate)

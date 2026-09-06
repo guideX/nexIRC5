@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
@@ -17,6 +18,8 @@ namespace nexIRC.Desktop;
 public partial class MainWindow : Window
 {
     private bool _closing;
+    private bool _shutdownComplete;
+    private readonly PresentationTimingProbe _presentationTiming = new();
 
     public MainWindow(
         IIrcTransportFactory transportFactory,
@@ -41,9 +44,12 @@ public partial class MainWindow : Window
             Focus();
         };
         AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(OnPreviewRightClick), true);
+        Closed += OnClosed;
     }
 
     public MainWindowViewModel ViewModel { get; }
+
+    internal PresentationTimingProbe PresentationTiming => _presentationTiming;
 
     internal async Task CloseAfterSmokeAsync()
     {
@@ -53,11 +59,13 @@ public partial class MainWindow : Window
             await ViewModel.ShutdownAsync().ConfigureAwait(true);
         }
 
+        _shutdownComplete = true;
         Close();
     }
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
+        CompositionTarget.Rendering += OnRendering;
         var state = ViewModel.CurrentPreferences.ViewState;
         var bounds = SystemParameters.WorkArea;
         var valid = ViewStateValidator.Normalize(state, new ViewportBounds(bounds.Left, bounds.Top, bounds.Right, bounds.Bottom));
@@ -68,6 +76,10 @@ public partial class MainWindow : Window
         NavigationColumn.Width = new GridLength(valid.NavigationPaneWidth);
         if (valid.IsMaximized) WindowState = WindowState.Maximized;
     }
+
+    private void OnRendering(object? sender, EventArgs e) => _presentationTiming.RecordRendering(Stopwatch.GetTimestamp());
+
+    private void OnClosed(object? sender, EventArgs e) => CompositionTarget.Rendering -= OnRendering;
 
     private async Task ShowNewConnectionAsync()
     {
@@ -703,15 +715,32 @@ public partial class MainWindow : Window
 
     private async void OnClosing(object? sender, CancelEventArgs e)
     {
+        if (_shutdownComplete)
+        {
+            return;
+        }
+
         if (_closing)
         {
+            e.Cancel = true;
             return;
         }
 
         e.Cancel = true;
         _closing = true;
         ViewModel.CaptureViewState(ActualWidth, ActualHeight, Left, Top, WindowState == WindowState.Maximized, NavigationColumn.ActualWidth);
-        await ViewModel.ShutdownAsync();
-        Close();
+        try
+        {
+            await ViewModel.ShutdownAsync();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"WPF shutdown completed with a recoverable error: {exception.Message}");
+        }
+        finally
+        {
+            _shutdownComplete = true;
+            Close();
+        }
     }
 }

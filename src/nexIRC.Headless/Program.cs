@@ -62,6 +62,7 @@ internal static class Program
         };
 
         var rawTask = PrintRawAsync(session, cancellation.Token);
+        var outboundTask = PrintOutboundAsync(session, cancellation.Token);
         var runTask = session.RunAsync(cancellation.Token);
         try
         {
@@ -89,6 +90,7 @@ internal static class Program
         }
 
         await rawTask.ConfigureAwait(false);
+        await outboundTask.ConfigureAwait(false);
         PrintDiagnostics(session.Snapshot);
         return session.Snapshot.State == ServerSessionState.Failed ? 1 : 0;
     }
@@ -186,6 +188,23 @@ internal static class Program
             await foreach (var item in session.ReadRawEventsAsync(cancellationToken).ConfigureAwait(false))
             {
                 Console.WriteLine($"RAW  {item.RawLine}");
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+    }
+
+    private static async Task PrintOutboundAsync(ServerSession session, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (var item in session.ReadOutboundEventsAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var line = item.RawLine.TrimStart();
+                var separator = line.IndexOfAny([' ', '\t']);
+                var command = separator < 0 ? line : line[..separator];
+                Console.WriteLine($"OUTBOUND command={command} generation={item.ConnectionGeneration}");
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

@@ -60,6 +60,8 @@ public sealed class ServerSession : IAsyncDisposable
     private ISaslMechanism? _activeSaslMechanism;
     private bool _saslResponseSent;
     private bool _disposed;
+    private Task? _disposeTask;
+    private int _quitSent;
 
     public ServerSession(ServerSessionOptions options, IIrcTransportFactory transportFactory)
     {
@@ -260,7 +262,7 @@ public sealed class ServerSession : IAsyncDisposable
             return;
         }
 
-        if (_registration == RegistrationState.Registered)
+        if (_registration == RegistrationState.Registered && Interlocked.Exchange(ref _quitSent, 1) == 0)
         {
             try
             {
@@ -275,14 +277,23 @@ public sealed class ServerSession : IAsyncDisposable
         await runTask.ConfigureAwait(false);
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (_disposed)
+        lock (_gate)
         {
-            return;
-        }
+            if (_disposeTask is not null)
+            {
+                return new ValueTask(_disposeTask);
+            }
 
-        _disposed = true;
+            _disposed = true;
+            _disposeTask = DisposeCoreAsync();
+            return new ValueTask(_disposeTask);
+        }
+    }
+
+    private async Task DisposeCoreAsync()
+    {
         _disposeCts.Cancel();
         await DisconnectAsync("nexIRC session disposed").ConfigureAwait(false);
         _disposeCts.Dispose();

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Windows;
+using System.Globalization;
 using nexIRC.Application;
 using nexIRC.Core.Networking;
 using nexIRC.Core.Session;
@@ -295,6 +296,7 @@ internal static class UiSmokeHarness
         // Background priority. The selection itself remains a normal
         // presentation/read-state action; it never reorders protocol events.
         await Task.Yield();
+        var interactionId = window.PresentationTiming.BeginInteraction();
         var selectionPosted = Stopwatch.GetTimestamp();
         var selectionWpfWaitMilliseconds = 0d;
         var selectionExecutionMilliseconds = 0d;
@@ -304,10 +306,14 @@ internal static class UiSmokeHarness
             var selectionStarted = Stopwatch.GetTimestamp();
             selectionWpfWaitMilliseconds = TicksToMilliseconds(selectionStarted - selectionPosted);
             viewModel.SelectView(channel);
+            window.PresentationTiming.MarkWpfStateChanged(interactionId);
             selectionBeforeBurstComplete = !BurstTailReached(channel, burstSize - 1);
             selectionExecutionMilliseconds = TicksToMilliseconds(Stopwatch.GetTimestamp() - selectionStarted);
         }, System.Windows.Threading.DispatcherPriority.Input).Task.ConfigureAwait(true);
         Require(selectionBeforeBurstComplete, "burst selection was not serviced before the complete derived backlog drained");
+        var presentationOpportunity = await window.PresentationTiming
+            .WaitForNextOpportunityAsync(TimeSpan.FromSeconds(2))
+            .ConfigureAwait(true);
 
         try
         {
@@ -340,7 +346,9 @@ internal static class UiSmokeHarness
         var boundary = diagnostics.BoundaryDiagnostics;
         var presentation = viewModel.PresentationDiagnostics;
         Console.WriteLine(
-            $"BURST_UI_METRICS events={burstSize} selection_authority_wait_ms=0.000 selection_wpf_wait_ms={selectionWpfWaitMilliseconds:F3} selection_wpf_execution_ms={selectionExecutionMilliseconds:F3} "
+            $"BURST_UI_METRICS events={burstSize} selection_authority_wait_ms=n/a selection_wpf_wait_ms={selectionWpfWaitMilliseconds:F3} selection_wpf_execution_ms={selectionExecutionMilliseconds:F3} "
+            + $"presentation_opportunity_available={presentationOpportunity is not null} interaction_to_opportunity_ms={FormatMilliseconds(presentationOpportunity?.InteractionToOpportunityMilliseconds)} "
+            + $"interaction_to_wpf_state_ms={FormatMilliseconds(presentationOpportunity?.InteractionToWpfStateMilliseconds)} wpf_state_to_opportunity_ms={FormatMilliseconds(presentationOpportunity?.WpfStateToPresentationOpportunityMilliseconds)} "
             + $"selection_before_burst_complete={selectionBeforeBurstComplete} unread_before_read={unreadBeforeRead} max_authoritative_queue_depth={diagnostics.MaximumQueueDepth} "
             + $"max_wpf_pending={diagnostics.MaximumWpfPendingWorkItems} wpf_posted={diagnostics.WpfWorkItemsPosted} wpf_executed={diagnostics.WpfWorkItemsExecuted} "
             + $"p50_wpf_schedule_wait_ms={diagnostics.P50WpfScheduleWaitMilliseconds:F3} p95_wpf_schedule_wait_ms={diagnostics.P95WpfScheduleWaitMilliseconds:F3} p99_wpf_schedule_wait_ms={diagnostics.P99WpfScheduleWaitMilliseconds:F3} "
@@ -350,6 +358,8 @@ internal static class UiSmokeHarness
             + $"navigation_refresh_requests={presentation.NavigationRefreshRequests} navigation_refresh_executions={presentation.NavigationRefreshExecutions} "
             + $"navigation_refresh_coalesced={presentation.NavigationRefreshCoalescedRequests} tail_ordered=true");
     }
+
+    private static string FormatMilliseconds(double? value) => value?.ToString("F3", CultureInfo.InvariantCulture) ?? "n/a";
 
     private static bool BurstTailReached(ChannelView channel, int lastIndex)
     {

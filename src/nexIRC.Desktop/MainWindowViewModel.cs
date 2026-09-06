@@ -15,7 +15,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private bool _isMemberListVisible = true;
     private bool _isToolbarVisible = true;
     private bool _isStatusBarVisible = true;
-    private bool _shutdownStarted;
+    private readonly object _shutdownGate = new();
+    private Task? _shutdownTask;
     private int _navigationRefreshPending;
     private long _navigationRefreshRequests;
     private long _navigationRefreshExecutions;
@@ -800,19 +801,21 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         return result.CaretIndex;
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        await ShutdownAsync().ConfigureAwait(false);
+        return new ValueTask(ShutdownAsync());
     }
 
-    public async Task ShutdownAsync()
+    public Task ShutdownAsync()
     {
-        if (_shutdownStarted)
+        lock (_shutdownGate)
         {
-            return;
+            return _shutdownTask ??= ShutdownCoreAsync();
         }
+    }
 
-        _shutdownStarted = true;
+    private async Task ShutdownCoreAsync()
+    {
         StatusText = "Closing sessions…";
         await Sessions.DisposeAsync().ConfigureAwait(true);
         _notificationAdapter?.Dispose();
