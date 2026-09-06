@@ -1,5 +1,7 @@
 using System.Collections;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
 
 namespace nexIRC.Application;
 
@@ -9,9 +11,78 @@ namespace nexIRC.Application;
 /// boundary; snapshot enumeration also keeps diagnostic/test readers from
 /// observing a half-applied collection while a projection is being rebuilt.
 /// </summary>
-public sealed class ThreadSafeObservableCollection<T> : ObservableCollection<T>, IEnumerable<T>
+/// <summary>
+/// Defers collection notifications while one bounded UI projection slice is
+/// applying several already-ordered state actions. Values are still changed
+/// immediately; only equivalent binding invalidations are reduced to one
+/// reset per collection at the end of the slice.
+/// </summary>
+public static class WorkspaceProjectionBatch
+{
+    [ThreadStatic]
+    private static int _depth;
+
+    [ThreadStatic]
+    private static List<IProjectionBatchParticipant>? _participants;
+
+    public static bool IsActive => _depth > 0;
+
+    public static IDisposable Begin()
+    {
+        _depth++;
+        return new Scope();
+    }
+
+    internal static void Register(IProjectionBatchParticipant participant)
+    {
+        if (_depth > 0 && !(_participants?.Contains(participant) ?? false))
+        {
+            (_participants ??= []).Add(participant);
+        }
+    }
+
+    private sealed class Scope : IDisposable
+    {
+        private bool _disposed;
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            if (--_depth != 0)
+            {
+                return;
+            }
+
+            var participants = _participants;
+            _participants = null;
+            if (participants is not null)
+            {
+                foreach (var participant in participants)
+                {
+                    participant.FlushProjectionNotifications();
+                }
+            }
+        }
+    }
+}
+
+internal interface IProjectionBatchParticipant
+{
+    void FlushProjectionNotifications();
+}
+
+public sealed class ThreadSafeObservableCollection<T> : ObservableCollection<T>, IEnumerable<T>, IProjectionBatchParticipant
 {
     private readonly object _gate = new();
+    private bool _notificationsDeferred;
+    private bool _deferredReset;
+    private readonly List<T> _deferredAdded = [];
+    private readonly List<T> _deferredRemoved = [];
 
     public new int Count
     {
@@ -74,6 +145,45 @@ public sealed class ThreadSafeObservableCollection<T> : ObservableCollection<T>,
         }
     }
 
+    protected override void OnCollectionChanged(NotifyCollectionChangedEventArgs e)
+    {
+        if (WorkspaceProjectionBatch.IsActive)
+        {
+            _notificationsDeferred = true;
+            switch (e.Action)
+            {
+                case NotifyCollectionChangedAction.Add when e.NewItems is not null:
+                    foreach (var item in e.NewItems.OfType<T>()) _deferredAdded.Add(item);
+                    break;
+                case NotifyCollectionChangedAction.Remove when e.OldItems is not null:
+                    foreach (var item in e.OldItems.OfType<T>()) _deferredRemoved.Add(item);
+                    break;
+                default:
+                    _deferredReset = true;
+                    break;
+            }
+
+            WorkspaceProjectionBatch.Register(this);
+            return;
+        }
+
+        base.OnCollectionChanged(e);
+    }
+
+    protected override void OnPropertyChanged(PropertyChangedEventArgs e)
+    {
+        if (WorkspaceProjectionBatch.IsActive
+            && (string.Equals(e.PropertyName, nameof(Count), StringComparison.Ordinal)
+                || string.Equals(e.PropertyName, "Item[]", StringComparison.Ordinal)))
+        {
+            _notificationsDeferred = true;
+            WorkspaceProjectionBatch.Register(this);
+            return;
+        }
+
+        base.OnPropertyChanged(e);
+    }
+
     public new IEnumerator<T> GetEnumerator() => Snapshot().AsEnumerable().GetEnumerator();
 
     IEnumerator<T> IEnumerable<T>.GetEnumerator() => GetEnumerator();
@@ -92,5 +202,47 @@ public sealed class ThreadSafeObservableCollection<T> : ObservableCollection<T>,
 
             return snapshot;
         }
+    }
+
+    void IProjectionBatchParticipant.FlushProjectionNotifications()
+    {
+        if (!_notificationsDeferred)
+        {
+            return;
+        }
+
+        _notificationsDeferred = false;
+        base.OnPropertyChanged(new PropertyChangedEventArgs(nameof(Count)));
+        base.OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
+        // A bounded transcript trim changes both ends of the collection. A
+        // single range event for that mixed operation is not consistently
+        // consumed by every WPF ItemsControl, so use one Reset for that case.
+        // Add-only and remove-only batches retain their cheaper range events.
+        if (_deferredReset || (_deferredRemoved.Count > 0 && _deferredAdded.Count > 0))
+        {
+            base.OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+        }
+        else
+        {
+            if (_deferredRemoved.Count > 0)
+            {
+                base.OnCollectionChanged(new NotifyCollectionChangedEventArgs(
+                    NotifyCollectionChangedAction.Remove,
+                    _deferredRemoved,
+                    0));
+            }
+
+            if (_deferredAdded.Count > 0)
+            {
+                base.OnCollectionChanged(new NotifyCollectionChangedEventArgs(
+                    NotifyCollectionChangedAction.Add,
+                    _deferredAdded,
+                    Math.Max(0, base.Count - _deferredAdded.Count)));
+            }
+        }
+
+        _deferredReset = false;
+        _deferredAdded.Clear();
+        _deferredRemoved.Clear();
     }
 }

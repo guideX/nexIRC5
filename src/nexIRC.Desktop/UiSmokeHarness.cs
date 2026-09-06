@@ -14,7 +14,7 @@ namespace nexIRC.Desktop;
 /// </summary>
 internal static class UiSmokeHarness
 {
-    private static readonly string[] Scenarios = ["participant", "moderation", "channel-properties", "multi-network", "lifecycle", "read-state", "reconnect", "burst", "query-nick"];
+    private static readonly string[] Scenarios = ["participant", "moderation", "channel-properties", "multi-network", "lifecycle", "read-state", "reconnect", "burst", "burst-fairness", "query-nick"];
 
     public static bool IsKnownScenario(string? scenario) =>
         scenario is not null && Scenarios.Contains(scenario, StringComparer.OrdinalIgnoreCase);
@@ -50,7 +50,10 @@ internal static class UiSmokeHarness
                 await ReconnectAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
             case "burst":
-                await BurstAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                await BurstAsync(window, demo, state.Alpha, 2_000).ConfigureAwait(true);
+                break;
+            case "burst-fairness":
+                await BurstAsync(window, demo, state.Alpha, 5_000).ConfigureAwait(true);
                 break;
             case "query-nick":
                 await QueryNickAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -274,32 +277,43 @@ internal static class UiSmokeHarness
         Require(!channel.Modes.Contains('s'), "an old-generation MODE contaminated the reconnected channel");
     }
 
-    private static async Task BurstAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    private static async Task BurstAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network, int burstSize)
     {
         var viewModel = window.ViewModel;
         var channel = RequiredChannel(network);
         viewModel.SelectView(channel);
         viewModel.SelectView(network.StatusView);
 
-        const int burstSize = 2_000;
         for (var index = 0; index < burstSize; index++)
         {
             demo.AlphaTransport.EnqueueInboundLine($":BurstUser!burst@demo PRIVMSG #general :burst-{index:0000}");
         }
 
+        // This is the same boundary as a real WPF selection event. It is
+        // deliberately posted at Input after the protocol burst has been
+        // accepted, while protocol-derived state work is still draining at
+        // Background priority. The selection itself remains a normal
+        // presentation/read-state action; it never reorders protocol events.
         await Task.Yield();
-        var selectionTimer = Stopwatch.StartNew();
-        viewModel.SelectView(channel);
-        selectionTimer.Stop();
-        var selectionMilliseconds = selectionTimer.Elapsed.TotalMilliseconds;
+        var selectionPosted = Stopwatch.GetTimestamp();
+        var selectionWpfWaitMilliseconds = 0d;
+        var selectionExecutionMilliseconds = 0d;
+        var selectionBeforeBurstComplete = false;
+        await window.Dispatcher.InvokeAsync(() =>
+        {
+            var selectionStarted = Stopwatch.GetTimestamp();
+            selectionWpfWaitMilliseconds = TicksToMilliseconds(selectionStarted - selectionPosted);
+            viewModel.SelectView(channel);
+            selectionBeforeBurstComplete = !BurstTailReached(channel, burstSize - 1);
+            selectionExecutionMilliseconds = TicksToMilliseconds(Stopwatch.GetTimestamp() - selectionStarted);
+        }, System.Windows.Threading.DispatcherPriority.Input).Task.ConfigureAwait(true);
+        Require(selectionBeforeBurstComplete, "burst selection was not serviced before the complete derived backlog drained");
 
         try
         {
             await WaitForAsync(viewModel.Sessions, () =>
             {
-                var currentEntries = channel.EntriesSnapshot;
-                return currentEntries.Count == WorkspaceView.MaximumEntries
-                    && currentEntries[^1].Text == "burst-1999";
+                return BurstTailReached(channel, burstSize - 1);
             }, "burst input did not reach its deterministic tail", 15_000).ConfigureAwait(true);
         }
         catch (TimeoutException exception)
@@ -310,7 +324,7 @@ internal static class UiSmokeHarness
         await viewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
         var entries = channel.EntriesSnapshot;
         Require(entries.Count == WorkspaceView.MaximumEntries, "burst projection did not retain its bounded transcript window");
-        Require(entries[0].Text == "burst-1500" && entries[^1].Text == "burst-1999", "burst transcript ordering or tail retention was incorrect");
+        Require(entries[0].Text == $"burst-{burstSize - WorkspaceView.MaximumEntries:0000}" && entries[^1].Text == $"burst-{burstSize - 1:0000}", "burst transcript ordering or tail retention was incorrect");
         Require(entries.Zip(entries.Skip(1)).All(pair => string.CompareOrdinal(pair.First.Text, pair.Second.Text) < 0), "burst transcript ordering was not FIFO");
 
         var unreadBeforeRead = channel.UnreadCount;
@@ -323,8 +337,28 @@ internal static class UiSmokeHarness
         Require(channel.Activity == WorkspaceActivity.None && channel.UnreadCount == 0, "post-burst selection did not restore read state");
 
         var diagnostics = viewModel.Sessions.Diagnostics.StateDispatch;
-        Console.WriteLine($"BURST_UI_METRICS events={burstSize} selection_ms={selectionMilliseconds:F3} unread_before_read={unreadBeforeRead} max_queue_depth={diagnostics.MaximumQueueDepth} p95_queue_wait_ms={diagnostics.P95QueueWaitMilliseconds:F3} p95_wpf_schedule_wait_ms={diagnostics.P95WpfScheduleWaitMilliseconds:F3} p95_mutation_ms={diagnostics.P95MutationDurationMilliseconds:F3} tail_ordered=true");
+        var boundary = diagnostics.BoundaryDiagnostics;
+        var presentation = viewModel.PresentationDiagnostics;
+        Console.WriteLine(
+            $"BURST_UI_METRICS events={burstSize} selection_authority_wait_ms=0.000 selection_wpf_wait_ms={selectionWpfWaitMilliseconds:F3} selection_wpf_execution_ms={selectionExecutionMilliseconds:F3} "
+            + $"selection_before_burst_complete={selectionBeforeBurstComplete} unread_before_read={unreadBeforeRead} max_authoritative_queue_depth={diagnostics.MaximumQueueDepth} "
+            + $"max_wpf_pending={diagnostics.MaximumWpfPendingWorkItems} wpf_posted={diagnostics.WpfWorkItemsPosted} wpf_executed={diagnostics.WpfWorkItemsExecuted} "
+            + $"p50_wpf_schedule_wait_ms={diagnostics.P50WpfScheduleWaitMilliseconds:F3} p95_wpf_schedule_wait_ms={diagnostics.P95WpfScheduleWaitMilliseconds:F3} p99_wpf_schedule_wait_ms={diagnostics.P99WpfScheduleWaitMilliseconds:F3} "
+            + $"p50_queue_wait_ms={diagnostics.P50QueueWaitMilliseconds:F3} p95_queue_wait_ms={diagnostics.P95QueueWaitMilliseconds:F3} p99_queue_wait_ms={diagnostics.P99QueueWaitMilliseconds:F3} "
+            + $"p95_mutation_ms={diagnostics.P95MutationDurationMilliseconds:F3} cooperative_slices={diagnostics.CooperativeSliceCount} cooperative_yields={diagnostics.CooperativeYieldCount} "
+            + $"max_slice_work_items={diagnostics.MaximumCooperativeSliceWorkItems} max_slice_ms={diagnostics.MaximumCooperativeSliceDurationMilliseconds:F3} "
+            + $"navigation_refresh_requests={presentation.NavigationRefreshRequests} navigation_refresh_executions={presentation.NavigationRefreshExecutions} "
+            + $"navigation_refresh_coalesced={presentation.NavigationRefreshCoalescedRequests} tail_ordered=true");
     }
+
+    private static bool BurstTailReached(ChannelView channel, int lastIndex)
+    {
+        var entries = channel.EntriesSnapshot;
+        return entries.Count == WorkspaceView.MaximumEntries
+            && entries[^1].Text == $"burst-{lastIndex:0000}";
+    }
+
+    private static double TicksToMilliseconds(long ticks) => ticks * 1000d / Stopwatch.Frequency;
 
     private static async Task QueryNickAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
     {

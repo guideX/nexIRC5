@@ -17,6 +17,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private bool _isStatusBarVisible = true;
     private bool _shutdownStarted;
     private int _navigationRefreshPending;
+    private long _navigationRefreshRequests;
+    private long _navigationRefreshExecutions;
+    private long _navigationRefreshCoalescedRequests;
     private readonly DesktopNotificationAdapter? _notificationAdapter;
     private readonly System.Windows.Threading.Dispatcher _uiDispatcher;
     private readonly Dictionary<Guid, MemorySaslCredentialProvider> _sessionCredentials = [];
@@ -116,6 +119,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public ObservableCollection<NetworkWorkspace> Networks => Sessions.Networks;
 
     public ObservableCollection<ConversationNavigationItem> ConversationNavigator { get; } = [];
+
+    public MainWindowPresentationDiagnostics PresentationDiagnostics => new(
+        Interlocked.Read(ref _navigationRefreshRequests),
+        Interlocked.Read(ref _navigationRefreshExecutions),
+        Interlocked.Read(ref _navigationRefreshCoalescedRequests));
 
     public InputHistory InputHistory { get; }
 
@@ -864,8 +872,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private void OnNavigationChanged(object? sender, EventArgs e)
     {
+        Interlocked.Increment(ref _navigationRefreshRequests);
         if (Interlocked.Exchange(ref _navigationRefreshPending, 1) != 0)
         {
+            Interlocked.Increment(ref _navigationRefreshCoalescedRequests);
             return;
         }
 
@@ -885,6 +895,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private void RefreshConversationNavigator()
     {
+        Interlocked.Increment(ref _navigationRefreshExecutions);
         ConversationNavigator.Clear();
         foreach (var item in Sessions.GetConversationNavigator())
         {
@@ -1051,3 +1062,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
     }
 }
+
+public sealed record MainWindowPresentationDiagnostics(
+    long NavigationRefreshRequests,
+    long NavigationRefreshExecutions,
+    long NavigationRefreshCoalescedRequests);
