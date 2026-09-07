@@ -27,6 +27,7 @@ internal static class UiSmokeHarness
         "burst",
         "burst-fairness",
         "query-nick",
+        "contextual-actions",
         "sustained-interactivity",
         "close-idle",
         "close-sustained",
@@ -95,6 +96,9 @@ internal static class UiSmokeHarness
             case "query-nick":
                 await QueryNickAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
+            case "contextual-actions":
+                await ContextualActionsAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
             case "sustained-interactivity":
                 await SustainedInteractivityAsync(window, demo, state.Alpha, state.Beta).ConfigureAwait(true);
                 break;
@@ -142,6 +146,44 @@ internal static class UiSmokeHarness
 
         Require(viewModel.Sessions.CloseView(query.Id), "participant query surface did not close cleanly");
         Require(viewModel.Sessions.CloseView(whoisView.Id), "WHOIS surface did not close cleanly");
+    }
+
+    private static async Task ContextualActionsAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var viewModel = window.ViewModel;
+        var channel = RequiredChannel(network);
+        var member = RequiredMember(channel, "Alex");
+        var context = viewModel.CreateParticipantContext(network, channel, member);
+
+        var networkActions = viewModel.Actions.BuildNetworkActions(network);
+        Require(networkActions.Single(item => item.Action == WorkspaceActionId.Connect).IsEnabled == false,
+            "registered network still exposed Connect as enabled");
+        Require(networkActions.Single(item => item.Action == WorkspaceActionId.Disconnect).IsEnabled,
+            "registered network did not expose Disconnect");
+
+        var channelActions = viewModel.Actions.BuildChannelActions(network, channel);
+        Require(channelActions.Single(item => item.Action == WorkspaceActionId.PartChannel).IsEnabled,
+            "joined channel did not expose Part");
+        Require(channelActions.Single(item => item.Action == WorkspaceActionId.RefreshNames).IsEnabled,
+            "joined channel did not expose Refresh member list");
+
+        var opened = await viewModel.Actions.ExecuteNetworkAsync(network, WorkspaceActionId.OpenNetwork).ConfigureAwait(true);
+        Require(opened.Succeeded && ReferenceEquals(viewModel.Sessions.ActiveView, network.StatusView),
+            "network context action did not activate server status");
+
+        var refresh = await viewModel.Actions.ExecuteChannelAsync(network, channel, WorkspaceActionId.RefreshNames).ConfigureAwait(true);
+        Require(refresh.Succeeded, "channel Refresh member list action failed");
+        Require(demo.AlphaTransport.OutboundLines.Contains("NAMES #general"),
+            "channel Refresh member list action did not route NAMES");
+
+        viewModel.OpenParticipantQuery(context);
+        Require(viewModel.ActiveView is QueryView query && query.Nickname == "Alex",
+            "nick Open Query action did not reuse the production query path");
+        var whois = await viewModel.Actions.ParticipantActions.SendWhoisAsync(context).ConfigureAwait(true);
+        Require(whois.Succeeded && whois.View is WhoisView, "nick WHOIS action failed");
+        demo.AlphaTransport.EnqueueInboundLine(":alpha.server 311 nexAlpha Alex alex alpha.example * :Alex Context User");
+        demo.AlphaTransport.EnqueueInboundLine(":alpha.server 318 nexAlpha Alex :End of WHOIS list");
+        await WaitForAsync(viewModel.Sessions, () => ((WhoisView)whois.View!).IsCompleted, "contextual WHOIS did not complete").ConfigureAwait(true);
     }
 
     private static async Task ModerationAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)

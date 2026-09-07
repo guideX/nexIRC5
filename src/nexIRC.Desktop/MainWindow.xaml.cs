@@ -348,13 +348,15 @@ public partial class MainWindow : Window
         {
             treeItem.IsSelected = true;
             ViewModel.SelectView(network.StatusView);
-            OpenContextMenu(treeItem, [
-                ("Connect", new Func<Task>(() => ViewModel.Sessions.ConnectAsync(network.Id).AsTask())),
-                ("Disconnect", new Func<Task>(() => ViewModel.Sessions.DisconnectAsync(network.Id).AsTask())),
-                ("Reconnect", new Func<Task>(() => ViewModel.Sessions.ReconnectAsync(network.Id).AsTask())),
-                ("Open Status", () => { ViewModel.SelectView(network.StatusView); return Task.CompletedTask; }),
-                ("Remove", new Func<Task>(() => ViewModel.Sessions.RemoveAsync(network.Id).AsTask()))
-            ], "NetworkContextMenu");
+            var actions = ViewModel.Actions.BuildNetworkActions(network)
+                .Select(action => new ContextMenuAction(
+                    action.Label,
+                    () => ExecuteWorkspaceActionAsync(network, action.Action),
+                    action.IsEnabled,
+                    action.DisabledReason))
+                .Append(new ContextMenuAction("Remove", new Func<Task>(() => ViewModel.Sessions.RemoveAsync(network.Id).AsTask())))
+                .ToArray();
+            OpenContextMenu(treeItem, actions, "NetworkContextMenu");
             e.Handled = true;
             return;
         }
@@ -376,14 +378,14 @@ public partial class MainWindow : Window
             {
                 if (channel.IsJoined)
                 {
-                    actions.Add(("PART (keep view)", () => ViewModel.ExecuteInputAsync($"/part {channel.Channel}")));
+                    actions.Add(("PART (keep view)", () => ExecuteChannelActionAsync(viewNetwork, channel, WorkspaceActionId.PartChannel)));
                     actions.Add(("PART and close", () => ViewModel.PartAndCloseActiveAsync()));
                     actions.Add(("Close view without PART", () => { ViewModel.CloseActiveView(); return Task.CompletedTask; }));
                 }
                 else
                 {
                     actions.Add(("Reopen view", () => { ViewModel.ReopenConversation(channel); return Task.CompletedTask; }));
-                    actions.Add(("Rejoin channel", () => ViewModel.ExecuteInputAsync($"/rejoin {channel.Channel}")));
+                    actions.Add(("Rejoin channel", () => ExecuteChannelActionAsync(viewNetwork, channel, WorkspaceActionId.RejoinChannel)));
                     if (channel.LifecycleState is ConversationLifecycleState.HistoricalOnly or ConversationLifecycleState.Parted)
                     {
                         actions.Add(("Remove historical view", () => { ViewModel.RemoveHistoricalConversation(channel); return Task.CompletedTask; }));
@@ -399,8 +401,8 @@ public partial class MainWindow : Window
                 actions.Add(("Copy channel name", () => CopyText(channel.Channel)));
                 if (channel.IsJoined)
                 {
-                    actions.Add(("Request channel modes", () => ViewModel.ExecuteInputAsync($"/mode {channel.Channel}")));
-                    actions.Add(("Request topic", () => ViewModel.ExecuteInputAsync($"/topic {channel.Channel}")));
+                    actions.Add(("Request channel modes", () => ExecuteChannelActionAsync(viewNetwork, channel, WorkspaceActionId.RequestModes)));
+                    actions.Add(("Request topic", () => ExecuteChannelActionAsync(viewNetwork, channel, WorkspaceActionId.RequestTopic)));
                     actions.Add(("Edit Topic…", () =>
                     {
                         OpenTopicEditor(viewNetwork, channel);
@@ -662,14 +664,21 @@ public partial class MainWindow : Window
 
     private void OpenContextMenu(FrameworkElement target, IEnumerable<(string Header, Func<Task> Action)> actions, string automationId = "WorkspaceContextMenu")
     {
+        OpenContextMenu(target, actions.Select(action => new ContextMenuAction(action.Header, action.Action)), automationId);
+    }
+
+    private void OpenContextMenu(FrameworkElement target, IEnumerable<ContextMenuAction> actions, string automationId = "WorkspaceContextMenu")
+    {
         var menu = new ContextMenu { PlacementTarget = target };
         AutomationProperties.SetAutomationId(menu, automationId);
         AutomationProperties.SetName(menu, automationId == "ChannelContextMenu" ? "Channel actions" : "Workspace actions");
-        foreach (var (header, action) in actions)
+        foreach (var action in actions)
         {
-            var item = new MenuItem { Header = header, Tag = action };
-            AutomationProperties.SetAutomationId(item, $"ContextAction.{header.Replace("…", string.Empty, StringComparison.Ordinal).Replace(" ", string.Empty, StringComparison.Ordinal)}");
-            AutomationProperties.SetName(item, header);
+            var item = new MenuItem { Header = action.Header, Tag = action.Action, IsEnabled = action.IsEnabled, ToolTip = action.DisabledReason };
+            AutomationProperties.SetAutomationId(item, $"ContextAction.{action.Header.Replace("…", string.Empty, StringComparison.Ordinal).Replace(" ", string.Empty, StringComparison.Ordinal)}");
+            AutomationProperties.SetName(item, action.IsEnabled || string.IsNullOrWhiteSpace(action.DisabledReason)
+                ? action.Header
+                : $"{action.Header} ({action.DisabledReason})");
             item.Click += OnGeneratedContextMenuClick;
             menu.Items.Add(item);
         }
@@ -682,6 +691,26 @@ public partial class MainWindow : Window
         if (sender is MenuItem { Tag: Func<Task> action })
         {
             await action();
+        }
+    }
+
+    private async Task ExecuteWorkspaceActionAsync(NetworkWorkspace network, WorkspaceActionId action)
+    {
+        var result = await ViewModel.Actions.ExecuteNetworkAsync(network, action).ConfigureAwait(true);
+        ViewModel.StatusText = result.Message;
+        if (result.View is not null)
+        {
+            ViewModel.SelectView(result.View);
+        }
+    }
+
+    private async Task ExecuteChannelActionAsync(NetworkWorkspace network, ChannelView channel, WorkspaceActionId action)
+    {
+        var result = await ViewModel.Actions.ExecuteChannelAsync(network, channel, action).ConfigureAwait(true);
+        ViewModel.StatusText = result.Message;
+        if (result.View is not null)
+        {
+            ViewModel.SelectView(result.View);
         }
     }
 
@@ -735,6 +764,12 @@ public partial class MainWindow : Window
         MessageBox.Show(this, "nexIRC 5\nA reconnect-aware, multi-network IRC client shell.", "About nexIRC", MessageBoxButton.OK, MessageBoxImage.Information);
 
     private sealed record ParticipantMenuInvocation(ParticipantActionContext Context, ParticipantMenuItem Action);
+
+    private sealed record ContextMenuAction(
+        string Header,
+        Func<Task> Action,
+        bool IsEnabled = true,
+        string? DisabledReason = null);
 
     private async void OnClosing(object? sender, CancelEventArgs e)
     {

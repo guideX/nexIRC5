@@ -45,8 +45,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             _notificationAdapter = new DesktopNotificationAdapter(Sessions.Notifications, () => CurrentPreferences, notification => { RouteNotification(notification); });
         }
-        _commands = new IrcCommandDispatcher(Sessions);
-        ParticipantActions = new ParticipantActionService(Sessions);
+        Actions = new WorkspaceActionRouter(Sessions);
+        _commands = new IrcCommandDispatcher(Sessions, Actions);
+        ParticipantActions = Actions.ParticipantActions;
         InputHistory = new InputHistory();
         Completion = new CompletionEngine(() => Configuration?.Aliases ?? Array.Empty<AliasDefinition>());
         if (configuration is not null)
@@ -108,6 +109,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public NetworkSessionManager Sessions { get; }
 
     public ParticipantActionService ParticipantActions { get; }
+
+    public WorkspaceActionRouter Actions { get; }
 
     public ConfigurationService? Configuration { get; }
 

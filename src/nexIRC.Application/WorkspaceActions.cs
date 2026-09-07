@@ -1,0 +1,427 @@
+using nexIRC.Core.Protocol;
+using nexIRC.Core.Session;
+using nexIRC.Core.State;
+
+namespace nexIRC.Application;
+
+public enum WorkspaceActionId
+{
+    Connect,
+    Disconnect,
+    Reconnect,
+    OpenNetwork,
+    OpenChannel,
+    JoinChannel,
+    RejoinChannel,
+    PartChannel,
+    RequestTopic,
+    EditTopic,
+    RequestModes,
+    RefreshNames
+}
+
+public enum WorkspaceActionTargetKind
+{
+    Network,
+    Channel,
+    Query,
+    Nickname
+}
+
+public sealed record WorkspaceActionTarget(
+    Guid NetworkId,
+    Guid? ViewId = null,
+    string? Name = null,
+    string? Nickname = null);
+
+public sealed record WorkspaceActionDescriptor(
+    WorkspaceActionId Action,
+    string Label,
+    WorkspaceActionTargetKind TargetKind,
+    WorkspaceActionTarget Target,
+    bool IsEnabled,
+    string? DisabledReason = null)
+{
+    public string AccessibleText => IsEnabled || string.IsNullOrWhiteSpace(DisabledReason)
+        ? Label
+        : $"{Label} ({DisabledReason})";
+}
+
+/// <summary>
+/// Shared application action boundary for commands and contextual UI.  It
+/// owns target/state validation and routes accepted operations through the
+/// session manager; WPF never writes protocol lines directly.
+/// </summary>
+public sealed class WorkspaceActionRouter
+{
+    private readonly NetworkSessionManager _sessions;
+
+    public WorkspaceActionRouter(NetworkSessionManager sessions)
+    {
+        _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
+        ParticipantActions = new ParticipantActionService(sessions);
+        ChannelActions = new ChannelActionService(sessions);
+    }
+
+    public ParticipantActionService ParticipantActions { get; }
+
+    public ChannelActionService ChannelActions { get; }
+
+    public IReadOnlyList<WorkspaceActionDescriptor> BuildNetworkActions(NetworkWorkspace network)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        var state = network.State;
+        var canConnect = state is NetworkDisplayState.Disconnected or NetworkDisplayState.Failed;
+        var canDisconnect = state is not (NetworkDisplayState.Disconnected or NetworkDisplayState.Failed or NetworkDisplayState.ReconnectWaiting);
+        var canReconnect = state is NetworkDisplayState.Disconnected
+            or NetworkDisplayState.Failed
+            or NetworkDisplayState.Registered
+            or NetworkDisplayState.Connected;
+        var target = new WorkspaceActionTarget(network.Id, network.StatusView.Id, network.DisplayName);
+        return
+        [
+            new(WorkspaceActionId.Connect, "Connect", WorkspaceActionTargetKind.Network, target, canConnect,
+                canConnect ? null : "The network is already connected or is transitioning."),
+            new(WorkspaceActionId.Disconnect, "Disconnect", WorkspaceActionTargetKind.Network, target, canDisconnect,
+                canDisconnect ? null : "The network is already disconnected or waiting to reconnect."),
+            new(WorkspaceActionId.Reconnect, "Reconnect", WorkspaceActionTargetKind.Network, target, canReconnect,
+                canReconnect ? null : "Reconnect is unavailable during this lifecycle transition."),
+            new(WorkspaceActionId.OpenNetwork, "Open status", WorkspaceActionTargetKind.Network, target, true)
+        ];
+    }
+
+    public IReadOnlyList<WorkspaceActionDescriptor> BuildChannelActions(NetworkWorkspace network, ChannelView channel)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(channel);
+        var consistent = network.Id == channel.NetworkId;
+        var registered = consistent && IsRegistered(network);
+        var logicallyJoined = channel.IsJoined && channel.LifecycleState is not (ConversationLifecycleState.Parted or ConversationLifecycleState.Kicked or ConversationLifecycleState.Disconnected or ConversationLifecycleState.HistoricalOnly);
+        var joined = registered && logicallyJoined;
+        var authority = consistent ? ChannelAuthority.Evaluate(network, channel) : null;
+        var target = new WorkspaceActionTarget(network.Id, channel.Id, channel.Channel);
+        return
+        [
+            new(WorkspaceActionId.OpenChannel, "Open channel", WorkspaceActionTargetKind.Channel, target, consistent),
+            new(WorkspaceActionId.JoinChannel, "Join channel", WorkspaceActionTargetKind.Channel, target, registered && !logicallyJoined,
+                registered && !logicallyJoined ? null : !registered ? "Connect and register first" : "The channel is already joined."),
+            new(WorkspaceActionId.RejoinChannel, "Rejoin channel", WorkspaceActionTargetKind.Channel, target, registered && !logicallyJoined,
+                registered && !logicallyJoined ? null : !registered ? "Connect and register first" : "The channel is already joined."),
+            new(WorkspaceActionId.PartChannel, "Part channel", WorkspaceActionTargetKind.Channel, target, joined,
+                joined ? null : !registered ? "Connect and register first" : "The channel is not currently joined."),
+            new(WorkspaceActionId.RequestTopic, "Request topic", WorkspaceActionTargetKind.Channel, target, joined,
+                joined ? null : "Join the channel first."),
+            new(WorkspaceActionId.EditTopic, "Edit topic", WorkspaceActionTargetKind.Channel, target, joined && authority!.ChangeTopic.IsAllowed,
+                joined && authority!.ChangeTopic.IsAllowed ? null : !joined ? "Join the channel first." : authority!.ChangeTopic.Reason),
+            new(WorkspaceActionId.RequestModes, "Request channel modes", WorkspaceActionTargetKind.Channel, target, joined,
+                joined ? null : "Join the channel first."),
+            new(WorkspaceActionId.RefreshNames, "Refresh member list", WorkspaceActionTargetKind.Channel, target, joined,
+                joined ? null : "Join the channel first.")
+        ];
+    }
+
+    public async ValueTask<CommandDispatchResult> ExecuteNetworkAsync(
+        NetworkWorkspace network,
+        WorkspaceActionId action,
+        CancellationToken cancellationToken = default)
+    {
+        var descriptor = BuildNetworkActions(network).FirstOrDefault(item => item.Action == action);
+        if (descriptor is null)
+        {
+            return CommandDispatchResult.Failure("The network action is not supported.", network.StatusView);
+        }
+
+        if (!descriptor.IsEnabled)
+        {
+            return CommandDispatchResult.Failure(descriptor.DisabledReason ?? "The network action is unavailable.", network.StatusView);
+        }
+
+        switch (action)
+        {
+            case WorkspaceActionId.Connect:
+                await _sessions.ConnectAsync(network.Id, cancellationToken).ConfigureAwait(false);
+                return CommandDispatchResult.Success($"Connecting to {network.DisplayName}.", network.StatusView);
+            case WorkspaceActionId.Disconnect:
+                await _sessions.DisconnectAsync(network.Id).ConfigureAwait(false);
+                return CommandDispatchResult.Success($"Disconnect requested for {network.DisplayName}.", network.StatusView);
+            case WorkspaceActionId.Reconnect:
+                await _sessions.ReconnectAsync(network.Id, cancellationToken).ConfigureAwait(false);
+                return CommandDispatchResult.Success($"Reconnecting to {network.DisplayName}.", network.StatusView);
+            case WorkspaceActionId.OpenNetwork:
+                _sessions.ActivateView(network.StatusView.Id);
+                return CommandDispatchResult.Success($"Opened {network.DisplayName}.", network.StatusView);
+            default:
+                return CommandDispatchResult.Failure("The network action is not supported.", network.StatusView);
+        }
+    }
+
+    public async ValueTask<CommandDispatchResult> ExecuteChannelAsync(
+        NetworkWorkspace network,
+        ChannelView channel,
+        WorkspaceActionId action,
+        CancellationToken cancellationToken = default)
+    {
+        var descriptor = BuildChannelActions(network, channel).FirstOrDefault(item => item.Action == action);
+        if (descriptor is null)
+        {
+            return CommandDispatchResult.Failure("The channel action is not supported.", channel);
+        }
+
+        if (!descriptor.IsEnabled)
+        {
+            return CommandDispatchResult.Failure(descriptor.DisabledReason ?? "The channel action is unavailable.", channel);
+        }
+
+        switch (action)
+        {
+            case WorkspaceActionId.OpenChannel:
+                _sessions.ActivateView(channel.Id);
+                return CommandDispatchResult.Success($"Opened {channel.Channel}.", channel);
+            case WorkspaceActionId.JoinChannel:
+                await network.Session.JoinChannelAsync(channel.Channel, cancellationToken).ConfigureAwait(false);
+                _sessions.ActivateView(channel.Id);
+                return CommandDispatchResult.Success($"Joining {channel.Channel}.", channel);
+            case WorkspaceActionId.RejoinChannel:
+                await network.Session.RejoinChannelAsync(channel.Channel, cancellationToken).ConfigureAwait(false);
+                _sessions.ActivateView(channel.Id);
+                return CommandDispatchResult.Success($"Rejoining {channel.Channel}.", channel);
+            case WorkspaceActionId.PartChannel:
+                return await PartChannelAsync(network, channel, null, allowPendingJoinCancellation: false, cancellationToken: cancellationToken).ConfigureAwait(false);
+            case WorkspaceActionId.RequestTopic:
+                await network.Session.SendCommandAsync("TOPIC", [channel.Channel], cancellationToken: cancellationToken).ConfigureAwait(false);
+                return CommandDispatchResult.Success($"Topic requested for {channel.Channel}.", channel);
+            case WorkspaceActionId.EditTopic:
+                return CommandDispatchResult.Failure("Use the topic editor or /topic <text> to set a topic.", channel);
+            case WorkspaceActionId.RequestModes:
+                await network.Session.SendCommandAsync("MODE", [channel.Channel], cancellationToken: cancellationToken).ConfigureAwait(false);
+                return CommandDispatchResult.Success($"Channel modes requested for {channel.Channel}.", channel);
+            case WorkspaceActionId.RefreshNames:
+                await network.Session.SendCommandAsync("NAMES", [channel.Channel], cancellationToken: cancellationToken).ConfigureAwait(false);
+                return CommandDispatchResult.Success($"Refreshing members for {channel.Channel}.", channel);
+            default:
+                return CommandDispatchResult.Failure("The channel action is not supported.", channel);
+        }
+    }
+
+    public async ValueTask<CommandDispatchResult> PartChannelAsync(
+        NetworkWorkspace network,
+        ChannelView channel,
+        string? reason = null,
+        bool allowPendingJoinCancellation = false,
+        CancellationToken cancellationToken = default)
+    {
+        var descriptor = BuildChannelActions(network, channel).FirstOrDefault(item => item.Action == WorkspaceActionId.PartChannel);
+        var pendingJoin = network.Session.Snapshot.DesiredChannels.Any(item => IrcIdentity.Equals(item, channel.Channel, network.Snapshot.Features.CaseMapping));
+        if (descriptor is null || !descriptor.IsEnabled && !(allowPendingJoinCancellation && pendingJoin && IsRegistered(network)))
+        {
+            return CommandDispatchResult.Failure(descriptor?.DisabledReason ?? "The channel action is unavailable.", channel);
+        }
+
+        if (reason?.Any(char.IsControl) == true)
+        {
+            return CommandDispatchResult.Failure("A part reason cannot contain control characters.", channel);
+        }
+
+        await network.Session.PartChannelAsync(channel.Channel, string.IsNullOrWhiteSpace(reason) ? null : reason, cancellationToken).ConfigureAwait(false);
+        channel.SetLifecycleState(ConversationLifecycleState.Parted);
+        return CommandDispatchResult.Success($"Leaving {channel.Channel}.", channel);
+    }
+
+    public QueryView OpenQuery(NetworkWorkspace network, string nickname)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ValidateTarget(nickname, "nickname");
+        var view = _sessions.EnsureQuery(network.Id, nickname);
+        _sessions.ActivateView(view.Id);
+        _sessions.RecordRecent(network, DestinationKind.Query, nickname);
+        return view;
+    }
+
+    public async ValueTask<CommandDispatchResult> RequestWhoisAsync(NetworkWorkspace network, string nickname, CancellationToken cancellationToken = default)
+    {
+        if (!IsRegistered(network))
+        {
+            return CommandDispatchResult.Failure("The network is not registered.", network.StatusView);
+        }
+
+        ValidateTarget(nickname, "nickname");
+        var request = await _sessions.RequestWhoisAsync(network.Id, nickname, cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success($"WHOIS requested for {nickname}.", request.View);
+    }
+
+    public async ValueTask<CommandDispatchResult> SendMessageAsync(
+        NetworkWorkspace network,
+        string target,
+        string text,
+        WorkspaceView? preferredView = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (!IsRegistered(network))
+        {
+            return CommandDispatchResult.Failure("The network is not registered.", preferredView ?? network.StatusView);
+        }
+
+        ValidateTarget(target, "target");
+        ValidateText(text, "message");
+        var isChannel = IsChannelTarget(network, target);
+        WorkspaceView view;
+        if (preferredView is { NetworkId: var networkId } candidate
+            && networkId == network.Id
+            && ((isChannel && candidate is ChannelView channel && IrcIdentity.Equals(channel.Channel, target, network.Snapshot.Features.CaseMapping))
+                || (!isChannel && candidate is QueryView query && IrcIdentity.Equals(query.Nickname, target, network.Snapshot.Features.CaseMapping))))
+        {
+            view = candidate;
+        }
+        else
+        {
+            view = isChannel
+                ? (WorkspaceView)_sessions.EnsureChannel(network.Id, target)
+                : OpenQuery(network, target);
+        }
+
+        _sessions.ActivateView(view.Id);
+        if (isChannel)
+        {
+            _sessions.RecordRecent(network, DestinationKind.Channel, target);
+        }
+
+        await network.Session.SendCommandAsync("PRIVMSG", [target], text, cancellationToken).ConfigureAwait(false);
+        _sessions.AppendLocal(view, IrcEventPresentation.CreateLocalMessage(
+            network.Session.Snapshot.Nickname,
+            text,
+            isChannel ? OutgoingMessageKind.ChannelMessage : OutgoingMessageKind.PrivateMessage));
+        return CommandDispatchResult.Success($"Message sent to {target}.", view);
+    }
+
+    public async ValueTask<CommandDispatchResult> SendNoticeAsync(NetworkWorkspace network, string target, string text, CancellationToken cancellationToken = default)
+    {
+        if (!IsRegistered(network))
+        {
+            return CommandDispatchResult.Failure("The network is not registered.", network.StatusView);
+        }
+
+        ValidateTarget(target, "target");
+        ValidateText(text, "NOTICE text");
+        var isChannel = IsChannelTarget(network, target);
+        WorkspaceView view = isChannel
+            ? _sessions.EnsureChannel(network.Id, target)
+            : OpenQuery(network, target);
+        var command = new IrcCommandBuilder(CommandLimit(network)).Build("NOTICE", [target], text);
+        await network.Session.SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
+        _sessions.AppendLocal(view, IrcEventPresentation.CreateLocalMessage(network.Session.Snapshot.Nickname, text, OutgoingMessageKind.Notice));
+        return CommandDispatchResult.Success($"Notice sent to {target}.", view);
+    }
+
+    public async ValueTask<CommandDispatchResult> SendActionAsync(NetworkWorkspace network, WorkspaceView activeView, string text, CancellationToken cancellationToken = default)
+    {
+        if (!IsRegistered(network))
+        {
+            return CommandDispatchResult.Failure("The network is not registered.", activeView);
+        }
+
+        var target = activeView switch
+        {
+            ChannelView channel => channel.Channel,
+            QueryView query => query.Nickname,
+            _ => null
+        };
+        if (target is null)
+        {
+            return CommandDispatchResult.Failure("Select a channel or query before sending an action.", activeView);
+        }
+
+        ValidateText(text, "action");
+        var command = IrcParticipantCommandBuilder.BuildAction(new IrcCommandBuilder(CommandLimit(network)), target, text);
+        await network.Session.SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
+        _sessions.AppendLocal(activeView, IrcEventPresentation.CreateLocalMessage(network.Session.Snapshot.Nickname, text, OutgoingMessageKind.Action));
+        return CommandDispatchResult.Success($"Action sent to {target}.", activeView);
+    }
+
+    public async ValueTask<CommandDispatchResult> ChangeNicknameAsync(NetworkWorkspace network, string nickname, CancellationToken cancellationToken = default)
+    {
+        if (!IsRegistered(network))
+        {
+            return CommandDispatchResult.Failure("The network is not registered.", network.StatusView);
+        }
+
+        ValidateTarget(nickname, "nickname");
+        await network.Session.SendCommandAsync("NICK", [nickname], cancellationToken: cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success($"Nickname change requested: {nickname}.", network.StatusView);
+    }
+
+    public async ValueTask<CommandDispatchResult> SendAwayAsync(NetworkWorkspace network, string? message, CancellationToken cancellationToken = default)
+    {
+        if (!IsRegistered(network))
+        {
+            return CommandDispatchResult.Failure("The network is not registered.", network.StatusView);
+        }
+
+        if (message?.Any(char.IsControl) == true)
+        {
+            return CommandDispatchResult.Failure("Away text cannot contain control characters.", network.StatusView);
+        }
+
+        await network.Session.SendCommandAsync("AWAY", trailingParameter: string.IsNullOrWhiteSpace(message) ? null : message.Trim(), cancellationToken: cancellationToken).ConfigureAwait(false);
+        var detail = string.IsNullOrWhiteSpace(message) ? "Away status cleared." : "Away status set.";
+        _sessions.AppendLocal(network.StatusView, IrcEventPresentation.CreateLocalCommand(detail));
+        return CommandDispatchResult.Success(detail, network.StatusView);
+    }
+
+    public async ValueTask<CommandDispatchResult> SendWhoAsync(NetworkWorkspace network, string? target, CancellationToken cancellationToken = default)
+    {
+        if (!IsRegistered(network))
+        {
+            return CommandDispatchResult.Failure("The network is not registered.", network.StatusView);
+        }
+
+        if (!string.IsNullOrWhiteSpace(target))
+        {
+            ValidateTarget(target, "WHO target");
+        }
+
+        await network.Session.SendCommandAsync("WHO", string.IsNullOrWhiteSpace(target) ? null : [target], cancellationToken: cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success(string.IsNullOrWhiteSpace(target) ? "WHO requested." : $"WHO requested for {target}.", network.StatusView);
+    }
+
+    public async ValueTask<CommandDispatchResult> SendNamesAsync(NetworkWorkspace network, string? channel, CancellationToken cancellationToken = default)
+    {
+        if (!IsRegistered(network))
+        {
+            return CommandDispatchResult.Failure("The network is not registered.", network.StatusView);
+        }
+
+        if (!string.IsNullOrWhiteSpace(channel))
+        {
+            ValidateTarget(channel, "channel");
+        }
+
+        await network.Session.SendCommandAsync("NAMES", string.IsNullOrWhiteSpace(channel) ? null : [channel], cancellationToken: cancellationToken).ConfigureAwait(false);
+        return CommandDispatchResult.Success(string.IsNullOrWhiteSpace(channel) ? "NAMES requested." : $"NAMES requested for {channel}.", network.StatusView);
+    }
+
+    private static bool IsRegistered(NetworkWorkspace network) =>
+        network.Snapshot.Registration == RegistrationState.Registered
+        && network.Snapshot.State is not (ServerSessionState.Disconnected or ServerSessionState.Failed or ServerSessionState.ReconnectWaiting);
+
+    private static bool IsChannelTarget(NetworkWorkspace network, string target) =>
+        target.Length > 0 && network.Snapshot.Features.ChannelTypes.Contains(target[0]);
+
+    private static int CommandLimit(NetworkWorkspace network) =>
+        Math.Max(3, Math.Min(network.Session.MaximumOutboundLineBytes, network.Snapshot.Features.LineLength));
+
+    private static void ValidateTarget(string value, string name)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Any(char.IsWhiteSpace) || value.Any(char.IsControl) || value[0] == ':')
+        {
+            throw new ArgumentException($"The {name} must be one safe IRC token.", name);
+        }
+    }
+
+    private static void ValidateText(string value, string name)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Any(character => character is '\r' or '\n' or '\0'))
+        {
+            throw new ArgumentException($"The {name} is required and cannot contain line breaks or NUL characters.", name);
+        }
+    }
+}

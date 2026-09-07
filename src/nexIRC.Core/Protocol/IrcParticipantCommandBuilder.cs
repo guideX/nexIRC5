@@ -13,6 +13,9 @@ public static class IrcParticipantCommandBuilder
     public static IrcOutboundMessage BuildNotice(IrcCommandBuilder builder, string target, string text) =>
         builder.Build("NOTICE", [ValidateNickname(target)], ValidateText(text, nameof(text)));
 
+    public static IrcOutboundMessage BuildAction(IrcCommandBuilder builder, string target, string text) =>
+        builder.Build("PRIVMSG", [ValidateNickname(target)], $"\u0001ACTION {ValidateText(text, nameof(text))}\u0001");
+
     public static IrcOutboundMessage BuildCtcp(IrcCommandBuilder builder, string target, string command, string? arguments = null)
     {
         target = ValidateNickname(target);
