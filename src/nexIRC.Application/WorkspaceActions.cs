@@ -196,7 +196,7 @@ public sealed class WorkspaceActionRouter
                 await network.Session.SendCommandAsync("MODE", [channel.Channel], cancellationToken: cancellationToken).ConfigureAwait(false);
                 return CommandDispatchResult.Success($"Channel modes requested for {channel.Channel}.", channel);
             case WorkspaceActionId.RefreshNames:
-                await network.Session.SendCommandAsync("NAMES", [channel.Channel], cancellationToken: cancellationToken).ConfigureAwait(false);
+                await network.Session.RequestNamesAsync(channel.Channel, cancellationToken).ConfigureAwait(false);
                 return CommandDispatchResult.Success($"Refreshing members for {channel.Channel}.", channel);
             default:
                 return CommandDispatchResult.Failure("The channel action is not supported.", channel);
@@ -395,7 +395,7 @@ public sealed class WorkspaceActionRouter
             ValidateTarget(channel, "channel");
         }
 
-        await network.Session.SendCommandAsync("NAMES", string.IsNullOrWhiteSpace(channel) ? null : [channel], cancellationToken: cancellationToken).ConfigureAwait(false);
+        await network.Session.RequestNamesAsync(channel, cancellationToken).ConfigureAwait(false);
         return CommandDispatchResult.Success(string.IsNullOrWhiteSpace(channel) ? "NAMES requested." : $"NAMES requested for {channel}.", network.StatusView);
     }
 

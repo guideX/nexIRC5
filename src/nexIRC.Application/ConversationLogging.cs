@@ -27,6 +27,14 @@ public enum ConversationLogSearchScope
 public sealed record ConversationLogRecord
 {
     public DateTimeOffset Timestamp { get; init; }
+    /// <summary>
+    /// Local delivery/processing time. Timestamp remains the displayed
+    /// message time and may be authoritative server-time. This diagnostic is
+    /// intentionally runtime-only so it does not expand every JSONL history
+    /// record on the hot message path.
+    /// </summary>
+    [JsonIgnore]
+    public DateTimeOffset? ReceivedAt { get; init; }
     public Guid NetworkId { get; init; }
     public Guid ScopeId { get; init; }
     public Guid? ProfileId { get; init; }
@@ -266,6 +274,7 @@ public sealed class ConversationLoggingService
         var record = new ConversationLogRecord
         {
             Timestamp = entry.Timestamp,
+            ReceivedAt = entry.ReceivedAt,
             NetworkId = networkId,
             ScopeId = profileId ?? networkId,
             ProfileId = profileId,

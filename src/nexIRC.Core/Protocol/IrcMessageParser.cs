@@ -23,7 +23,10 @@ public static class IrcMessageParser
                     return IrcParseResult.FromError("A tag section must be followed by a command.");
                 }
 
-                ParseTags(rawLine[(index + 1)..tagEnd], tags);
+                if (!TryParseTags(rawLine[(index + 1)..tagEnd], tags, out var tagError))
+                {
+                    return IrcParseResult.FromError(tagError ?? "The IRC tag section was malformed.");
+                }
                 index = tagEnd;
             }
 
@@ -95,25 +98,36 @@ public static class IrcMessageParser
         }
     }
 
-    private static void ParseTags(string rawTags, List<IrcMessageTag> tags)
+    private static bool TryParseTags(string rawTags, List<IrcMessageTag> tags, out string? error)
     {
+        error = null;
+        if (rawTags.Length == 0)
+        {
+            error = "The IRC tag section was empty.";
+            return false;
+        }
+
         foreach (var rawTag in rawTags.Split(';'))
         {
             if (rawTag.Length == 0)
             {
-                throw new FormatException("The IRC tag section contained an empty tag.");
+                error = "The IRC tag section contained an empty tag.";
+                return false;
             }
 
             var equals = rawTag.IndexOf('=');
             var key = equals >= 0 ? rawTag[..equals] : rawTag;
-            if (key.Length == 0)
+            if (key.Length == 0 || key.Any(static character => character is ';' or ' ' or '\r' or '\n' or '\0'))
             {
-                throw new FormatException("An IRC message tag had an empty key.");
+                error = "An IRC message tag had an invalid key.";
+                return false;
             }
 
             var rawValue = equals >= 0 ? rawTag[(equals + 1)..] : null;
             tags.Add(new IrcMessageTag(rawTag, key, rawValue, Unescape(rawValue)));
         }
+
+        return true;
     }
 
     private static string? Unescape(string? value)
@@ -132,15 +146,32 @@ public static class IrcMessageParser
                 continue;
             }
 
-            builder.Append(value[++index] switch
+            var escaped = value[++index];
+            switch (escaped)
             {
-                ':' => ';',
-                's' => ' ',
-                'r' => '\r',
-                'n' => '\n',
-                '\\' => '\\',
-                _ => value[index]
-            });
+                case ':':
+                    builder.Append(';');
+                    break;
+                case 's':
+                    builder.Append(' ');
+                    break;
+                case 'r':
+                    builder.Append('\r');
+                    break;
+                case 'n':
+                    builder.Append('\n');
+                    break;
+                case '\\':
+                    builder.Append('\\');
+                    break;
+                default:
+                    // Preserve an unknown escape literally.  This keeps a
+                    // future tag value round-trippable and, importantly,
+                    // prevents malformed metadata from shifting the command.
+                    builder.Append('\\');
+                    builder.Append(escaped);
+                    break;
+            }
         }
 
         return builder.ToString();

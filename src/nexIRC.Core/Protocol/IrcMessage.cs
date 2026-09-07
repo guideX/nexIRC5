@@ -107,6 +107,10 @@ public sealed class IrcMessage
         Parameters = hasTrailingParameter
             ? new ReadOnlyCollection<string>(middleParameters.Concat(new[] { trailingParameter! }).ToList())
             : middleParameters;
+        ServerTimestamp = TagValues.TryGetValue("time", out var time)
+            && IrcServerTime.TryParse(time, out var parsedTimestamp)
+                ? parsedTimestamp
+                : null;
     }
 
     public string RawLine { get; }
@@ -131,9 +135,43 @@ public sealed class IrcMessage
 
     public IReadOnlyList<string> Parameters { get; }
 
+    /// <summary>
+    /// The authoritative timestamp supplied by the server-time message tag,
+    /// when the tag is present and has the strict IRCv3 timestamp form.
+    /// </summary>
+    public DateTimeOffset? ServerTimestamp { get; }
+
     public bool IsNumeric => NumericCommand.HasValue;
 
     private static bool IsNumericCommand(string command) => command.Length == 3 && command.All(static c => c is >= '0' and <= '9');
+}
+
+public static class IrcServerTime
+{
+    private static readonly string[] Formats =
+    [
+        "yyyy-MM-dd'T'HH:mm:ss.FFFFFFF'Z'",
+        "yyyy-MM-dd'T'HH:mm:ss'Z'",
+        "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFzzz",
+        "yyyy-MM-dd'T'HH:mm:sszzz"
+    ];
+
+    public static bool TryParse(string? value, out DateTimeOffset timestamp)
+    {
+        if (value is not null
+            && DateTimeOffset.TryParseExact(
+                value,
+                Formats,
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+                out timestamp))
+        {
+            return true;
+        }
+
+        timestamp = default;
+        return false;
+    }
 }
 
 public sealed class IrcParseResult

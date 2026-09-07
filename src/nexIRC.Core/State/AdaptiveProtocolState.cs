@@ -27,12 +27,14 @@ public sealed class CapabilitySnapshot
     internal CapabilitySnapshot(
         IReadOnlyDictionary<string, IrcCapability> available,
         IReadOnlySet<string> enabled,
+        IReadOnlySet<string> rejected,
         IReadOnlyList<string> rawAdvertisedTokens,
         IReadOnlyList<string> requestedTokens,
         CapNegotiationState negotiationState)
     {
         Available = available;
         Enabled = enabled;
+        Rejected = rejected;
         RawAdvertisedTokens = rawAdvertisedTokens;
         RequestedTokens = requestedTokens;
         NegotiationState = negotiationState;
@@ -42,6 +44,13 @@ public sealed class CapabilitySnapshot
 
     public IReadOnlySet<string> Enabled { get; }
 
+    /// <summary>
+    /// Capabilities explicitly refused by the server for this request.  This
+    /// is intentionally separate from an advertised capability that has not
+    /// yet been ACKed and from a requested capability absent from LS.
+    /// </summary>
+    public IReadOnlySet<string> Rejected { get; }
+
     public IReadOnlyList<string> RawAdvertisedTokens { get; }
 
     public IReadOnlyList<string> RequestedTokens { get; }
@@ -50,16 +59,71 @@ public sealed class CapabilitySnapshot
 
     public bool IsAvailable(string name) => Available.ContainsKey(Normalize(name));
 
+    public bool IsRequested(string name) => RequestedTokens.Contains(Normalize(name), StringComparer.Ordinal);
+
     public bool IsEnabled(string name) => Enabled.Contains(Normalize(name));
+
+    public bool IsRejected(string name) => Rejected.Contains(Normalize(name));
+
+    public bool IsUnavailable(string name) => IsRequested(name) && !IsAvailable(name) && !IsRejected(name);
+
+    public CapabilityNegotiationStatus GetStatus(string name)
+    {
+        var normalized = Normalize(name);
+        if (Enabled.Contains(normalized)) return CapabilityNegotiationStatus.Enabled;
+        if (Rejected.Contains(normalized)) return CapabilityNegotiationStatus.Rejected;
+        if (RequestedTokens.Contains(normalized, StringComparer.Ordinal)) return Available.ContainsKey(normalized)
+            ? CapabilityNegotiationStatus.Requested
+            : CapabilityNegotiationStatus.Unavailable;
+        return Available.ContainsKey(normalized)
+            ? CapabilityNegotiationStatus.Advertised
+            : CapabilityNegotiationStatus.Unknown;
+    }
 
     public static CapabilitySnapshot Empty { get; } = new(
         new ReadOnlyDictionary<string, IrcCapability>(new Dictionary<string, IrcCapability>(StringComparer.Ordinal)),
+        new HashSet<string>(StringComparer.Ordinal),
         new HashSet<string>(StringComparer.Ordinal),
         Array.Empty<string>(),
         Array.Empty<string>(),
         CapNegotiationState.NotStarted);
 
     internal static string Normalize(string name) => name.ToLowerInvariant();
+}
+
+public enum CapabilityNegotiationStatus
+{
+    Unknown,
+    Advertised,
+    Requested,
+    Enabled,
+    Rejected,
+    Unavailable
+}
+
+/// <summary>
+/// The bounded IRCv3 surface understood by nexIRC.  Callers may still pass
+/// an explicit capability list to <see cref="IrcCapabilityNegotiator"/> for
+/// experiments, but the application defaults are drawn from this registry so
+/// an advertised extension is never requested accidentally.
+/// </summary>
+public static class IrcCapabilityCatalog
+{
+    public const string MessageTags = "message-tags";
+    public const string ServerTime = "server-time";
+    public const string AwayNotify = "away-notify";
+    public const string ExtendedJoin = "extended-join";
+    public const string MultiPrefix = "multi-prefix";
+    public const string AccountNotify = "account-notify";
+    public const string AccountTag = "account-tag";
+    public const string LabeledResponse = "labeled-response";
+    public const string Sasl = "sasl";
+
+    public static IReadOnlyList<string> PreferredPhase1V { get; } =
+    [MessageTags, ServerTime, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
+
+    public static IReadOnlySet<string> Known { get; } =
+        new HashSet<string>(PreferredPhase1V.Concat([AccountTag, Sasl]), StringComparer.Ordinal);
 }
 
 public enum CapNegotiationState
@@ -92,6 +156,7 @@ public sealed class IrcCapabilityNegotiator
     private readonly IrcCommandBuilder _commandBuilder;
     private readonly Dictionary<string, IrcCapability> _available = new(StringComparer.Ordinal);
     private readonly HashSet<string> _enabled = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _rejected = new(StringComparer.Ordinal);
     private readonly List<string> _rawAdvertisedTokens = [];
     private readonly List<string> _requestedTokens;
     private readonly HashSet<string> _completionGateCapabilities;
@@ -118,6 +183,10 @@ public sealed class IrcCapabilityNegotiator
 
     public CapNegotiationResult Start()
     {
+        _available.Clear();
+        _enabled.Clear();
+        _rejected.Clear();
+        _rawAdvertisedTokens.Clear();
         _state = CapNegotiationState.Listing;
         return Result(_commandBuilder.Build("CAP", ["LS", "302"]));
     }
@@ -181,6 +250,15 @@ public sealed class IrcCapabilityNegotiator
                 return Result();
 
             case "NAK":
+                foreach (var token in tokens)
+                {
+                    var name = CapabilityName(token);
+                    if (name.Length > 0)
+                    {
+                        _rejected.Add(name);
+                    }
+                }
+
                 if (_state == CapNegotiationState.Requesting)
                 {
                     return EndNegotiation();
@@ -217,6 +295,7 @@ public sealed class IrcCapabilityNegotiator
     {
         _available.Clear();
         _enabled.Clear();
+        _rejected.Clear();
         _rawAdvertisedTokens.Clear();
         _state = CapNegotiationState.NotStarted;
     }
@@ -227,7 +306,7 @@ public sealed class IrcCapabilityNegotiator
     /// </summary>
     public CapNegotiationResult Complete()
     {
-        if (_state is CapNegotiationState.AwaitingCompletion or CapNegotiationState.Requesting)
+        if (_state is CapNegotiationState.Listing or CapNegotiationState.AwaitingCompletion or CapNegotiationState.Requesting)
         {
             return EndNegotiation();
         }
@@ -269,7 +348,10 @@ public sealed class IrcCapabilityNegotiator
 
         var rawValue = equals >= 0 ? rawToken[(equals + 1)..] : null;
         _available[name] = new IrcCapability(rawToken, name, rawValue, rawValue);
-        _rawAdvertisedTokens.Add(rawToken);
+        if (!_rawAdvertisedTokens.Contains(rawToken, StringComparer.Ordinal))
+        {
+            _rawAdvertisedTokens.Add(rawToken);
+        }
     }
 
     private void ApplyAcknowledgement(IEnumerable<string> tokens)
@@ -289,6 +371,7 @@ public sealed class IrcCapabilityNegotiator
             else
             {
                 _enabled.Add(name);
+                _rejected.Remove(name);
                 AddAdvertised(token);
             }
         }
@@ -319,6 +402,7 @@ public sealed class IrcCapabilityNegotiator
     private CapabilitySnapshot CreateSnapshot() => new(
         new ReadOnlyDictionary<string, IrcCapability>(new Dictionary<string, IrcCapability>(_available, StringComparer.Ordinal)),
         new HashSet<string>(_enabled, StringComparer.Ordinal),
+        new HashSet<string>(_rejected, StringComparer.Ordinal),
         _rawAdvertisedTokens.ToArray(),
         _requestedTokens.ToArray(),
         _state);

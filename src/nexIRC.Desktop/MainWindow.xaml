@@ -116,6 +116,8 @@
                     <TextBlock Text="Server status" FontSize="20" FontWeight="SemiBold" Foreground="#172033" />
                     <TextBlock Text="{Binding EndpointText}" Foreground="#64748B" Margin="0,4,0,10" />
                     <TextBlock Text="{Binding StateText}" FontWeight="SemiBold" Foreground="#2563EB" />
+                    <TextBlock Text="IRCv3 capabilities" FontWeight="SemiBold" Margin="0,10,0,2" />
+                    <TextBlock Text="{Binding CapabilitiesText}" Foreground="#475569" />
                 </StackPanel>
                 <ListBox Grid.Row="1" ItemsSource="{Binding Entries}" ItemTemplate="{StaticResource TranscriptEntryTemplate}" Margin="0,14,0,0" BorderThickness="0" Background="Transparent" FontFamily="Cascadia Mono" />
             </Grid>
@@ -159,7 +161,13 @@
                     <Border Grid.Column="1" Width="205" Margin="10,0,0,0" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="1" Visibility="{Binding DataContext.IsMemberListVisible, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource BooleanToVisibility}}">
                         <DockPanel>
                             <TextBlock DockPanel.Dock="Top" Text="Members" Style="{StaticResource PaneHeader}" />
-                    <ListBox AutomationProperties.AutomationId="MemberList" AutomationProperties.Name="Channel members" ItemsSource="{Binding Members}" DisplayMemberPath="DisplayText" BorderThickness="0" Padding="8,0" MouseDoubleClick="OnMemberListDoubleClick" ToolTip="Double-click to open a private conversation. Right-click for participant actions." />
+                    <ListBox AutomationProperties.AutomationId="MemberList" AutomationProperties.Name="Channel members" ItemsSource="{Binding Members}" BorderThickness="0" Padding="8,0" MouseDoubleClick="OnMemberListDoubleClick" ToolTip="Double-click to open a private conversation. Right-click for participant actions.">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding DisplayText}" ToolTip="{Binding DetailsText}" />
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
                         </DockPanel>
                     </Border>
                 </Grid>
@@ -386,7 +394,7 @@
             <Separator />
             <StatusBarItem Content="{Binding Sessions.OperationFeedback.LatestText}" ToolTip="Latest server operation feedback" AutomationProperties.AutomationId="OperationFeedback" />
             <Separator />
-            <StatusBarItem Content="nexIRC 5 · Phase 1M" />
+            <StatusBarItem Content="nexIRC 5 · Phase 1V" />
         </StatusBar>
 
         <Grid>

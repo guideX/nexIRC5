@@ -106,7 +106,8 @@ public sealed record TranscriptEntry(
     string? Sender,
     string Text,
     string? Metadata = null,
-    long Sequence = 0)
+    long Sequence = 0,
+    DateTimeOffset? ReceivedAt = null)
 {
     public string DisplayTime => Timestamp.ToLocalTime().ToString("HH:mm:ss", System.Globalization.CultureInfo.CurrentCulture);
 
@@ -160,7 +161,7 @@ public sealed record NetworkConnectionOptions
 
     public IReadOnlyList<string> NicknameFallbacks { get; init; } = Array.Empty<string>();
 
-    public IReadOnlyList<string> RequestedCapabilities { get; init; } = ["message-tags", "server-time", "multi-prefix", "labeled-response"];
+    public IReadOnlyList<string> RequestedCapabilities { get; init; } = IrcCapabilityCatalog.PreferredPhase1V;
 
     public IReadOnlySet<string> DesiredChannels { get; init; } = new HashSet<string>(StringComparer.Ordinal);
 
@@ -530,6 +531,7 @@ public sealed class ServerStatusView : WorkspaceView
     private NetworkDisplayState _connectionState = NetworkDisplayState.Disconnected;
     private string? _networkName;
     private string _endpointText = string.Empty;
+    private string _capabilitiesText = "(none negotiated)";
 
     internal ServerStatusView(Guid networkId, Guid id, string title, IrcEndpoint endpoint)
         : base(networkId, id, WorkspaceViewKind.ServerStatus, title)
@@ -557,11 +559,21 @@ public sealed class ServerStatusView : WorkspaceView
 
     public string StateText => ConnectionState.ToString();
 
+    public string CapabilitiesText => _capabilitiesText;
+
     internal void ApplySnapshot(ServerSessionSnapshot snapshot)
     {
         ConnectionState = ToDisplayState(snapshot.State);
         NetworkName = snapshot.Features.NetworkName ?? snapshot.Identity.NetworkName;
         EndpointText = snapshot.Endpoint.ToString();
+        var capabilitiesText = snapshot.Capabilities.Enabled.Count == 0
+            ? "(none negotiated)"
+            : string.Join(Environment.NewLine, snapshot.Capabilities.Enabled.OrderBy(static capability => capability, StringComparer.Ordinal));
+        if (!string.Equals(_capabilitiesText, capabilitiesText, StringComparison.Ordinal))
+        {
+            _capabilitiesText = capabilitiesText;
+            OnPropertyChanged(nameof(CapabilitiesText));
+        }
         OnPropertyChanged(nameof(StateText));
     }
 
@@ -586,6 +598,9 @@ public sealed class ChannelMemberView : ObservableObject
     private string? _username;
     private string? _host;
     private string? _account;
+    private string? _realName;
+    private bool _isAway;
+    private string? _awayReason;
     private IReadOnlySet<char> _prefixModes = new HashSet<char>();
 
     internal ChannelMemberView(string nickname)
@@ -613,6 +628,24 @@ public sealed class ChannelMemberView : ObservableObject
         private set => SetProperty(ref _account, value);
     }
 
+    public string? RealName
+    {
+        get => _realName;
+        private set => SetProperty(ref _realName, value);
+    }
+
+    public bool IsAway
+    {
+        get => _isAway;
+        private set => SetProperty(ref _isAway, value);
+    }
+
+    public string? AwayReason
+    {
+        get => _awayReason;
+        private set => SetProperty(ref _awayReason, value);
+    }
+
     public string? Hostmask => Username is null || Host is null ? null : $"*!{Username}@{Host}";
 
     public string PrefixText
@@ -625,14 +658,37 @@ public sealed class ChannelMemberView : ObservableObject
 
     public string DisplayText => $"{PrefixText}{Nickname}";
 
+    public string DetailsText
+    {
+        get
+        {
+            var details = new List<string> { Nickname };
+            if (!string.IsNullOrWhiteSpace(Username) || !string.IsNullOrWhiteSpace(Host))
+            {
+                details.Add($"{Username ?? "?"}@{Host ?? "?"}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(Account)) details.Add($"account: {Account}");
+            if (!string.IsNullOrWhiteSpace(RealName)) details.Add($"real name: {RealName}");
+            details.Add(IsAway
+                ? string.IsNullOrWhiteSpace(AwayReason) ? "away" : $"away: {AwayReason}"
+                : "online");
+            return string.Join(Environment.NewLine, details);
+        }
+    }
+
     internal void Apply(IrcChannelMemberSnapshot snapshot, IrcPrefixGrammar? grammar)
     {
         Username = snapshot.Username;
         Host = snapshot.Host;
         Account = snapshot.Account;
+        RealName = snapshot.RealName;
+        IsAway = snapshot.IsAway;
+        AwayReason = snapshot.AwayReason;
         _prefixModes = new HashSet<char>(snapshot.PrefixModes);
         PrefixText = HighestPrefix(snapshot.PrefixModes, grammar);
         OnPropertyChanged(nameof(DisplayText));
+        OnPropertyChanged(nameof(DetailsText));
     }
 
     internal bool IsEquivalent(IrcChannelMemberSnapshot snapshot, IrcPrefixGrammar? grammar)
@@ -641,6 +697,9 @@ public sealed class ChannelMemberView : ObservableObject
         return string.Equals(Username, snapshot.Username, StringComparison.Ordinal)
             && string.Equals(Host, snapshot.Host, StringComparison.Ordinal)
             && string.Equals(Account, snapshot.Account, StringComparison.Ordinal)
+            && string.Equals(RealName, snapshot.RealName, StringComparison.Ordinal)
+            && IsAway == snapshot.IsAway
+            && string.Equals(AwayReason, snapshot.AwayReason, StringComparison.Ordinal)
             && string.Equals(PrefixText, prefixText, StringComparison.Ordinal)
             && PrefixModes.SetEquals(snapshot.PrefixModes);
     }
@@ -995,6 +1054,10 @@ public sealed class QueryView : WorkspaceView
     public int IdentityConnectionGeneration { get; private set; }
 
     public bool IsIdentityBoundToCurrentSession { get; private set; }
+
+    internal bool CanApplyNicknameChange(string previousNickname, string newNickname, IrcCaseMapping mapping) =>
+        IrcCaseMappingComparer.Equals(Nickname, previousNickname, mapping)
+        && !IrcCaseMappingComparer.Equals(Nickname, newNickname, mapping);
 
     internal bool TryApplyNicknameChange(string previousNickname, string newNickname, IrcCaseMapping mapping, int connectionGeneration)
     {

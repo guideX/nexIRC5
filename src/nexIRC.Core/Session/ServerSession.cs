@@ -24,7 +24,7 @@ public sealed class ServerSession : IAsyncDisposable
     private static readonly HashSet<string> KnownCommands =
     [
         "CAP", "PING", "PONG", "PASS", "NICK", "USER", "JOIN", "PART", "QUIT", "PRIVMSG", "NOTICE",
-        "TOPIC", "ERROR", "MODE", "KICK", "INVITE", "AWAY", "WALLOPS", "AUTHENTICATE"
+        "TOPIC", "ERROR", "MODE", "KICK", "INVITE", "AWAY", "ACCOUNT", "BATCH", "WALLOPS", "AUTHENTICATE"
     ];
 
     private readonly ServerSessionOptions _options;
@@ -75,19 +75,19 @@ public sealed class ServerSession : IAsyncDisposable
         _stateStore = new SessionStateStore(options.Nickname, options.DesiredChannels);
         _nicknameCandidates = BuildNicknameCandidates(options);
         var requestedCapabilityList = options.RequestedCapabilities
-            .Where(capability => options.SaslPolicy != SaslAuthenticationPolicy.Disabled || !string.Equals(capability, "sasl", StringComparison.OrdinalIgnoreCase))
+            .Where(capability => options.SaslPolicy != SaslAuthenticationPolicy.Disabled || !string.Equals(capability, IrcCapabilityCatalog.Sasl, StringComparison.OrdinalIgnoreCase))
             .ToList();
         if (options.SaslPolicy != SaslAuthenticationPolicy.Disabled &&
-            !requestedCapabilityList.Any(capability => string.Equals(capability, "sasl", StringComparison.OrdinalIgnoreCase)))
+            !requestedCapabilityList.Any(capability => string.Equals(capability, IrcCapabilityCatalog.Sasl, StringComparison.OrdinalIgnoreCase)))
         {
-            requestedCapabilityList.Add("sasl");
+            requestedCapabilityList.Add(IrcCapabilityCatalog.Sasl);
         }
 
         var requestedCapabilities = requestedCapabilityList.ToArray();
         _capabilities = new IrcCapabilityNegotiator(
             requestedCapabilities,
             options.MaximumOutboundLineBytes,
-            options.SaslPolicy == SaslAuthenticationPolicy.Disabled ? Array.Empty<string>() : ["sasl"]);
+            options.SaslPolicy == SaslAuthenticationPolicy.Disabled ? Array.Empty<string>() : [IrcCapabilityCatalog.Sasl]);
         _features = ServerFeatureSet.Build(CapabilitySnapshot.Empty, ISupportSnapshot.Empty, options.Profiles, ServerIdentity.Unknown);
         _authenticationState = options.SaslPolicy == SaslAuthenticationPolicy.Disabled
             ? SaslAuthenticationState.Disabled
@@ -113,6 +113,13 @@ public sealed class ServerSession : IAsyncDisposable
     }
 
     public Task Completion => _runTask ?? Task.CompletedTask;
+
+    /// <summary>
+    /// Completes when this session's writer has handed QUIT to the transport.
+    /// It is useful to verify natural shutdown without competing with the
+    /// application event-drain consumer.
+    /// </summary>
+    public Task QuitWritten => _quitWritten.Task;
 
     /// <summary>
     /// Test and diagnostic visibility for session ownership. This is a count,
@@ -201,6 +208,20 @@ public sealed class ServerSession : IAsyncDisposable
         {
             await SendCommandAsync("PART", [channel], reason, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    public async ValueTask RequestNamesAsync(string? channel = null, CancellationToken cancellationToken = default)
+    {
+        if (!string.IsNullOrWhiteSpace(channel))
+        {
+            ValidateChannelName(channel);
+            lock (_gate)
+            {
+                _stateStore.BeginNamesRequest(channel);
+            }
+        }
+
+        await SendCommandAsync("NAMES", string.IsNullOrWhiteSpace(channel) ? null : [channel], cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
     public Task RunAsync(CancellationToken cancellationToken = default)
@@ -445,6 +466,7 @@ public sealed class ServerSession : IAsyncDisposable
 
         var writerFailure = new StrongBox<ConnectionFailure?>(null);
         var writerTask = WriteLoopAsync(transport, outbound.Reader, connectionCts, writerFailure, epoch);
+        var capabilityFallbackTask = CapabilityFallbackAsync(outbound.Writer, epoch, connectionCts);
         try
         {
             SetState(ServerSessionState.CapNegotiation);
@@ -483,6 +505,14 @@ public sealed class ServerSession : IAsyncDisposable
             try
             {
                 await writerTask.ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is OperationCanceledException or IrcTransportException or IOException)
+            {
+            }
+
+            try
+            {
+                await capabilityFallbackTask.ConfigureAwait(false);
             }
             catch (Exception exception) when (exception is OperationCanceledException or IrcTransportException or IOException)
             {
@@ -538,6 +568,68 @@ public sealed class ServerSession : IAsyncDisposable
         }
 
         SetState(ServerSessionState.CapNegotiation);
+    }
+
+    private async Task CapabilityFallbackAsync(
+        ChannelWriter<IrcOutboundMessage> writer,
+        ConnectionEpoch epoch,
+        CancellationTokenSource connectionCts)
+    {
+        try
+        {
+            await Task.Delay(_options.CapabilityNegotiationTimeout, connectionCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (connectionCts.IsCancellationRequested)
+        {
+            return;
+        }
+
+        CapNegotiationResult result;
+        lock (_gate)
+        {
+            if (!IsCurrentEpochUnsafe(epoch) || _capabilities.Snapshot.NegotiationState == CapNegotiationState.Ended)
+            {
+                return;
+            }
+
+            result = _capabilities.Complete();
+        }
+
+        foreach (var command in result.Commands)
+        {
+            await writer.WriteAsync(command, connectionCts.Token).ConfigureAwait(false);
+        }
+
+        if (result.Snapshot.NegotiationState == CapNegotiationState.Ended)
+        {
+            if (_options.SaslPolicy != SaslAuthenticationPolicy.Disabled)
+            {
+                lock (_gate)
+                {
+                    if (_authenticationState == SaslAuthenticationState.WaitingForCapability)
+                    {
+                        _authenticationState = SaslAuthenticationState.Skipped;
+                    }
+                }
+            }
+
+            if (_options.SaslPolicy == SaslAuthenticationPolicy.Required && !result.Snapshot.IsAvailable(IrcCapabilityCatalog.Sasl))
+            {
+                lock (_gate)
+                {
+                    _authenticationState = SaslAuthenticationState.Failed;
+                    _authenticationFailure = "The server did not complete CAP negotiation and SASL is required.";
+                    _registration = RegistrationState.Failed;
+                    _lastFailure = new ConnectionFailure(ConnectionFailureKind.RegistrationRejected, _authenticationFailure, IsTransient: false);
+                }
+
+                SetState(ServerSessionState.Failed);
+                connectionCts.Cancel();
+                return;
+            }
+
+            await BeginRegistrationAsync(epoch, connectionCts.Token).ConfigureAwait(false);
+        }
     }
 
     private async Task<ConnectionFailure> ReadLoopAsync(IIrcTransport transport, ConnectionEpoch epoch, CancellationTokenSource connectionCts, StrongBox<ConnectionFailure?> writerFailure)
@@ -628,7 +720,8 @@ public sealed class ServerSession : IAsyncDisposable
             return;
         }
 
-        var rawEvent = new RawIrcLineEvent(DateTimeOffset.UtcNow, frame.Text, frame.Bytes, epoch.Generation);
+        var receivedAt = DateTimeOffset.UtcNow;
+        var rawEvent = new RawIrcLineEvent(receivedAt, frame.Text, frame.Bytes, epoch.Generation);
         await _rawEvents.Writer.WriteAsync(rawEvent, connectionCts.Token).ConfigureAwait(false);
         if (!IsCurrentEpoch(epoch))
         {
@@ -643,7 +736,7 @@ public sealed class ServerSession : IAsyncDisposable
         }
 
         var message = parse.Message!;
-        await _parsedEvents.Writer.WriteAsync(new ParsedIrcMessageEvent(DateTimeOffset.UtcNow, message, epoch.Generation), connectionCts.Token).ConfigureAwait(false);
+        await _parsedEvents.Writer.WriteAsync(new ParsedIrcMessageEvent(receivedAt, message, epoch.Generation), connectionCts.Token).ConfigureAwait(false);
         if (!IsCurrentEpoch(epoch))
         {
             return;
@@ -668,7 +761,7 @@ public sealed class ServerSession : IAsyncDisposable
                 _features = ServerFeatureSet.Build(capResult.Snapshot, _isupport.Snapshot, _options.Profiles, _identityDetector.Snapshot);
             }
 
-            await PublishCapabilityChangesAsync(message, capabilitiesBefore, capResult.Snapshot, epoch).ConfigureAwait(false);
+            await PublishCapabilityChangesAsync(message, capabilitiesBefore, capResult.Snapshot, epoch, receivedAt).ConfigureAwait(false);
             await HandleCapabilityResultAsync(message, capResult, epoch, connectionCts).ConfigureAwait(false);
         }
 
@@ -680,6 +773,45 @@ public sealed class ServerSession : IAsyncDisposable
                 _identityDetector.ObserveISupport(_isupport.Snapshot);
                 _features = ServerFeatureSet.Build(_capabilities.Snapshot, _isupport.Snapshot, _options.Profiles, _identityDetector.Snapshot);
                 _stateStore.SetCaseMapping(_features.CaseMapping);
+            }
+        }
+
+        if (message.NumericCommand == 421
+            && message.Parameters.Any(static parameter => parameter.Equals("CAP", StringComparison.OrdinalIgnoreCase)))
+        {
+            if (_options.SaslPolicy == SaslAuthenticationPolicy.Required)
+            {
+                lock (_gate)
+                {
+                    _authenticationState = SaslAuthenticationState.Failed;
+                    _authenticationFailure = "The server does not support CAP and SASL is required.";
+                    _registration = RegistrationState.Failed;
+                    _lastFailure = new ConnectionFailure(ConnectionFailureKind.RegistrationRejected, _authenticationFailure, IsTransient: false);
+                }
+
+                SetState(ServerSessionState.Failed);
+                connectionCts.Cancel();
+                return;
+            }
+
+            CapNegotiationResult caplessResult;
+            lock (_gate)
+            {
+                caplessResult = _capabilities.Complete();
+            }
+            foreach (var command in caplessResult.Commands)
+            {
+                await QueueOutboundAsync(command, connectionCts.Token, epoch).ConfigureAwait(false);
+            }
+
+            if (caplessResult.Snapshot.NegotiationState == CapNegotiationState.Ended)
+            {
+                if (_options.SaslPolicy != SaslAuthenticationPolicy.Disabled)
+                {
+                    await SetAuthenticationStateAsync(message, SaslAuthenticationState.Skipped, null, "The server does not support CAP; continuing without authentication.", epoch, receivedAt).ConfigureAwait(false);
+                }
+
+                await BeginRegistrationAsync(epoch, connectionCts.Token).ConfigureAwait(false);
             }
         }
         else if (message.NumericCommand == 4)
@@ -708,7 +840,7 @@ public sealed class ServerSession : IAsyncDisposable
             }
 
             SetState(ServerSessionState.Registered);
-            await PublishSemanticAsync(new IrcRegistrationStateEvent(message, previousRegistration, _registration), epoch).ConfigureAwait(false);
+            await PublishSemanticAsync(new IrcRegistrationStateEvent(message, previousRegistration, _registration), epoch, receivedAt).ConfigureAwait(false);
             await QueueDesiredChannelsAsync(epoch, connectionCts.Token).ConfigureAwait(false);
         }
 
@@ -739,7 +871,7 @@ public sealed class ServerSession : IAsyncDisposable
         {
             var payload = message.HasTrailingParameter ? message.TrailingParameter ?? string.Empty : message.Parameters.Count > 0 ? message.Parameters[0] : string.Empty;
             await QueueOutboundAsync(new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build("PONG", trailingParameter: payload), connectionCts.Token, epoch).ConfigureAwait(false);
-            await PublishSemanticAsync(new IrcPingEvent(message, payload), epoch).ConfigureAwait(false);
+            await PublishSemanticAsync(new IrcPingEvent(message, payload), epoch, receivedAt).ConfigureAwait(false);
         }
 
         if (message.Command == "ERROR")
@@ -747,7 +879,7 @@ public sealed class ServerSession : IAsyncDisposable
             _lastFailure = new ConnectionFailure(ConnectionFailureKind.Protocol, message.HasTrailingParameter ? message.TrailingParameter ?? "The IRC server reported an error." : "The IRC server reported an error.", IsTransient: false);
             _registration = RegistrationState.Failed;
             SetState(ServerSessionState.Failed);
-            await PublishSemanticAsync(new IrcServerErrorEvent(message, _lastFailure.Message), epoch).ConfigureAwait(false);
+            await PublishSemanticAsync(new IrcServerErrorEvent(message, _lastFailure.Message), epoch, receivedAt).ConfigureAwait(false);
             connectionCts.Cancel();
         }
 
@@ -759,34 +891,34 @@ public sealed class ServerSession : IAsyncDisposable
 
         foreach (var semanticEvent in stateEvents)
         {
-            await PublishSemanticAsync(semanticEvent, epoch).ConfigureAwait(false);
+            await PublishSemanticAsync(semanticEvent, epoch, receivedAt).ConfigureAwait(false);
 
             if (semanticEvent is IrcJoinEvent join && NamesEqual(join.Nickname, _stateStore.Nickname, _features.CaseMapping))
             {
                 await QueueChannelResynchronizationAsync(join.Channel, epoch, connectionCts.Token).ConfigureAwait(false);
-                await PublishSemanticAsync(new IrcChannelSynchronizationEvent(message, join.Channel, ChannelSynchronizationState.Synchronizing), epoch).ConfigureAwait(false);
+                await PublishSemanticAsync(new IrcChannelSynchronizationEvent(message, join.Channel, ChannelSynchronizationState.Synchronizing), epoch, receivedAt).ConfigureAwait(false);
             }
         }
 
         if (EventDispatcher.TryDispatch(message, out var extensionEvent))
         {
-            await PublishSemanticAsync(extensionEvent!, epoch).ConfigureAwait(false);
+            await PublishSemanticAsync(extensionEvent!, epoch, receivedAt).ConfigureAwait(false);
         }
 
         if (message.NumericCommand is int finalNumeric)
         {
             if (!KnownNumerics.Contains(finalNumeric))
             {
-                await PublishSemanticAsync(new IrcUnknownNumericEvent(message, finalNumeric), epoch).ConfigureAwait(false);
+                await PublishSemanticAsync(new IrcUnknownNumericEvent(message, finalNumeric), epoch, receivedAt).ConfigureAwait(false);
             }
             else if (finalNumeric is not 1 && !IrcNumericCatalog.IsRecognized(finalNumeric))
             {
-                await PublishSemanticAsync(new IrcNumericEvent(message, finalNumeric), epoch).ConfigureAwait(false);
+                await PublishSemanticAsync(new IrcNumericEvent(message, finalNumeric), epoch, receivedAt).ConfigureAwait(false);
             }
         }
         else if (!KnownCommands.Contains(message.Command))
         {
-            await PublishSemanticAsync(new IrcUnknownCommandEvent(message), epoch).ConfigureAwait(false);
+            await PublishSemanticAsync(new IrcUnknownCommandEvent(message), epoch, receivedAt).ConfigureAwait(false);
         }
     }
 
@@ -826,8 +958,8 @@ public sealed class ServerSession : IAsyncDisposable
         }
 
         var subcommand = FindCapSubcommand(message);
-        var saslRequested = _options.SaslPolicy != SaslAuthenticationPolicy.Disabled && _capabilities.Snapshot.RequestedTokens.Contains("sasl", StringComparer.Ordinal);
-        var saslAvailable = result.Snapshot.IsAvailable("sasl");
+        var saslRequested = _options.SaslPolicy != SaslAuthenticationPolicy.Disabled && _capabilities.Snapshot.RequestedTokens.Contains(IrcCapabilityCatalog.Sasl, StringComparer.Ordinal);
+        var saslAvailable = result.Snapshot.IsAvailable(IrcCapabilityCatalog.Sasl);
         if (saslRequested && subcommand == "LS" && !HasMoreCapabilityListing(message) && !saslAvailable)
         {
             if (_options.SaslPolicy == SaslAuthenticationPolicy.Required)
@@ -839,7 +971,7 @@ public sealed class ServerSession : IAsyncDisposable
             await SetAuthenticationStateAsync(message, SaslAuthenticationState.Skipped, null, "SASL is unavailable; continuing without authentication.", epoch).ConfigureAwait(false);
         }
 
-        if (subcommand == "NAK" && saslRequested && messageHasCapability(message, "sasl"))
+        if (subcommand == "NAK" && saslRequested && messageHasCapability(message, IrcCapabilityCatalog.Sasl))
         {
             if (_options.SaslPolicy == SaslAuthenticationPolicy.Required)
             {
@@ -847,11 +979,21 @@ public sealed class ServerSession : IAsyncDisposable
                 return;
             }
 
-            await FailAuthenticationAsync(message, "The server rejected the SASL capability request.", epoch, connectionCts, fatal: false).ConfigureAwait(false);
+            await SetAuthenticationStateAsync(message, SaslAuthenticationState.Failed, _authenticationMechanism, "The server rejected the SASL capability request.", epoch).ConfigureAwait(false);
+            DisposeActiveCredential();
+            foreach (var command in result.Commands)
+            {
+                await QueueOutboundAsync(command, connectionCts.Token, epoch).ConfigureAwait(false);
+            }
+
+            if (result.Snapshot.NegotiationState == CapNegotiationState.Ended)
+            {
+                await BeginRegistrationAsync(epoch, connectionCts.Token).ConfigureAwait(false);
+            }
             return;
         }
 
-        if (subcommand == "ACK" && saslRequested && result.Snapshot.IsEnabled("sasl"))
+        if (subcommand == "ACK" && saslRequested && result.Snapshot.IsEnabled(IrcCapabilityCatalog.Sasl))
         {
             await StartSaslAsync(message, result.Snapshot, epoch, connectionCts).ConfigureAwait(false);
             return;
@@ -1038,7 +1180,11 @@ public sealed class ServerSession : IAsyncDisposable
 
     private async Task CompleteCapabilityAndBeginRegistrationAsync(ConnectionEpoch epoch, CancellationToken cancellationToken)
     {
-        var result = _capabilities.Complete();
+        CapNegotiationResult result;
+        lock (_gate)
+        {
+            result = _capabilities.Complete();
+        }
         foreach (var command in result.Commands)
         {
             await QueueOutboundAsync(command, cancellationToken, epoch).ConfigureAwait(false);
@@ -1070,7 +1216,8 @@ public sealed class ServerSession : IAsyncDisposable
         SaslAuthenticationState state,
         string? mechanism,
         string? detail,
-        ConnectionEpoch epoch)
+        ConnectionEpoch epoch,
+        DateTimeOffset? receivedAt = null)
     {
         SaslAuthenticationState previous;
         lock (_gate)
@@ -1083,7 +1230,7 @@ public sealed class ServerSession : IAsyncDisposable
 
         if (previous != state || detail is not null)
         {
-            await PublishSemanticAsync(new IrcSaslStateChangedEvent(message, previous, state, mechanism ?? _authenticationMechanism, detail), epoch).ConfigureAwait(false);
+            await PublishSemanticAsync(new IrcSaslStateChangedEvent(message, previous, state, mechanism ?? _authenticationMechanism, detail), epoch, receivedAt).ConfigureAwait(false);
         }
     }
 
@@ -1091,30 +1238,33 @@ public sealed class ServerSession : IAsyncDisposable
         IrcMessage message,
         CapabilitySnapshot before,
         CapabilitySnapshot after,
-        ConnectionEpoch epoch)
+        ConnectionEpoch epoch,
+        DateTimeOffset receivedAt)
     {
         var available = after.Available.Keys.Except(before.Available.Keys, StringComparer.Ordinal).ToArray();
         var removed = before.Available.Keys.Except(after.Available.Keys, StringComparer.Ordinal).ToArray();
         var enabled = after.Enabled.Except(before.Enabled, StringComparer.Ordinal).ToArray();
         var disabled = before.Enabled.Except(after.Enabled, StringComparer.Ordinal).ToArray();
+        var rejected = after.Rejected.Except(before.Rejected, StringComparer.Ordinal).ToArray();
         foreach (var change in new[]
         {
             (IrcCapabilityChangeKind.Available, available),
             (IrcCapabilityChangeKind.Removed, removed),
             (IrcCapabilityChangeKind.Enabled, enabled),
-            (IrcCapabilityChangeKind.Disabled, disabled)
+            (IrcCapabilityChangeKind.Disabled, disabled),
+            (IrcCapabilityChangeKind.Rejected, rejected)
         })
         {
             if (change.Item2.Length > 0)
             {
-                await PublishSemanticAsync(new IrcCapabilityChangedEvent(message, change.Item1, change.Item2), epoch).ConfigureAwait(false);
+                await PublishSemanticAsync(new IrcCapabilityChangedEvent(message, change.Item1, change.Item2), epoch, receivedAt).ConfigureAwait(false);
             }
         }
     }
 
     private static ISaslMechanism? SelectSaslMechanism(CapabilitySnapshot capabilities, IReadOnlyList<ISaslMechanism> mechanisms)
     {
-        var advertised = capabilities.Available.TryGetValue("sasl", out var sasl) && !string.IsNullOrWhiteSpace(sasl.Value)
+        var advertised = capabilities.Available.TryGetValue(IrcCapabilityCatalog.Sasl, out var sasl) && !string.IsNullOrWhiteSpace(sasl.Value)
             ? sasl.Value!.Split([',', ' '], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             : Array.Empty<string>();
         return mechanisms.FirstOrDefault(mechanism => advertised.Length == 0 || advertised.Contains(mechanism.Name, StringComparer.OrdinalIgnoreCase));
@@ -1276,6 +1426,7 @@ public sealed class ServerSession : IAsyncDisposable
             }
 
             _stateStore.MarkChannelSynchronizing(channel);
+            _stateStore.BeginNamesRequest(channel);
         }
 
         var builder = new IrcCommandBuilder(_options.MaximumOutboundLineBytes);
@@ -1371,14 +1522,14 @@ public sealed class ServerSession : IAsyncDisposable
         await _parseErrors.Writer.WriteAsync(item).ConfigureAwait(false);
     }
 
-    private async Task PublishSemanticAsync(IrcSemanticEvent semanticEvent, ConnectionEpoch epoch)
+    private async Task PublishSemanticAsync(IrcSemanticEvent semanticEvent, ConnectionEpoch epoch, DateTimeOffset? receivedAt = null)
     {
         if (!IsCurrentEpoch(epoch))
         {
             return;
         }
 
-        var item = new SessionSemanticEvent(semanticEvent, epoch.Generation);
+        var item = new SessionSemanticEvent(semanticEvent, epoch.Generation, receivedAt ?? DateTimeOffset.UtcNow);
         await _semanticEvents.Writer.WriteAsync(item).ConfigureAwait(false);
         try
         {
@@ -1497,6 +1648,11 @@ public sealed class ServerSession : IAsyncDisposable
         if (options.ReadBufferBytes < 1)
         {
             throw new ArgumentOutOfRangeException(nameof(options.ReadBufferBytes));
+        }
+
+        if (options.CapabilityNegotiationTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options.CapabilityNegotiationTimeout));
         }
 
         if (options.Reconnect.MaximumAttempts < 1)

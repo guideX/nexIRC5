@@ -5,6 +5,7 @@ using nexIRC.Application;
 using nexIRC.Core.Networking;
 using nexIRC.Core.Protocol;
 using nexIRC.Core.Session;
+using nexIRC.Core.State;
 using nexIRC.Networking;
 using nexIRC.Networking.Testing;
 using MessageBox = System.Windows.MessageBox;
@@ -32,7 +33,7 @@ public partial class App : System.Windows.Application
 
         if (smokeScenario is not null && !UiSmokeHarness.IsKnownScenario(smokeScenario))
         {
-            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": unknown scenario. Expected the existing smoke scenarios, contextual-actions, sustained-interactivity, or close-idle/close-sustained/close-backlog/close-reconnect/close-partial/close-registered/close-persistence/close-interacted.");
+            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": unknown scenario. Expected the existing smoke scenarios, ircv3-metadata, contextual-actions, sustained-interactivity, or close-idle/close-sustained/close-backlog/close-reconnect/close-partial/close-registered/close-persistence/close-interacted.");
             Environment.ExitCode = 2;
             Shutdown(2);
             return;
@@ -193,19 +194,20 @@ public partial class App : System.Windows.Application
             var nickname = $"nex5{Environment.ProcessId % 100_000:00000}";
             var network = viewModel.Sessions.Add(new NetworkConnectionOptions
             {
-                DisplayName = "Libera Phase 1S",
+                DisplayName = "Libera Phase 1V",
                 Endpoint = new IrcEndpoint("irc.libera.chat", 6697, true),
                 Nickname = nickname,
                 Username = nickname,
-                RealName = "nexIRC 5 Phase 1S live WPF close",
-                RequestedCapabilities = ["message-tags", "server-time", "multi-prefix"],
+                RealName = "nexIRC 5 Phase 1V live IRCv3 smoke",
+                RequestedCapabilities = IrcCapabilityCatalog.PreferredPhase1V,
+                DesiredChannels = new HashSet<string>(new[] { "#libera" }, StringComparer.Ordinal),
                 Reconnect = new ReconnectPolicy(Enabled: false)
             });
             viewModel.SelectView(network.StatusView);
 
             var states = new List<ServerSessionState>();
             var whois318 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            var quitObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var serverTimeObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             void OnStateChanged(object? sender, SessionStateChangedEvent change)
             {
                 if (!states.Contains(change.Current))
@@ -216,27 +218,41 @@ public partial class App : System.Windows.Application
 
             void OnSemanticEvent(object? sender, SessionSemanticEvent item)
             {
-                if (item.Event is IrcWhoisEvent { Numeric: 318 })
+                if (item.Event is IrcWhoisEvent whois)
                 {
-                    whois318.TrySetResult();
+                    Console.WriteLine($"LIVE_WPF_TRACE whois_numeric={whois.Numeric} nickname={whois.Nickname} label={(whois.RequestLabel is null ? "none" : "present")}");
+                    if (whois.Numeric == 318)
+                    {
+                        whois318.TrySetResult();
+                    }
+                }
+
+                if (item.Event.Message.ServerTimestamp is not null)
+                {
+                    serverTimeObserved.TrySetResult();
                 }
             }
 
             network.Session.StateChanged += OnStateChanged;
             network.Session.SemanticEventReceived += OnSemanticEvent;
-            var outboundCancellation = new CancellationTokenSource();
-            var outboundReader = ObserveQuitAsync(network.Session, quitObserved, outboundCancellation.Token);
             await viewModel.Sessions.ConnectAsync(network.Id).ConfigureAwait(true);
             await WaitForLiveConditionAsync(
                 () => network.State == NetworkDisplayState.Registered,
                 "Libera registration did not reach 001").ConfigureAwait(true);
-            Console.WriteLine("LIVE_WPF_TRACE dns=true tcp=true tls=true registration=001");
+            await WaitForLiveConditionAsync(
+                () => network.Channels.Any(channel => channel.Channel == "#libera" && channel.IsJoined && channel.Synchronization == ChannelSynchronizationState.Synchronized),
+                "Libera #libera JOIN/NAMES did not converge").ConfigureAwait(true);
+            var liveChannel = network.Channels.Single(channel => channel.Channel == "#libera");
+            var liveMember = liveChannel.Members.FirstOrDefault(member => string.Equals(member.Nickname, nickname, StringComparison.OrdinalIgnoreCase));
+            Console.WriteLine(
+                $"LIVE_WPF_TRACE dns=true tcp=true tls=true registration=001 join=true names=synchronized capabilities={string.Join(',', network.Snapshot.Capabilities.Enabled.OrderBy(static capability => capability, StringComparer.Ordinal))} server_time_seen={serverTimeObserved.Task.IsCompleted} extended_join={(liveMember?.Account is not null || liveMember?.RealName is not null)} multi_prefix={(liveMember?.PrefixModes.Count > 1)}");
 
             var whois = await viewModel.Sessions.RequestWhoisAsync(network.Id, nickname).ConfigureAwait(true);
+            await whois318.Task.WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(true);
+            Console.WriteLine($"LIVE_WPF_TRACE whois_318_observed=true view_completed={(whois.View is WhoisView whoisResult && whoisResult.IsCompleted)}");
             await WaitForLiveConditionAsync(
                 () => whois.View is WhoisView { IsCompleted: true },
                 "Libera self-WHOIS did not complete at 318").ConfigureAwait(true);
-            await whois318.Task.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(true);
             Console.WriteLine("LIVE_WPF_TRACE whois=318");
 
             var preCloseSnapshot = network.Session.Snapshot;
@@ -244,13 +260,10 @@ public partial class App : System.Windows.Application
             var closeStart = Stopwatch.GetTimestamp();
             void OnWindowClosed(object? sender, EventArgs args)
             {
-                var quit = quitObserved.Task.Wait(TimeSpan.FromSeconds(2));
-                outboundCancellation.Cancel();
-                var outboundReaderStopped = outboundReader.Wait(TimeSpan.FromSeconds(2));
-                outboundCancellation.Dispose();
+                var quit = network.Session.QuitWritten.Wait(TimeSpan.FromSeconds(2));
                 Console.WriteLine(
-                    $"LIVE_WPF_RESULT states={string.Join(',', states)} quit={quit} disconnected={network.Session.Snapshot.State == ServerSessionState.Disconnected} outbound_reader_stopped={outboundReaderStopped} natural_window_close=true close_request_to_window_closed_ms={(Stopwatch.GetTimestamp() - closeStart) * 1000d / Stopwatch.Frequency:F3}");
-                Environment.ExitCode = quit && network.Session.Snapshot.State == ServerSessionState.Disconnected && outboundReaderStopped ? 0 : 1;
+                    $"LIVE_WPF_RESULT states={string.Join(',', states)} quit={quit} disconnected={network.Session.Snapshot.State == ServerSessionState.Disconnected} natural_window_close=true close_request_to_window_closed_ms={(Stopwatch.GetTimestamp() - closeStart) * 1000d / Stopwatch.Frequency:F3}");
+                Environment.ExitCode = quit && network.Session.Snapshot.State == ServerSessionState.Disconnected ? 0 : 1;
                 window.Closed -= OnWindowClosed;
                 network.Session.StateChanged -= OnStateChanged;
                 network.Session.SemanticEventReceived -= OnSemanticEvent;
@@ -268,29 +281,6 @@ public partial class App : System.Windows.Application
             {
                 window.Close();
             }
-        }
-    }
-
-    private static async Task ObserveQuitAsync(
-        ServerSession session,
-        TaskCompletionSource quitObserved,
-        CancellationToken cancellationToken)
-    {
-        try
-        {
-            await foreach (var command in session.ReadOutboundEventsAsync(cancellationToken).ConfigureAwait(false))
-            {
-                var rawLine = command.RawLine.TrimStart();
-                var separator = rawLine.IndexOfAny([' ', '\t']);
-                var commandName = separator < 0 ? rawLine : rawLine[..separator];
-                if (string.Equals(commandName, "QUIT", StringComparison.OrdinalIgnoreCase))
-                {
-                    quitObserved.TrySetResult();
-                }
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
         }
     }
 

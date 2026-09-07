@@ -4,8 +4,16 @@ namespace nexIRC.Application;
 
 public static class IrcEventPresentation
 {
-    public static TranscriptEntry? Render(IrcSemanticEvent semanticEvent, ServerSessionSnapshot snapshot) =>
-        semanticEvent switch
+    public static TranscriptEntry? Render(
+        IrcSemanticEvent semanticEvent,
+        ServerSessionSnapshot snapshot,
+        DateTimeOffset? receivedAt = null)
+    {
+        var timestamp = semanticEvent.Message.ServerTimestamp ?? receivedAt ?? DateTimeOffset.UtcNow;
+        TranscriptEntry Entry(TranscriptEntryKind kind, string? sender, string text, string? metadata = null) =>
+            new(timestamp, kind, sender, text, metadata, ReceivedAt: receivedAt);
+
+        var entry = semanticEvent switch
         {
             IrcWelcomeEvent welcome => Entry(TranscriptEntryKind.Connection, null, welcome.NetworkName is null ? "Connected; server identity is not known yet." : $"Connected to {welcome.NetworkName}."),
             IrcRegistrationStateEvent registration => Entry(TranscriptEntryKind.Registration, null, $"Registration: {registration.Previous} → {registration.Current}."),
@@ -13,6 +21,9 @@ public static class IrcEventPresentation
             IrcSaslStateChangedEvent sasl => Entry(sasl.Current == SaslAuthenticationState.Failed ? TranscriptEntryKind.Error : TranscriptEntryKind.Authentication, null, $"SASL: {sasl.Current}{FormatDetail(sasl.Detail)}"),
             IrcServerErrorEvent error => Entry(TranscriptEntryKind.Error, null, error.Text),
             IrcJoinEvent join => Entry(TranscriptEntryKind.Join, join.Nickname, $"joined {join.Channel}"),
+            IrcAwayEvent away => Entry(TranscriptEntryKind.Informational, away.Nickname, away.IsAway ? $"is away{FormatDetail(away.Reason)}" : "is no longer away"),
+            IrcAccountEvent => null,
+            IrcBatchEvent => null,
             IrcPartEvent part => Entry(TranscriptEntryKind.Part, part.Nickname, $"left {part.Channel}"),
             IrcQuitEvent quit => Entry(TranscriptEntryKind.Quit, quit.Nickname, $"quit{FormatDetail(quit.Reason)}"),
             IrcKickEvent kick => Entry(TranscriptEntryKind.Kick, kick.Nickname, $"was kicked from {kick.Channel}{FormatDetail(kick.Reason)}"),
@@ -50,6 +61,9 @@ public static class IrcEventPresentation
             IrcPingEvent => null,
             _ => Entry(TranscriptEntryKind.System, null, semanticEvent.Message.Command)
         };
+
+        return entry;
+    }
 
     public static TranscriptEntry CreateLocalMessage(string sender, string text, bool isAction = false) =>
         CreateLocalMessage(sender, text, isAction ? OutgoingMessageKind.Action : OutgoingMessageKind.ChannelMessage);

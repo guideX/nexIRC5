@@ -101,6 +101,13 @@ public sealed class ServerSessionOptions
 
     public IReadOnlyList<string> RequestedCapabilities { get; init; } = Array.Empty<string>();
 
+    /// <summary>
+    /// Bounds the pre-registration wait for servers that ignore CAP entirely.
+    /// A server that does not answer within this window is treated as a
+    /// legacy CAP-less server and registration continues without extensions.
+    /// </summary>
+    public TimeSpan CapabilityNegotiationTimeout { get; init; } = TimeSpan.FromSeconds(3);
+
     public IReadOnlySet<string> DesiredChannels { get; init; } = new HashSet<string>(StringComparer.Ordinal);
 
     public ReconnectPolicy Reconnect { get; init; } = new();
@@ -158,7 +165,8 @@ public enum IrcCapabilityChangeKind
     Available,
     Removed,
     Enabled,
-    Disabled
+    Disabled,
+    Rejected
 }
 
 public sealed record IrcCapabilityChangedEvent(
@@ -180,7 +188,30 @@ public sealed record IrcChannelSynchronizationEvent(
 
 public sealed record IrcNicknameChangedEvent(IrcMessage Message, string? PreviousNickname, string NewNickname) : IrcSemanticEvent(Message);
 
-public sealed record IrcJoinEvent(IrcMessage Message, string Channel, string Nickname) : IrcSemanticEvent(Message);
+public sealed record IrcJoinEvent(
+    IrcMessage Message,
+    string Channel,
+    string Nickname,
+    string? Account = null,
+    string? RealName = null) : IrcSemanticEvent(Message);
+
+public sealed record IrcAwayEvent(
+    IrcMessage Message,
+    string Nickname,
+    bool IsAway,
+    string? Reason) : IrcSemanticEvent(Message);
+
+public sealed record IrcAccountEvent(
+    IrcMessage Message,
+    string Nickname,
+    string? Account) : IrcSemanticEvent(Message);
+
+public sealed record IrcBatchEvent(
+    IrcMessage Message,
+    string BatchId,
+    bool IsStart,
+    string? Type,
+    IReadOnlyList<string> Parameters) : IrcSemanticEvent(Message);
 
 public sealed record IrcPartEvent(IrcMessage Message, string Channel, string Nickname) : IrcSemanticEvent(Message);
 
@@ -306,7 +337,10 @@ public sealed record IrcChannelMemberSnapshot(
     string? Username,
     string? Host,
     IReadOnlySet<char> PrefixModes,
-    string? Account = null);
+    string? Account = null,
+    string? RealName = null,
+    bool IsAway = false,
+    string? AwayReason = null);
 
 public sealed record IrcChannelSnapshot(
     string Name,
@@ -386,4 +420,7 @@ public sealed record SessionStateChangedEvent(
     ServerSessionState Current,
     int ConnectionGeneration);
 
-public sealed record SessionSemanticEvent(IrcSemanticEvent Event, int ConnectionGeneration);
+public sealed record SessionSemanticEvent(
+    IrcSemanticEvent Event,
+    int ConnectionGeneration,
+    DateTimeOffset? ReceivedAt = null);

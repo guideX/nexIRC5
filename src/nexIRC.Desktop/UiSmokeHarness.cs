@@ -27,6 +27,7 @@ internal static class UiSmokeHarness
         "burst",
         "burst-fairness",
         "query-nick",
+        "ircv3-metadata",
         "contextual-actions",
         "sustained-interactivity",
         "close-idle",
@@ -95,6 +96,9 @@ internal static class UiSmokeHarness
                 break;
             case "query-nick":
                 await QueryNickAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "ircv3-metadata":
+                await Ircv3MetadataAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
             case "contextual-actions":
                 await ContextualActionsAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -184,6 +188,56 @@ internal static class UiSmokeHarness
         demo.AlphaTransport.EnqueueInboundLine(":alpha.server 311 nexAlpha Alex alex alpha.example * :Alex Context User");
         demo.AlphaTransport.EnqueueInboundLine(":alpha.server 318 nexAlpha Alex :End of WHOIS list");
         await WaitForAsync(viewModel.Sessions, () => ((WhoisView)whois.View!).IsCompleted, "contextual WHOIS did not complete").ConfigureAwait(true);
+    }
+
+    private static async Task Ircv3MetadataAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var viewModel = window.ViewModel;
+        var channel = RequiredChannel(network);
+        var refresh = await viewModel.Actions.ExecuteChannelAsync(network, channel, WorkspaceActionId.RefreshNames).ConfigureAwait(true);
+        Require(refresh.Succeeded, "IRCv3 metadata smoke could not start a NAMES refresh");
+
+        const string serverTime = "2026-09-07T15:04:05.123Z";
+        var expectedServerTimestamp = DateTimeOffset.Parse(serverTime, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+        demo.AlphaTransport.EnqueueInboundLine($"@time={serverTime} :Alex!demo@alpha.server JOIN #general alex-account :Alex Metadata User");
+        demo.AlphaTransport.EnqueueInboundLine($"@time={serverTime} :alpha.server 353 nexAlpha = #general :@+Alex");
+        demo.AlphaTransport.EnqueueInboundLine($"@time={serverTime} :Alex!demo@alpha.server AWAY :at lunch");
+        demo.AlphaTransport.EnqueueInboundLine($"@time={serverTime} :alpha.server 366 nexAlpha #general :End of names");
+        demo.AlphaTransport.EnqueueInboundLine($"@time={serverTime} :Alex!demo@alpha.server PRIVMSG #general :server-timed metadata");
+
+        bool MetadataConverged()
+        {
+            var member = channel.Members.FirstOrDefault(candidate => candidate.Nickname == "Alex");
+            return member is not null
+                && member.Account == "alex-account"
+                && member.RealName == "Alex Metadata User"
+                && member.IsAway
+                && member.PrefixModes.Contains('o')
+                && member.PrefixModes.Contains('v')
+                && channel.EntriesSnapshot.Any(entry => entry.Text == "server-timed metadata" && entry.Timestamp == expectedServerTimestamp);
+        }
+
+        try
+        {
+            await WaitForAsync(viewModel.Sessions, MetadataConverged, "IRCv3 metadata did not converge in the WPF projection").ConfigureAwait(true);
+        }
+        catch (TimeoutException exception)
+        {
+            var member = channel.Members.FirstOrDefault(candidate => candidate.Nickname == "Alex");
+            throw new TimeoutException(
+                $"{exception.Message} member={(member is null ? "<missing>" : $"account={member.Account ?? "<none>"}, real={member.RealName ?? "<none>"}, away={member.IsAway}, prefixes={string.Join(',', member.PrefixModes)}")}, entries={channel.EntriesSnapshot.Count}",
+                exception);
+        }
+
+        var participant = RequiredMember(channel, "Alex");
+        var context = viewModel.CreateParticipantContext(network, channel, participant);
+        var actions = ParticipantActionCatalog.Build(context, isIgnored: false);
+        Require(actions.SelectMany(group => group.Items).Single(item => item.Action == ParticipantActionKind.CopyAccount).IsEnabled,
+            "IRCv3 account metadata did not enable Copy Account");
+        Require(participant.DetailsText.Contains("alex-account", StringComparison.Ordinal)
+            && participant.DetailsText.Contains("away: at lunch", StringComparison.Ordinal),
+            "IRCv3 participant details did not expose current account and away state");
+        Console.WriteLine($"IRCV3_UI_TRACE account={participant.Account} away={participant.IsAway} prefixes={participant.PrefixModes} server_time={serverTime}");
     }
 
     private static async Task ModerationAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)

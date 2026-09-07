@@ -7,12 +7,15 @@ internal sealed class SessionStateStore
 {
     private readonly Dictionary<string, MutableChannel> _channels = new(StringComparer.Ordinal);
     private readonly Dictionary<string, MutableQuery> _queries = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, MutableBatch> _batches = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, MemberMutation> _memberMutations = new(StringComparer.Ordinal);
     private HashSet<string> _desiredChannels;
     private readonly List<string> _motdLines = [];
     private string _nickname;
     private int _connectionGeneration;
     private IrcCaseMapping _caseMapping = IrcCaseMapping.Rfc1459;
     private bool _motdComplete;
+    private long _membershipRevision;
 
     public SessionStateStore(string nickname, IEnumerable<string>? desiredChannels = null)
     {
@@ -109,6 +112,16 @@ internal sealed class SessionStateStore
         GetChannel(channel).Synchronization = ChannelSynchronizationState.Synchronizing;
     }
 
+    public void BeginNamesRequest(string channel)
+    {
+        var state = GetChannel(channel);
+        state.NamesRequestPending = true;
+        state.NamesStartRevision = _membershipRevision;
+        state.NamesInProgress = false;
+        state.NamesObserved.Clear();
+        state.Synchronization = ChannelSynchronizationState.Synchronizing;
+    }
+
     public void SetGeneration(int generation)
     {
         _connectionGeneration = generation;
@@ -120,6 +133,8 @@ internal sealed class SessionStateStore
             channel.IsJoined = false;
             channel.Synchronization = ChannelSynchronizationState.NotRequested;
             channel.NamesInProgress = false;
+            channel.NamesRequestPending = false;
+            channel.NamesObserved.Clear();
             channel.ConnectionGeneration = generation;
             channel.Members.Clear();
             channel.ModeState.Reset();
@@ -133,6 +148,10 @@ internal sealed class SessionStateStore
             query.ConnectionGeneration = generation;
             query.Messages.Clear();
         }
+
+        _batches.Clear();
+        _memberMutations.Clear();
+        _membershipRevision = 0;
     }
 
     public void SetNickname(string nickname)
@@ -152,6 +171,15 @@ internal sealed class SessionStateStore
                 break;
             case "JOIN":
                 ApplyJoin(message, events);
+                break;
+            case "AWAY":
+                ApplyAway(message, events);
+                break;
+            case "ACCOUNT":
+                ApplyAccount(message, events);
+                break;
+            case "BATCH":
+                ApplyBatch(message, events);
                 break;
             case "PART":
                 ApplyPart(message, events);
@@ -280,6 +308,9 @@ internal sealed class SessionStateStore
                 continue;
             }
 
+            TouchMember(channel, oldNickname, MemberMutationKind.Removal);
+            TouchMember(channel, newNickname, MemberMutationKind.Structural);
+
             var oldKey = FindMemberKey(channel, oldNickname);
             if (oldKey is null || !channel.Members.Remove(oldKey, out var member))
             {
@@ -321,21 +352,106 @@ internal sealed class SessionStateStore
         }
         var existingKey = FindMemberKey(channel, nickname);
         var existing = existingKey is not null ? channel.Members[existingKey] : null;
-        var account = message.Parameters.Count > 1 ? Parameter(message, 1) : null;
+        var isExtendedJoin = message.Parameters.Count >= 3;
+        var account = isExtendedJoin ? Parameter(message, 1) : existing?.Account;
         if (string.Equals(account, "*", StringComparison.Ordinal))
         {
             account = null;
         }
+        var realName = isExtendedJoin ? Parameter(message, 2) : existing?.RealName;
         SetMember(channel, existing is null
-            ? MemberFromPrefix(nickname, message.Prefix) with { Account = account }
+            ? MemberFromPrefix(nickname, message.Prefix) with { Account = account, RealName = realName }
             : existing with
             {
                 Nickname = nickname,
                 Username = message.Prefix?.User ?? existing.Username,
                 Host = message.Prefix?.Host ?? existing.Host,
-                Account = account ?? existing.Account
+                Account = account,
+                RealName = realName
             });
-        events.Add(new IrcJoinEvent(message, channelName, nickname));
+        TouchMember(channel, nickname, MemberMutationKind.Structural);
+        events.Add(new IrcJoinEvent(message, channelName, nickname, isExtendedJoin ? account : null, isExtendedJoin ? realName : null));
+    }
+
+    private void ApplyAway(IrcMessage message, List<IrcSemanticEvent> events)
+    {
+        var nickname = message.Prefix?.Name;
+        if (string.IsNullOrWhiteSpace(nickname))
+        {
+            return;
+        }
+
+        var isAway = message.HasTrailingParameter || message.Parameters.Count > 0;
+        var reason = isAway
+            ? message.HasTrailingParameter ? message.TrailingParameter : Parameter(message, 0)
+            : null;
+        foreach (var channel in _channels.Values)
+        {
+            var memberKey = FindMemberKey(channel, nickname);
+            if (memberKey is { } key)
+            {
+                channel.Members[key] = channel.Members[key] with { IsAway = isAway, AwayReason = reason };
+                TouchMember(channel, nickname, MemberMutationKind.Metadata);
+            }
+        }
+
+        events.Add(new IrcAwayEvent(message, nickname, isAway, reason));
+    }
+
+    private void ApplyAccount(IrcMessage message, List<IrcSemanticEvent> events)
+    {
+        var nickname = message.Prefix?.Name;
+        if (string.IsNullOrWhiteSpace(nickname))
+        {
+            return;
+        }
+
+        var rawAccount = message.HasTrailingParameter ? message.TrailingParameter : Parameter(message, 0);
+        var account = string.Equals(rawAccount, "*", StringComparison.Ordinal) || string.IsNullOrWhiteSpace(rawAccount)
+            ? null
+            : rawAccount;
+        foreach (var channel in _channels.Values)
+        {
+            var memberKey = FindMemberKey(channel, nickname);
+            if (memberKey is { } key)
+            {
+                channel.Members[key] = channel.Members[key] with { Account = account };
+                TouchMember(channel, nickname, MemberMutationKind.Metadata);
+            }
+        }
+
+        events.Add(new IrcAccountEvent(message, nickname, account));
+    }
+
+    private void ApplyBatch(IrcMessage message, List<IrcSemanticEvent> events)
+    {
+        var token = Parameter(message, 0);
+        if (string.IsNullOrWhiteSpace(token) || token.Length > 65 || token[0] is not ('+' or '-'))
+        {
+            return;
+        }
+
+        var batchId = token[1..];
+        if (batchId.Length == 0 || batchId.Any(static character => character is ' ' or '\r' or '\n'))
+        {
+            return;
+        }
+
+        if (token[0] == '+')
+        {
+            var type = Parameter(message, 1);
+            if (string.IsNullOrWhiteSpace(type) || _batches.Count >= 32)
+            {
+                return;
+            }
+
+            _batches[batchId] = new MutableBatch(type);
+            events.Add(new IrcBatchEvent(message, batchId, true, type, message.Parameters.Skip(2).Take(16).ToArray()));
+        }
+        else if (_batches.Remove(batchId, out var batch))
+        {
+            events.Add(new IrcBatchEvent(message, batchId, false, batch.Type, Array.Empty<string>()));
+        }
     }
 
     private void ApplyPart(IrcMessage message, List<IrcSemanticEvent> events)
@@ -349,6 +465,7 @@ internal sealed class SessionStateStore
 
         if (_channels.TryGetValue(ChannelKey(channelName), out var channel))
         {
+            TouchMember(channel, nickname, MemberMutationKind.Removal);
             var memberKey = FindMemberKey(channel, nickname);
             if (memberKey is not null)
             {
@@ -376,6 +493,7 @@ internal sealed class SessionStateStore
 
         foreach (var channel in _channels.Values)
         {
+            TouchMember(channel, nickname, MemberMutationKind.Removal);
             var memberKey = FindMemberKey(channel, nickname);
             if (memberKey is not null)
             {
@@ -399,11 +517,14 @@ internal sealed class SessionStateStore
         if (IsChannelTarget(target, features.ChannelTypes)
             && message.Prefix?.Name is { } sender
             && message.TagValues.TryGetValue("account", out var account)
-            && !string.Equals(account, "*", StringComparison.Ordinal)
             && _channels.TryGetValue(ChannelKey(target), out var channel)
             && FindMemberKey(channel, sender) is { } memberKey)
         {
-            channel.Members[memberKey] = channel.Members[memberKey] with { Account = account };
+            channel.Members[memberKey] = channel.Members[memberKey] with
+            {
+                Account = string.Equals(account, "*", StringComparison.Ordinal) ? null : account
+            };
+            TouchMember(channel, sender, MemberMutationKind.Metadata);
         }
 
         if (TryParseCtcp(text, out var ctcpCommand, out var ctcpArguments))
@@ -568,6 +689,7 @@ internal sealed class SessionStateStore
 
             channel.Members[nickname] = member with { Nickname = nickname, PrefixModes = modes };
             channel.ModeState.SetMemberModes(nickname, modes);
+            TouchMember(channel, nickname, MemberMutationKind.Mode);
         }
     }
 
@@ -582,6 +704,7 @@ internal sealed class SessionStateStore
 
         if (_channels.TryGetValue(ChannelKey(channelName), out var channel))
         {
+            TouchMember(channel, nickname, MemberMutationKind.Removal);
             var memberKey = FindMemberKey(channel, nickname);
             if (memberKey is not null)
             {
@@ -611,8 +734,26 @@ internal sealed class SessionStateStore
         var channel = GetChannel(channelName);
         if (!channel.NamesInProgress)
         {
-            channel.Members.Clear();
-            channel.ModeState.ClearMemberModes();
+            if (channel.NamesRequestPending)
+            {
+                channel.NamesObserved.Clear();
+                channel.NamesRequestPending = false;
+            }
+            else if (channel.Synchronization == ChannelSynchronizationState.Synchronized)
+            {
+                // A segment arriving after 366 belongs to an older NAMES
+                // cycle unless a new request was explicitly registered.
+                return;
+            }
+            else if (channel.Synchronization != ChannelSynchronizationState.Synchronized)
+            {
+                // An unsolicited first snapshot is still allowed to seed
+                // membership, but an old segment arriving after 366 must
+                // retain the previous cycle's revision fence.
+                channel.NamesStartRevision = _membershipRevision;
+                channel.NamesObserved.Clear();
+            }
+
             channel.NamesInProgress = true;
         }
 
@@ -637,12 +778,27 @@ internal sealed class SessionStateStore
             }
 
             var existing = FindMemberKey(channel, nick);
+            var existingMember = existing is not null ? channel.Members[existing] : null;
+            var hasNewerMutation = TryGetNewerMemberMutation(channel, nick, channel.NamesStartRevision, out var mutation);
+            if (hasNewerMutation && existingMember is null)
+            {
+                continue;
+            }
+            var effectiveModes = hasNewerMutation
+                && mutation.Kind == MemberMutationKind.Mode
+                && existingMember is not null
+                ? existingMember.PrefixModes
+                : modes;
             channel.Members[nick] = new IrcChannelMemberSnapshot(
                 nick,
-                existing is not null ? channel.Members[existing].Username : null,
-                existing is not null ? channel.Members[existing].Host : null,
-                modes);
-            channel.ModeState.SetMemberModes(nick, modes);
+                existingMember?.Username,
+                existingMember?.Host,
+                effectiveModes,
+                existingMember?.Account,
+                existingMember?.RealName,
+                existingMember?.IsAway ?? false,
+                existingMember?.AwayReason);
+            channel.ModeState.SetMemberModes(nick, effectiveModes);
             if (existing is not null && !string.Equals(existing, nick, StringComparison.Ordinal))
             {
                 channel.Members.Remove(existing);
@@ -654,6 +810,7 @@ internal sealed class SessionStateStore
                 channel.IsStale = false;
                 channel.Synchronization = ChannelSynchronizationState.Synchronizing;
             }
+            channel.NamesObserved.Add(NameKey(nick));
             names.Add(nick);
         }
 
@@ -669,7 +826,30 @@ internal sealed class SessionStateStore
         }
 
         var channel = GetChannel(channelName);
+        if (!channel.NamesInProgress)
+        {
+            return;
+        }
+
+        foreach (var memberKey in channel.Members.Keys.ToArray())
+        {
+            if (channel.NamesObserved.Contains(NameKey(memberKey)))
+            {
+                continue;
+            }
+
+            var hasNewerMutation = TryGetNewerMemberMutation(channel, memberKey, channel.NamesStartRevision, out var mutation);
+            if (!hasNewerMutation || mutation.Kind == MemberMutationKind.Removal)
+            {
+                channel.Members.Remove(memberKey);
+                channel.ModeState.RemoveMember(memberKey);
+            }
+        }
+
         channel.NamesInProgress = false;
+        channel.NamesRequestPending = false;
+        channel.NamesObserved.Clear();
+        ClearMemberMutations(channel);
         if (channel.IsJoined)
         {
             channel.Synchronization = ChannelSynchronizationState.Synchronized;
@@ -715,8 +895,18 @@ internal sealed class SessionStateStore
         var channel = GetChannel(channelName);
         var existingKey = FindMemberKey(channel, nickname);
         var existingModes = existingKey is not null ? channel.Members[existingKey].PrefixModes : ParsePrefixModes(status, features);
-        channel.Members[nickname] = new IrcChannelMemberSnapshot(nickname, username, host, existingModes);
+        var existing = existingKey is not null ? channel.Members[existingKey] : null;
+        channel.Members[nickname] = new IrcChannelMemberSnapshot(
+            nickname,
+            username,
+            host,
+            existingModes,
+            existing?.Account,
+            string.IsNullOrWhiteSpace(realName) ? existing?.RealName : realName,
+            existing?.IsAway ?? false,
+            existing?.AwayReason);
         channel.ModeState.SetMemberModes(nickname, existingModes);
+        TouchMember(channel, nickname, MemberMutationKind.Metadata);
         if (existingKey is not null && !string.Equals(existingKey, nickname, StringComparison.Ordinal))
         {
             channel.Members.Remove(existingKey);
@@ -872,6 +1062,9 @@ internal sealed class SessionStateStore
         public DateTimeOffset? TopicSetAt { get; set; }
         public int ConnectionGeneration { get; set; }
         public bool NamesInProgress { get; set; }
+        public bool NamesRequestPending { get; set; }
+        public HashSet<string> NamesObserved { get; } = new(StringComparer.Ordinal);
+        public long NamesStartRevision { get; set; }
         public ChannelSynchronizationState Synchronization { get; set; }
         public IrcChannelModeState ModeState { get; }
         public Dictionary<string, IrcChannelMemberSnapshot> Members { get; } = new(StringComparer.Ordinal);
@@ -890,17 +1083,49 @@ internal sealed class SessionStateStore
         }
     }
 
-    private static DateTimeOffset? ParseServerTime(IrcMessage message) =>
-        message.TagValues.TryGetValue("time", out var value)
-            && DateTimeOffset.TryParse(value, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out var timestamp)
-                ? timestamp
-                : null;
+    private static DateTimeOffset? ParseServerTime(IrcMessage message) => message.ServerTimestamp;
+
+    private void TouchMember(MutableChannel channel, string nickname, MemberMutationKind kind)
+    {
+        _membershipRevision++;
+        _memberMutations[MemberMutationKey(channel, nickname)] = new MemberMutation(_membershipRevision, kind);
+    }
+
+    private bool TryGetNewerMemberMutation(MutableChannel channel, string nickname, long revision, out MemberMutation mutation) =>
+        _memberMutations.TryGetValue(MemberMutationKey(channel, nickname), out mutation!)
+        && mutation.Revision > revision;
+
+    private void ClearMemberMutations(MutableChannel channel)
+    {
+        var prefix = ChannelKey(channel.Name) + '\0';
+        foreach (var key in _memberMutations.Keys.Where(key => key.StartsWith(prefix, StringComparison.Ordinal)).ToArray())
+        {
+            _memberMutations.Remove(key);
+        }
+    }
+
+    private string MemberMutationKey(MutableChannel channel, string nickname) => $"{ChannelKey(channel.Name)}\0{NameKey(nickname)}";
+
+    private enum MemberMutationKind
+    {
+        Structural,
+        Metadata,
+        Mode,
+        Removal
+    }
+
+    private sealed record MemberMutation(long Revision, MemberMutationKind Kind);
 
     private static DateTimeOffset? ParseUnixTime(string? value) =>
         long.TryParse(value, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var seconds)
             && seconds is >= -62135596800 and <= 253402300799
             ? DateTimeOffset.FromUnixTimeSeconds(seconds)
-            : null;
+                : null;
+
+    private sealed class MutableBatch(string type)
+    {
+        public string Type { get; } = type;
+    }
 
     private sealed class MutableQuery
     {

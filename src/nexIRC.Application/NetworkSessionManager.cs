@@ -279,7 +279,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
         var workspace = GetWorkspace(networkId);
-        var supportsLabels = workspace.Snapshot.Capabilities.IsEnabled("labeled-response");
+        var supportsLabels = workspace.Snapshot.Capabilities.IsEnabled(IrcCapabilityCatalog.LabeledResponse);
         ActiveOperation? operationToStart = null;
         IrcQueryRequestResult result;
         lock (_operationsGate)
@@ -367,7 +367,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         var workspace = GetWorkspace(networkId);
-        var supportsLabels = workspace.Snapshot.Capabilities.IsEnabled("labeled-response");
+        var supportsLabels = workspace.Snapshot.Capabilities.IsEnabled(IrcCapabilityCatalog.LabeledResponse);
         ActiveOperation? previous = null;
         ActiveOperation operation;
         lock (_operationsGate)
@@ -469,7 +469,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 throw new InvalidOperationException("Too many IRC operations are already outstanding on this network.");
             }
 
-            var supportsLabels = workspace.Snapshot.Capabilities.IsEnabled("labeled-response");
+            var supportsLabels = workspace.Snapshot.Capabilities.IsEnabled(IrcCapabilityCatalog.LabeledResponse);
             var label = supportsLabels
                 ? NextOperationLabelUnsafe(state.LabeledWhois.Keys
                     .Concat(state.BanLists.Values.Select(item => item.Operation.RequestLabel ?? string.Empty))
@@ -1414,11 +1414,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             return null;
         }
 
-        if (!query.TryApplyNicknameChange(
-                nick.PreviousNickname,
-                nick.NewNickname,
-                snapshot.Features.CaseMapping,
-                snapshot.ConnectionGeneration))
+        if (!query.CanApplyNicknameChange(nick.PreviousNickname, nick.NewNickname, snapshot.Features.CaseMapping))
         {
             return null;
         }
@@ -1439,6 +1435,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 snapshot.Features.CaseMapping);
             SaveConfigurationInBackground();
         }
+
+        query.TryApplyNicknameChange(
+            nick.PreviousNickname,
+            nick.NewNickname,
+            snapshot.Features.CaseMapping,
+            snapshot.ConnectionGeneration);
 
         return query;
     }
@@ -2118,11 +2120,15 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             }
 
             entry.Workspace.ApplySnapshot(snapshot);
-            RouteSemanticEvent(entry.Workspace, item.Event, snapshot);
+            RouteSemanticEvent(entry.Workspace, item.Event, snapshot, item.ReceivedAt);
         }, DispatchCategory(item.Event));
     }
 
-    private void RouteSemanticEvent(NetworkWorkspace workspace, IrcSemanticEvent semanticEvent, ServerSessionSnapshot snapshot)
+    private void RouteSemanticEvent(
+        NetworkWorkspace workspace,
+        IrcSemanticEvent semanticEvent,
+        ServerSessionSnapshot snapshot,
+        DateTimeOffset? receivedAt)
     {
         if (ShouldSuppressIgnoredPresentation(workspace, semanticEvent))
         {
@@ -2131,59 +2137,67 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             return;
         }
 
+        void Append(
+            WorkspaceView view,
+            IrcSemanticEvent item,
+            WorkspaceActivity? activity = null,
+            bool publishNotification = true,
+            bool updateLastActivity = true) =>
+            AppendRendered(view, item, snapshot, activity, publishNotification, updateLastActivity, receivedAt);
+
         switch (semanticEvent)
         {
             case IrcCtcpEvent ctcp when snapshot.Features.ChannelTypes.Contains(ctcp.Target.FirstOrDefault()):
-                AppendRendered(workspace.EnsureChannel(ctcp.Target, reopen: false), semanticEvent, snapshot);
+                Append(workspace.EnsureChannel(ctcp.Target, reopen: false), semanticEvent);
                 break;
             case IrcCtcpEvent ctcp when IrcIdentity.Equals(ctcp.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping):
-                AppendRendered(workspace.EnsureIncomingQuery(ctcp.Target), semanticEvent, snapshot);
+                Append(workspace.EnsureIncomingQuery(ctcp.Target), semanticEvent);
                 break;
             case IrcCtcpEvent ctcp when ctcp.Message.Prefix?.Name is { } sender:
-                AppendRendered(workspace.EnsureIncomingQuery(sender), semanticEvent, snapshot, WorkspaceActivity.Important);
+                Append(workspace.EnsureIncomingQuery(sender), semanticEvent, WorkspaceActivity.Important);
                 break;
             case IrcPrivmsgEvent message when snapshot.Features.ChannelTypes.Contains(message.Target.FirstOrDefault()):
-                AppendRendered(workspace.EnsureChannel(message.Target, reopen: false), semanticEvent, snapshot);
+                Append(workspace.EnsureChannel(message.Target, reopen: false), semanticEvent);
                 break;
             case IrcPrivmsgEvent message when message.IsNotice && message.Message.Prefix?.User is null:
-                AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                Append(workspace.StatusView, semanticEvent);
                 break;
             case IrcPrivmsgEvent:
                 // A direct message is rendered by the corresponding query
                 // event below; do not duplicate it in server status.
                 break;
             case IrcQueryMessageEvent query:
-                AppendRendered(workspace.EnsureIncomingQuery(query.Nickname), semanticEvent, snapshot, WorkspaceActivity.Important);
+                Append(workspace.EnsureIncomingQuery(query.Nickname), semanticEvent, WorkspaceActivity.Important);
                 break;
             case IrcJoinEvent join:
-                AppendRendered(workspace.EnsureChannel(join.Channel, reopen: false), semanticEvent, snapshot);
+                Append(workspace.EnsureChannel(join.Channel, reopen: false), semanticEvent);
                 break;
             case IrcPartEvent part:
-                AppendRendered(workspace.EnsureChannel(part.Channel, reopen: false), semanticEvent, snapshot);
+                Append(workspace.EnsureChannel(part.Channel, reopen: false), semanticEvent);
                 break;
             case IrcKickEvent kick:
                 ReconcileKickEvent(workspace, kick);
-                AppendRendered(workspace.EnsureChannel(kick.Channel, reopen: false), semanticEvent, snapshot);
+                Append(workspace.EnsureChannel(kick.Channel, reopen: false), semanticEvent);
                 break;
             case IrcTopicEvent topic:
                 ReconcileTopicEvent(workspace, topic);
-                AppendRendered(workspace.EnsureChannel(topic.Channel, reopen: false), semanticEvent, snapshot);
+                Append(workspace.EnsureChannel(topic.Channel, reopen: false), semanticEvent);
                 break;
             case IrcTopicUnsetEvent topic:
-                AppendRendered(workspace.EnsureChannel(topic.Channel, reopen: false), semanticEvent, snapshot);
+                Append(workspace.EnsureChannel(topic.Channel, reopen: false), semanticEvent);
                 break;
             case IrcNamesEvent names:
-                AppendRendered(workspace.EnsureChannel(names.Channel, reopen: false), semanticEvent, snapshot);
+                Append(workspace.EnsureChannel(names.Channel, reopen: false), semanticEvent);
                 break;
             case IrcNamesCompleteEvent names:
-                AppendRendered(workspace.EnsureChannel(names.Channel, reopen: false), semanticEvent, snapshot);
+                Append(workspace.EnsureChannel(names.Channel, reopen: false), semanticEvent);
                 break;
             case IrcWhoEvent who:
-                AppendRendered(workspace.EnsureChannel(who.Channel, reopen: false), semanticEvent, snapshot);
+                Append(workspace.EnsureChannel(who.Channel, reopen: false), semanticEvent);
                 break;
             case IrcModeEvent mode:
                 ReconcileModeEvent(workspace, mode);
-                AppendRendered(workspace.EnsureChannel(mode.Channel, reopen: false), semanticEvent, snapshot);
+                Append(workspace.EnsureChannel(mode.Channel, reopen: false), semanticEvent);
                 break;
             case IrcBanListItemEvent banListItem:
                 if (RouteBanListItemEvent(workspace, banListItem) is not null)
@@ -2191,22 +2205,22 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                     break;
                 }
 
-                AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                Append(workspace.StatusView, semanticEvent);
                 break;
             case IrcBanListEndEvent banListEnd:
                 if (RouteBanListEndEvent(workspace, banListEnd) is not null)
                 {
-                    AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                    Append(workspace.StatusView, semanticEvent);
                 }
 
                 break;
             case IrcChannelSynchronizationEvent synchronization:
-                AppendRendered(workspace.EnsureChannel(synchronization.Channel, reopen: false), semanticEvent, snapshot);
+                Append(workspace.EnsureChannel(synchronization.Channel, reopen: false), semanticEvent);
                 break;
             case IrcListStartEvent listStartEvent:
                 if (RouteListEvent(workspace, listStartEvent.RequestLabel, completes: false, starts: true) is not null)
                 {
-                    AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                    Append(workspace.StatusView, semanticEvent);
                 }
 
                 break;
@@ -2224,7 +2238,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             case IrcListEndEvent listEndEvent:
                 if (RouteListEvent(workspace, listEndEvent.RequestLabel, completes: true, starts: false) is not null)
                 {
-                    AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                    Append(workspace.StatusView, semanticEvent);
                 }
 
                 break;
@@ -2238,7 +2252,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
                 if (whoisView is not null)
                 {
-                    AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                    Append(workspace.StatusView, semanticEvent);
                 }
 
                 break;
@@ -2247,10 +2261,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 WorkspaceView targetView = serverNumeric.Interpretation.TargetChannel is { } targetChannel
                     ? workspace.EnsureChannel(targetChannel, reopen: false)
                     : workspace.StatusView;
-                AppendRendered(targetView, serverNumeric, snapshot);
+                Append(targetView, serverNumeric);
                 if (!ReferenceEquals(targetView, workspace.StatusView))
                 {
-                    AppendRendered(workspace.StatusView, serverNumeric, snapshot);
+                    Append(workspace.StatusView, serverNumeric);
                 }
 
                 break;
@@ -2265,12 +2279,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                     pendingWhois.ApplyAdditional(unknownWhois.Numeric, MessageText(unknownWhois.Message));
                 }
 
-                AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                Append(workspace.StatusView, semanticEvent);
                 break;
             case IrcQuitEvent quit:
                 foreach (var channel in workspace.Channels)
                 {
-                    AppendRendered(channel, semanticEvent, snapshot);
+                    Append(channel, semanticEvent);
                 }
 
                 break;
@@ -2279,27 +2293,26 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 var followedQuery = ReconcileQueryNicknameChange(workspace, nickname, snapshot);
                 foreach (var channel in workspace.Channels)
                 {
-                    AppendRendered(channel, semanticEvent, snapshot);
+                    Append(channel, semanticEvent);
                 }
 
                 if (followedQuery is not null)
                 {
-                    AppendRendered(
+                    Append(
                         followedQuery,
                         semanticEvent,
-                        snapshot,
                         WorkspaceActivity.None,
                         publishNotification: false,
                         updateLastActivity: false);
                 }
 
-                AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                Append(workspace.StatusView, semanticEvent);
                 break;
             case IrcNumericEvent numeric when numeric.Numeric is 332 or 331 or 324 or 353 or 366 or 367 or 368 or 375 or 372 or 376 or 422
                 || WhoisResult.IsKnownWhoisNumeric(numeric.Numeric):
                 break;
             default:
-                AppendRendered(workspace.StatusView, semanticEvent, snapshot);
+                Append(workspace.StatusView, semanticEvent);
                 break;
         }
     }
@@ -2381,9 +2394,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         ServerSessionSnapshot snapshot,
         WorkspaceActivity? activity = null,
         bool publishNotification = true,
-        bool updateLastActivity = true)
+        bool updateLastActivity = true,
+        DateTimeOffset? receivedAt = null)
     {
-        var entry = IrcEventPresentation.Render(semanticEvent, snapshot);
+        var entry = IrcEventPresentation.Render(semanticEvent, snapshot, receivedAt);
         if (entry is null)
         {
             return;
@@ -2649,9 +2663,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private static WorkspaceDispatchActionCategory DispatchCategory(IrcSemanticEvent semanticEvent) => semanticEvent switch
     {
         IrcPrivmsgEvent or IrcQueryMessageEvent or IrcCtcpEvent => WorkspaceDispatchActionCategory.IncomingMessage,
-        IrcJoinEvent or IrcPartEvent or IrcQuitEvent or IrcKickEvent or IrcNamesEvent or IrcNamesCompleteEvent or IrcWhoEvent or IrcWhoEndEvent => WorkspaceDispatchActionCategory.Membership,
+        IrcJoinEvent or IrcPartEvent or IrcQuitEvent or IrcKickEvent or IrcAwayEvent or IrcAccountEvent or IrcNamesEvent or IrcNamesCompleteEvent or IrcWhoEvent or IrcWhoEndEvent => WorkspaceDispatchActionCategory.Membership,
         IrcModeEvent or IrcTopicEvent or IrcTopicUnsetEvent or IrcTopicMetadataEvent => WorkspaceDispatchActionCategory.ModeOrTopic,
-        IrcNicknameChangedEvent or IrcChannelSynchronizationEvent or IrcWelcomeEvent or IrcRegistrationStateEvent or IrcCapabilityChangedEvent or IrcSaslStateChangedEvent or IrcMotdEvent => WorkspaceDispatchActionCategory.Lifecycle,
+        IrcNicknameChangedEvent or IrcChannelSynchronizationEvent or IrcWelcomeEvent or IrcRegistrationStateEvent or IrcCapabilityChangedEvent or IrcSaslStateChangedEvent or IrcBatchEvent or IrcMotdEvent => WorkspaceDispatchActionCategory.Lifecycle,
         IrcWhoisEvent or IrcBanListItemEvent or IrcBanListEndEvent or IrcListStartEvent or IrcListItemEvent or IrcListEndEvent => WorkspaceDispatchActionCategory.HistoryProjection,
         IrcServerErrorEvent or IrcServerNumericEvent or IrcUnknownCommandEvent or IrcUnknownNumericEvent => WorkspaceDispatchActionCategory.Notification,
         _ => WorkspaceDispatchActionCategory.Other

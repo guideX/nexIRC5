@@ -4,6 +4,12 @@ using nexIRC.Networking.Testing;
 
 namespace nexIRC.Application.Tests;
 
+[CollectionDefinition("Phase1R endurance", DisableParallelization = true)]
+public sealed class Phase1RCollectionDefinition
+{
+}
+
+[Collection("Phase1R endurance")]
 public sealed class Phase1RTests
 {
     [Fact]
