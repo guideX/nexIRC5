@@ -619,6 +619,14 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             _navigationHistory.Record(ConversationIdentity.From(ActiveView));
         }
 
+        foreach (var networkItem in Networks)
+        {
+            if (!ReferenceEquals(networkItem, workspace))
+            {
+                networkItem.DeactivateActiveView();
+            }
+        }
+
         workspace.Activate(view);
         ActiveNetwork = workspace;
         ActiveView = view;

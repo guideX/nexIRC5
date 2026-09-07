@@ -15,10 +15,46 @@ namespace nexIRC.Desktop;
 /// </summary>
 internal static class UiSmokeHarness
 {
-    private static readonly string[] Scenarios = ["participant", "moderation", "channel-properties", "multi-network", "lifecycle", "read-state", "reconnect", "burst", "burst-fairness", "query-nick"];
+    private static readonly string[] Scenarios =
+    [
+        "participant",
+        "moderation",
+        "channel-properties",
+        "multi-network",
+        "lifecycle",
+        "read-state",
+        "reconnect",
+        "burst",
+        "burst-fairness",
+        "query-nick",
+        "sustained-interactivity",
+        "close-idle",
+        "close-sustained",
+        "close-backlog",
+        "close-reconnect",
+        "close-partial",
+        "close-registered",
+        "close-persistence",
+        "close-interacted"
+    ];
+
+    private static readonly string[] ExternalCloseScenarios =
+    [
+        "close-idle",
+        "close-sustained",
+        "close-backlog",
+        "close-reconnect",
+        "close-partial",
+        "close-registered",
+        "close-persistence",
+        "close-interacted"
+    ];
 
     public static bool IsKnownScenario(string? scenario) =>
         scenario is not null && Scenarios.Contains(scenario, StringComparer.OrdinalIgnoreCase);
+
+    public static bool IsExternalCloseScenario(string? scenario) =>
+        scenario is not null && ExternalCloseScenarios.Contains(scenario, StringComparer.OrdinalIgnoreCase);
 
     public static async Task RunAsync(string scenario, MainWindow window, DemoScenario demo)
     {
@@ -58,6 +94,19 @@ internal static class UiSmokeHarness
                 break;
             case "query-nick":
                 await QueryNickAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "sustained-interactivity":
+                await SustainedInteractivityAsync(window, demo, state.Alpha, state.Beta).ConfigureAwait(true);
+                break;
+            case "close-idle":
+            case "close-sustained":
+            case "close-backlog":
+            case "close-reconnect":
+            case "close-partial":
+            case "close-registered":
+            case "close-persistence":
+            case "close-interacted":
+                await CloseProbeAsync(scenario.ToLowerInvariant(), window, demo, state.Alpha, state.Beta).ConfigureAwait(true);
                 break;
             default:
                 throw new ArgumentException($"Unknown UI smoke scenario '{scenario}'.", nameof(scenario));
@@ -369,6 +418,433 @@ internal static class UiSmokeHarness
     }
 
     private static double TicksToMilliseconds(long ticks) => ticks * 1000d / Stopwatch.Frequency;
+
+    private static async Task SustainedInteractivityAsync(MainWindow window, DemoScenario demo, NetworkWorkspace alpha, NetworkWorkspace beta)
+    {
+        var viewModel = window.ViewModel;
+        var alphaChannel = RequiredChannel(alpha);
+        var betaChannel = RequiredChannel(beta);
+        var alphaQuery = viewModel.Sessions.EnsureQuery(alpha.Id, "Alex");
+        var existingQuery = viewModel.Sessions.OpenHistoricalConversation(alpha.Id, DestinationKind.Query, "ExistingPeer");
+
+        viewModel.SelectView(alpha.StatusView);
+        demo.BetaTransport.EnqueueInboundLine(":QuietMarker!u@beta PRIVMSG #general :phase1s-quiet-marker");
+        await WaitForAsync(viewModel.Sessions, () => betaChannel.UnreadCount > 0, "quiet network did not accumulate an unread marker").ConfigureAwait(true);
+
+        const int noisyTrafficCount = 3_600;
+        const int quietTrafficCount = 360;
+        var trafficStart = Stopwatch.GetTimestamp();
+        var noisyTraffic = ProduceTrafficAsync(
+            demo.AlphaTransport,
+            "#general",
+            "phase1s-alpha",
+            noisyTrafficCount,
+            batchSize: 32,
+            pacingMilliseconds: 1);
+        var quietTraffic = ProduceTrafficAsync(
+            demo.BetaTransport,
+            "#general",
+            "phase1s-beta",
+            quietTrafficCount,
+            batchSize: 24,
+            pacingMilliseconds: 2);
+        await Task.Yield();
+
+        var measurements = new List<InteractionMeasurement>();
+        measurements.Add(await MeasureInteractionAsync(
+            window,
+            "conversation-selection",
+            () => viewModel.SelectView(alphaChannel),
+            () => ReferenceEquals(viewModel.ActiveView, alphaChannel),
+            () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
+        measurements.Add(await MeasureInteractionAsync(
+            window,
+            "network-selection",
+            () => viewModel.SelectView(betaChannel),
+            () => ReferenceEquals(viewModel.ActiveView, betaChannel) && ReferenceEquals(viewModel.Sessions.ActiveNetwork, beta),
+            () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
+
+        var navigatorTarget = viewModel.ConversationNavigator.FirstOrDefault(item =>
+            item.Identity.NetworkId == alpha.Id
+            && item.Kind == WorkspaceViewKind.Channel
+            && item.Name == alphaChannel.Channel);
+        Require(navigatorTarget is not null, "sustained smoke did not expose the Alpha conversation in the navigator");
+        measurements.Add(await MeasureInteractionAsync(
+            window,
+            "navigator-selection",
+            () => viewModel.ActivateConversationCommand.Execute(navigatorTarget),
+            () => ReferenceEquals(viewModel.ActiveView, alphaChannel),
+            () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
+
+        const string draft = "phase1s draft input";
+        measurements.Add(await MeasureInteractionAsync(
+            window,
+            "draft-edit",
+            () => viewModel.PrepareInput(draft),
+            () => viewModel.InputText == draft,
+            () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
+
+        measurements.Add(await MeasureInteractionAsync(
+            window,
+            "draft-switch-and-restore",
+            () =>
+            {
+                viewModel.SelectView(betaChannel);
+                viewModel.SelectView(alphaChannel);
+            },
+            () => ReferenceEquals(viewModel.ActiveView, alphaChannel) && viewModel.InputText == draft,
+            () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
+
+        viewModel.SelectView(alphaChannel);
+        Require(ReferenceEquals(viewModel.ActiveView, alphaChannel) && ReferenceEquals(viewModel.Sessions.ActiveView, alphaChannel), "sustained smoke could not leave the quiet conversation before measuring unread selection");
+        demo.BetaTransport.EnqueueInboundLine(":QuietMarker!u@beta PRIVMSG #general :phase1s-quiet-selection-marker");
+        await WaitForAsync(viewModel.Sessions, () => betaChannel.UnreadCount > 0, $"quiet network did not accumulate the selection unread marker (active={viewModel.ActiveView?.Title}, betaActive={betaChannel.IsActive}, entries={betaChannel.EntryCount})").ConfigureAwait(true);
+        var quietUnreadObserved = false;
+        measurements.Add(await MeasureInteractionAsync(
+            window,
+            "unread-selection",
+            () =>
+            {
+                quietUnreadObserved = betaChannel.UnreadCount > 0;
+                viewModel.SelectView(betaChannel);
+            },
+            () => quietUnreadObserved && betaChannel.UnreadCount == 0 && betaChannel.Activity == WorkspaceActivity.None,
+            () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
+
+        measurements.Add(await MeasureInteractionAsync(
+            window,
+            "existing-query-destination",
+            () => viewModel.SelectView(existingQuery),
+            () => ReferenceEquals(viewModel.ActiveView, existingQuery) && existingQuery.IsViewOpen,
+            () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
+
+        measurements.Add(await MeasureInteractionAsync(
+            window,
+            "rapid-conversation-switch",
+            () =>
+            {
+                viewModel.SelectView(alphaChannel);
+                viewModel.SelectView(betaChannel);
+                viewModel.SelectView(alphaQuery);
+            },
+            () => ReferenceEquals(viewModel.ActiveView, alphaQuery),
+            () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
+
+        var secondNavigatorTarget = viewModel.ConversationNavigator.FirstOrDefault(item =>
+            item.Identity.NetworkId == beta.Id
+            && item.Kind == WorkspaceViewKind.Channel
+            && item.Name == betaChannel.Channel);
+        Require(secondNavigatorTarget is not null, "sustained smoke did not retain the quiet network navigator item");
+        measurements.Add(await MeasureInteractionAsync(
+            window,
+            "navigator-restore",
+            () => viewModel.ActivateConversationCommand.Execute(secondNavigatorTarget),
+            () => ReferenceEquals(viewModel.ActiveView, betaChannel),
+            () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
+
+        measurements.Add(await MeasureInteractionAsync(
+            window,
+            "draft-input-after-navigation",
+            () => viewModel.PrepareInput("phase1s post-navigation input"),
+            () => viewModel.InputText == "phase1s post-navigation input",
+            () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
+
+        measurements.Add(await MeasureInteractionAsync(
+            window,
+            "conversation-selection-final",
+            () => viewModel.SelectView(alphaChannel),
+            () => ReferenceEquals(viewModel.ActiveView, alphaChannel) && ReferenceEquals(viewModel.Sessions.ActiveNetwork, alpha),
+            () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
+
+        await Task.WhenAll(noisyTraffic, quietTraffic).ConfigureAwait(true);
+        var trafficElapsedMilliseconds = TicksToMilliseconds(Stopwatch.GetTimestamp() - trafficStart);
+        try
+        {
+            await WaitForAsync(viewModel.Sessions, () =>
+                AlphaTrafficTailReached(alphaChannel, noisyTrafficCount)
+                && BetaTrafficTailReached(betaChannel, quietTrafficCount),
+                "sustained traffic tails did not converge", 45_000).ConfigureAwait(true);
+        }
+        catch (TimeoutException exception)
+        {
+            var failedDiagnostics = viewModel.Sessions.Diagnostics;
+            var failedAlphaEntries = alphaChannel.EntriesSnapshot;
+            var failedBetaEntries = betaChannel.EntriesSnapshot;
+            throw new InvalidOperationException(
+                $"sustained traffic tails did not converge (alpha_last={(failedAlphaEntries.Count == 0 ? "<none>" : failedAlphaEntries[^1].Text)}, beta_last={(failedBetaEntries.Count == 0 ? "<none>" : failedBetaEntries[^1].Text)}, queued={failedDiagnostics.QueuedStateActions}, processed={failedDiagnostics.ProcessedStateActions}, queue={failedDiagnostics.CurrentQueueDepth}, max_queue={failedDiagnostics.MaximumQueueDepth})",
+                exception);
+        }
+        await viewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+
+        var alphaEntries = alphaChannel.EntriesSnapshot
+            .Where(entry => entry.Text.StartsWith("phase1s-alpha-", StringComparison.Ordinal))
+            .Select(entry => entry.Text)
+            .ToArray();
+        var betaEntries = betaChannel.EntriesSnapshot
+            .Where(entry => entry.Text.StartsWith("phase1s-beta-", StringComparison.Ordinal))
+            .Select(entry => entry.Text)
+            .ToArray();
+        Require(alphaEntries.SequenceEqual(alphaEntries.OrderBy(static value => value, StringComparer.Ordinal)), "noisy Alpha traffic lost FIFO ordering");
+        Require(betaEntries.SequenceEqual(betaEntries.OrderBy(static value => value, StringComparer.Ordinal)), "quiet Beta traffic lost FIFO ordering");
+        Require(!betaEntries.Any(entry => entry.StartsWith("phase1s-alpha-", StringComparison.Ordinal)), "noisy Alpha traffic crossed into Beta");
+        Require(measurements.Count(item => item.TrafficWasActive) >= 8, "too few user interactions overlapped active traffic");
+        Require(quietUnreadObserved, "quiet network unread state was not observed before selection");
+
+        var diagnostics = viewModel.Sessions.Diagnostics;
+        var stateDispatch = diagnostics.StateDispatch;
+        var recentSamples = stateDispatch.RecentSamples ?? Array.Empty<WorkspaceDispatchSample>();
+        var boundary = stateDispatch.BoundaryDiagnostics;
+        var trafficEvents = noisyTrafficCount + quietTrafficCount + 1;
+        var rate = trafficEvents / Math.Max(trafficElapsedMilliseconds / 1_000d, 0.001d);
+        Console.WriteLine(
+            $"SUSTAINED_UI_METRICS observations={measurements.Count} active_overlaps={measurements.Count(item => item.TrafficWasActive)} "
+            + $"traffic_events={trafficEvents} noisy_alpha_events={noisyTrafficCount} quiet_beta_events={quietTrafficCount + 1} traffic_elapsed_ms={trafficElapsedMilliseconds:F3} traffic_rate_eps={rate:F3} "
+            + FormatDistribution("queue_depth_at_interaction", measurements.Select(item => (double)item.QueueDepthAtInteraction)) + " "
+            + FormatDistribution("oldest_queued_age_ms", measurements.Select(item => item.OldestQueuedWorkAgeMilliseconds)) + " "
+            + FormatDistribution("wpf_callback_wait_ms", measurements.Select(item => item.WpfCallbackWaitMilliseconds)) + " "
+            + FormatDistribution("interaction_to_state_ms", measurements.Select(item => item.InteractionToStateMilliseconds)) + " "
+            + FormatDistribution("state_to_presentation_ms", measurements.Select(item => item.StateToPresentationOpportunityMilliseconds)) + " "
+            + FormatDistribution("interaction_to_presentation_ms", measurements.Select(item => item.InteractionToPresentationOpportunityMilliseconds)) + " "
+            + FormatDistribution("authority_residence_ms", recentSamples.Select(static sample => sample.QueueWaitMilliseconds)) + " "
+            + FormatDistribution("dispatcher_boundary_ms", recentSamples.Select(static sample => sample.WpfScheduleWaitMilliseconds)) + " "
+            + $"max_authoritative_queue_depth={stateDispatch.MaximumQueueDepth} max_wpf_pending={stateDispatch.MaximumWpfPendingWorkItems} "
+            + $"wpf_posted={stateDispatch.WpfWorkItemsPosted} wpf_executed={stateDispatch.WpfWorkItemsExecuted} "
+            + $"cooperative_slices={stateDispatch.CooperativeSliceCount} cooperative_yields={stateDispatch.CooperativeYieldCount} "
+            + $"max_slice_work_items={stateDispatch.MaximumCooperativeSliceWorkItems} max_slice_ms={stateDispatch.MaximumCooperativeSliceDurationMilliseconds:F3} "
+            + $"authority_samples={recentSamples.Count} alpha_tail_ordered=true beta_tail_ordered=true network_isolated=true unread_cleared=true "
+            + $"navigation_refresh_requests={viewModel.PresentationDiagnostics.NavigationRefreshRequests} navigation_refresh_executions={viewModel.PresentationDiagnostics.NavigationRefreshExecutions} "
+            + $"navigation_refresh_coalesced={viewModel.PresentationDiagnostics.NavigationRefreshCoalescedRequests}");
+    }
+
+    private static async Task<InteractionMeasurement> MeasureInteractionAsync(
+        MainWindow window,
+        string name,
+        Action action,
+        Func<bool> stateAssertion,
+        Func<bool> trafficActive)
+    {
+        var stateDispatch = window.ViewModel.Sessions.Diagnostics.StateDispatch;
+        var interactionId = window.PresentationTiming.BeginInteraction();
+        var callbackStart = 0L;
+        PresentationTimingSample? presentation = null;
+        try
+        {
+            await Task.Run(() => window.Dispatcher.InvokeAsync(() =>
+            {
+                callbackStart = Stopwatch.GetTimestamp();
+                action();
+                window.PresentationTiming.MarkWpfStateChanged(interactionId);
+            }, System.Windows.Threading.DispatcherPriority.Input).Task).ConfigureAwait(true);
+            if (!stateAssertion())
+            {
+                throw new InvalidOperationException(
+                    $"sustained interaction '{name}' did not reach its expected WPF state (view-model active={window.ViewModel.ActiveView?.Title ?? "<none>"}, session active={window.ViewModel.Sessions.ActiveView?.Title ?? "<none>"})");
+            }
+            presentation = await window.PresentationTiming
+                .WaitForNextOpportunityAsync(TimeSpan.FromSeconds(2))
+                .ConfigureAwait(true);
+            Require(presentation is not null, $"sustained interaction '{name}' had no bounded presentation opportunity");
+            var completedPresentation = presentation!;
+            return new InteractionMeasurement(
+                name,
+                stateDispatch.CurrentQueueDepth,
+                stateDispatch.CurrentOldestQueuedWorkAgeMilliseconds,
+                TicksToMilliseconds(callbackStart - completedPresentation.InteractionTimestamp),
+                completedPresentation.InteractionToWpfStateMilliseconds,
+                completedPresentation.WpfStateToPresentationOpportunityMilliseconds,
+                completedPresentation.InteractionToOpportunityMilliseconds,
+                trafficActive());
+        }
+        finally
+        {
+            if (presentation is null)
+            {
+                window.PresentationTiming.CancelPendingInteraction();
+            }
+        }
+    }
+
+    private static async Task ProduceTrafficAsync(
+        FakeIrcTransport transport,
+        string channel,
+        string prefix,
+        int count,
+        int batchSize,
+        int pacingMilliseconds,
+        CancellationToken cancellationToken = default)
+    {
+        for (var index = 0; index < count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            transport.EnqueueInboundLine($":{prefix}!stream@demo PRIVMSG {channel} :{prefix}-{index:00000}");
+            if ((index + 1) % batchSize == 0)
+            {
+                await Task.Delay(pacingMilliseconds, cancellationToken).ConfigureAwait(true);
+            }
+        }
+    }
+
+    private static bool AlphaTrafficTailReached(ChannelView channel, int count) =>
+        channel.EntriesSnapshot.Any(entry => entry.Text == $"phase1s-alpha-{count - 1:00000}");
+
+    private static bool BetaTrafficTailReached(ChannelView channel, int count) =>
+        channel.EntriesSnapshot.Any(entry => entry.Text == $"phase1s-beta-{count - 1:00000}");
+
+    private static string FormatDistribution(string prefix, IEnumerable<double> values)
+    {
+        var ordered = values.OrderBy(static value => value).ToArray();
+        Require(ordered.Length > 0, $"no samples were collected for {prefix}");
+        return $"{prefix}_min={ordered[0]:F3} {prefix}_p50={Percentile(ordered, 0.50):F3} {prefix}_p95={Percentile(ordered, 0.95):F3} {prefix}_p99={Percentile(ordered, 0.99):F3} {prefix}_max={ordered[^1]:F3}";
+    }
+
+    private static double Percentile(double[] ordered, double percentile)
+    {
+        var index = Math.Clamp((int)Math.Ceiling(ordered.Length * percentile) - 1, 0, ordered.Length - 1);
+        return ordered[index];
+    }
+
+    private sealed record InteractionMeasurement(
+        string Name,
+        int QueueDepthAtInteraction,
+        double OldestQueuedWorkAgeMilliseconds,
+        double WpfCallbackWaitMilliseconds,
+        double InteractionToStateMilliseconds,
+        double StateToPresentationOpportunityMilliseconds,
+        double InteractionToPresentationOpportunityMilliseconds,
+        bool TrafficWasActive);
+
+    private static async Task CloseProbeAsync(
+        string scenario,
+        MainWindow window,
+        DemoScenario demo,
+        NetworkWorkspace alpha,
+        NetworkWorkspace beta)
+    {
+        var viewModel = window.ViewModel;
+        var trackedTransports = new List<FakeIrcTransport> { demo.AlphaTransport, demo.BetaTransport };
+        using var trafficCancellation = new CancellationTokenSource();
+        Task traffic = Task.CompletedTask;
+
+        switch (scenario)
+        {
+            case "close-idle":
+                await viewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+                viewModel.SelectView(alpha.StatusView);
+                await viewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+                break;
+            case "close-sustained":
+                traffic = Task.WhenAll(
+                    ProduceTrafficAsync(demo.AlphaTransport, "#general", "phase1s-close-alpha", 6_000, 32, 1, trafficCancellation.Token),
+                    ProduceTrafficAsync(demo.BetaTransport, "#general", "phase1s-close-beta", 600, 24, 2, trafficCancellation.Token));
+                await Task.Yield();
+                break;
+            case "close-backlog":
+                EnqueueBacklog(demo.AlphaTransport, "#general", "phase1s-backlog-alpha", 10_000);
+                EnqueueBacklog(demo.BetaTransport, "#general", "phase1s-backlog-beta", 2_000);
+                await WaitForQueuePressureAsync(viewModel.Sessions, 256).ConfigureAwait(true);
+                break;
+            case "close-reconnect":
+                demo.AlphaTransport.EnqueueRemoteDisconnect();
+                await WaitForAsync(
+                    viewModel.Sessions,
+                    () => alpha.State == NetworkDisplayState.ReconnectWaiting || alpha.State == NetworkDisplayState.Connecting,
+                    "the reconnect close probe did not reach a reconnect boundary", 4_000).ConfigureAwait(true);
+                break;
+            case "close-partial":
+                {
+                    var partialTransport = new FakeIrcTransport(new IrcEndpoint("demo.partial.invalid", 6667, false));
+                    demo.AddTransport(partialTransport);
+                    trackedTransports.Add(partialTransport);
+                    var partial = viewModel.Sessions.Add(new NetworkConnectionOptions
+                    {
+                        DisplayName = "PartialNet",
+                        Endpoint = partialTransport.Endpoint,
+                        Nickname = "nexPartial",
+                        Username = "nexPartial",
+                        RealName = "Phase 1S partial connection close",
+                        RequestedCapabilities = Array.Empty<string>(),
+                        Reconnect = new ReconnectPolicy(Enabled: false)
+                    });
+                    await viewModel.Sessions.ConnectAsync(partial.Id).ConfigureAwait(true);
+                    await WaitForAsync(viewModel.Sessions, () => partialTransport.ConnectCount == 1, "partial transport did not connect", 4_000).ConfigureAwait(true);
+                    await WaitForAsync(
+                        viewModel.Sessions,
+                        () => partial.State is NetworkDisplayState.Connecting or NetworkDisplayState.Connected or NetworkDisplayState.CapNegotiation or NetworkDisplayState.Registering,
+                        "partial connection did not remain before registration", 4_000).ConfigureAwait(true);
+                    Require(partial.State != NetworkDisplayState.Registered, "partial close probe unexpectedly registered its session");
+                    break;
+                }
+            case "close-registered":
+                Require(alpha.State == NetworkDisplayState.Registered && beta.State == NetworkDisplayState.Registered, "registered close probe did not reach registered sessions");
+                await viewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+                break;
+            case "close-persistence":
+                EnqueueBacklog(demo.AlphaTransport, "#general", "phase1s-persistence", 1_000);
+                await WaitForQueuePressureAsync(viewModel.Sessions, 64).ConfigureAwait(true);
+                break;
+            case "close-interacted":
+                {
+                    var channel = RequiredChannel(alpha);
+                    var query = viewModel.Sessions.EnsureQuery(alpha.Id, "CloseProbePeer");
+                    viewModel.SelectView(channel);
+                    viewModel.PrepareInput("draft retained until natural close");
+                    viewModel.SelectView(beta.StatusView);
+                    viewModel.SelectView(query);
+                    Require(viewModel.InputText.Length == 0, "the interacted close probe did not switch to the query input state");
+                    viewModel.SelectView(channel);
+                    Require(viewModel.InputText == "draft retained until natural close", "the interacted close probe lost its draft");
+                    break;
+                }
+            default:
+                throw new ArgumentException($"Unknown close probe '{scenario}'.", nameof(scenario));
+        }
+
+        var readyDiagnostics = viewModel.Sessions.Diagnostics;
+        Console.WriteLine(
+            $"READY_UI_CLOSE scenario={scenario} state={alpha.State} queue_depth={readyDiagnostics.CurrentQueueDepth} "
+            + $"oldest_queued_age_ms={readyDiagnostics.StateDispatch.CurrentOldestQueuedWorkAgeMilliseconds:F3} max_queue_depth={readyDiagnostics.MaximumQueueDepth} "
+            + $"traffic_active={!traffic.IsCompleted}");
+
+        await window.WaitForClosedAsync().ConfigureAwait(true);
+        trafficCancellation.Cancel();
+        try
+        {
+            await traffic.ConfigureAwait(true);
+        }
+        catch (OperationCanceledException) when (trafficCancellation.IsCancellationRequested)
+        {
+        }
+
+        Require(!window.IsPresentationRenderingSubscribed, $"close probe '{scenario}' left the rendering handler subscribed");
+        Require(trackedTransports.All(transport => transport.CallbackSubscriptionCount == 0 && transport.ActiveReadCount == 0), $"close probe '{scenario}' left transport ownership active");
+        var quitCount = trackedTransports.Sum(transport => transport.OutboundLines.Count(line => line.StartsWith("QUIT", StringComparison.Ordinal)));
+        var disposedCount = trackedTransports.Count(transport => transport.IsDisposed);
+        Console.WriteLine(
+            $"CLOSE_UI_METRICS scenario={scenario} max_queue_depth={readyDiagnostics.MaximumQueueDepth} "
+            + $"queue_at_ready={readyDiagnostics.CurrentQueueDepth} quit_count={quitCount} disposed_transports={disposedCount}/{trackedTransports.Count} "
+            + $"rendering_handler_attached={window.IsPresentationRenderingSubscribed} callback_subscriptions={trackedTransports.Sum(transport => transport.CallbackSubscriptionCount)} "
+            + $"active_reads={trackedTransports.Sum(transport => transport.ActiveReadCount)}");
+    }
+
+    private static void EnqueueBacklog(FakeIrcTransport transport, string channel, string prefix, int count)
+    {
+        for (var index = 0; index < count; index++)
+        {
+            transport.EnqueueInboundLine($":{prefix}!stream@demo PRIVMSG {channel} :{prefix}-{index:00000}");
+        }
+    }
+
+    private static async Task WaitForQueuePressureAsync(NetworkSessionManager sessions, int minimumMaximumQueueDepth)
+    {
+        for (var attempt = 0; attempt < 96 && sessions.Diagnostics.MaximumQueueDepth < minimumMaximumQueueDepth; attempt++)
+        {
+            await Task.Yield();
+        }
+
+        Require(
+            sessions.Diagnostics.MaximumQueueDepth >= minimumMaximumQueueDepth,
+            $"the close probe did not create the required accepted-work pressure (max={sessions.Diagnostics.MaximumQueueDepth})");
+    }
 
     private static async Task QueryNickAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
     {

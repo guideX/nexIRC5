@@ -19,7 +19,9 @@ public partial class MainWindow : Window
 {
     private bool _closing;
     private bool _shutdownComplete;
+    private bool _renderingSubscribed;
     private readonly PresentationTimingProbe _presentationTiming = new();
+    private readonly TaskCompletionSource _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public MainWindow(
         IIrcTransportFactory transportFactory,
@@ -51,6 +53,10 @@ public partial class MainWindow : Window
 
     internal PresentationTimingProbe PresentationTiming => _presentationTiming;
 
+    internal bool IsPresentationRenderingSubscribed => _renderingSubscribed;
+
+    internal Task WaitForClosedAsync() => _closed.Task;
+
     internal async Task CloseAfterSmokeAsync()
     {
         if (!_closing)
@@ -65,7 +71,12 @@ public partial class MainWindow : Window
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
-        CompositionTarget.Rendering += OnRendering;
+        if (!_renderingSubscribed)
+        {
+            CompositionTarget.Rendering += OnRendering;
+            _renderingSubscribed = true;
+        }
+
         var state = ViewModel.CurrentPreferences.ViewState;
         var bounds = SystemParameters.WorkArea;
         var valid = ViewStateValidator.Normalize(state, new ViewportBounds(bounds.Left, bounds.Top, bounds.Right, bounds.Bottom));
@@ -79,7 +90,17 @@ public partial class MainWindow : Window
 
     private void OnRendering(object? sender, EventArgs e) => _presentationTiming.RecordRendering(Stopwatch.GetTimestamp());
 
-    private void OnClosed(object? sender, EventArgs e) => CompositionTarget.Rendering -= OnRendering;
+    private void OnClosed(object? sender, EventArgs e)
+    {
+        if (_renderingSubscribed)
+        {
+            CompositionTarget.Rendering -= OnRendering;
+            _renderingSubscribed = false;
+        }
+
+        _presentationTiming.CancelPendingInteraction();
+        _closed.TrySetResult();
+    }
 
     private async Task ShowNewConnectionAsync()
     {

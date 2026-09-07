@@ -30,6 +30,12 @@ public sealed class DemoScenario
         return reconnect;
     }
 
+    internal void AddTransport(FakeIrcTransport transport)
+    {
+        ArgumentNullException.ThrowIfNull(transport);
+        _factory.Add(transport);
+    }
+
     internal async Task<(NetworkWorkspace Alpha, NetworkWorkspace Beta)> SeedSmokeAsync(MainWindowViewModel viewModel)
     {
         ArgumentNullException.ThrowIfNull(viewModel);

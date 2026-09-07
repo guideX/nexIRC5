@@ -80,7 +80,7 @@ public sealed class Phase1PTests
 
         Assert.Equal([1, 2, 3], values.ToArray());
         Assert.Equal(1, collectionChanges);
-        Assert.Equal(NotifyCollectionChangedAction.Add, lastChange);
+        Assert.Equal(NotifyCollectionChangedAction.Reset, lastChange);
 
         using (WorkspaceProjectionBatch.Begin())
         {

@@ -105,34 +105,47 @@ public sealed class SerializedWorkspaceDispatcher : IWorkspaceDispatcher
     {
         get
         {
+            WorkspaceDispatchSample[] samples;
             lock (_sampleGate)
             {
-                var samples = _samples.ToArray();
-                return new WorkspaceDispatchDiagnostics(
-                    Interlocked.Read(ref _queuedActions),
-                    Interlocked.Read(ref _processedActions),
-                    Volatile.Read(ref _queueDepth),
-                    Volatile.Read(ref _maximumQueueDepth),
-                    Interlocked.Read(ref _maximumQueueWaitTicks),
-                    Interlocked.Read(ref _maximumProcessingDurationTicks),
-                    Interlocked.Read(ref _maximumWpfScheduleWaitTicks),
-                    Interlocked.Read(ref _maximumTotalDurationTicks),
-                    PercentileMilliseconds(samples, static sample => sample.QueueWaitTicks, 0.50),
-                    PercentileMilliseconds(samples, static sample => sample.QueueWaitTicks, 0.95),
-                    PercentileMilliseconds(samples, static sample => sample.QueueWaitTicks, 0.99),
-                    PercentileMilliseconds(samples, static sample => sample.MutationDurationTicks, 0.50),
-                    PercentileMilliseconds(samples, static sample => sample.MutationDurationTicks, 0.95),
-                    PercentileMilliseconds(samples, static sample => sample.MutationDurationTicks, 0.99),
-                    PercentileMilliseconds(samples, static sample => sample.WpfScheduleWaitTicks, 0.50),
-                    PercentileMilliseconds(samples, static sample => sample.WpfScheduleWaitTicks, 0.95),
-                    PercentileMilliseconds(samples, static sample => sample.WpfScheduleWaitTicks, 0.99),
-                    samples,
-                    Interlocked.Read(ref _cooperativeSlices),
-                    Interlocked.Read(ref _cooperativeYields),
-                    Volatile.Read(ref _maximumSliceWorkItems),
-                    StopwatchTicksToMilliseconds(Interlocked.Read(ref _maximumSliceDurationTicks)),
-                    _boundaryDiagnostics?.Diagnostics);
+                samples = _samples.ToArray();
             }
+
+            var oldestQueuedWorkAgeMilliseconds = 0d;
+            lock (_gate)
+            {
+                if (_pending.TryPeek(out var oldest))
+                {
+                    oldestQueuedWorkAgeMilliseconds = StopwatchTicksToMilliseconds(
+                        Math.Max(0, Stopwatch.GetTimestamp() - oldest.QueuedTimestamp));
+                }
+            }
+
+            return new WorkspaceDispatchDiagnostics(
+                Interlocked.Read(ref _queuedActions),
+                Interlocked.Read(ref _processedActions),
+                Volatile.Read(ref _queueDepth),
+                Volatile.Read(ref _maximumQueueDepth),
+                Interlocked.Read(ref _maximumQueueWaitTicks),
+                Interlocked.Read(ref _maximumProcessingDurationTicks),
+                Interlocked.Read(ref _maximumWpfScheduleWaitTicks),
+                Interlocked.Read(ref _maximumTotalDurationTicks),
+                PercentileMilliseconds(samples, static sample => sample.QueueWaitTicks, 0.50),
+                PercentileMilliseconds(samples, static sample => sample.QueueWaitTicks, 0.95),
+                PercentileMilliseconds(samples, static sample => sample.QueueWaitTicks, 0.99),
+                PercentileMilliseconds(samples, static sample => sample.MutationDurationTicks, 0.50),
+                PercentileMilliseconds(samples, static sample => sample.MutationDurationTicks, 0.95),
+                PercentileMilliseconds(samples, static sample => sample.MutationDurationTicks, 0.99),
+                PercentileMilliseconds(samples, static sample => sample.WpfScheduleWaitTicks, 0.50),
+                PercentileMilliseconds(samples, static sample => sample.WpfScheduleWaitTicks, 0.95),
+                PercentileMilliseconds(samples, static sample => sample.WpfScheduleWaitTicks, 0.99),
+                samples,
+                Interlocked.Read(ref _cooperativeSlices),
+                Interlocked.Read(ref _cooperativeYields),
+                Volatile.Read(ref _maximumSliceWorkItems),
+                StopwatchTicksToMilliseconds(Interlocked.Read(ref _maximumSliceDurationTicks)),
+                _boundaryDiagnostics?.Diagnostics,
+                oldestQueuedWorkAgeMilliseconds);
         }
     }
 
@@ -524,7 +537,8 @@ public sealed record WorkspaceDispatchDiagnostics(
     long CooperativeYieldCount = 0,
     int MaximumCooperativeSliceWorkItems = 0,
     double MaximumCooperativeSliceDurationMilliseconds = 0,
-    WorkspaceDispatcherBoundaryDiagnostics? BoundaryDiagnostics = null)
+    WorkspaceDispatcherBoundaryDiagnostics? BoundaryDiagnostics = null,
+    double CurrentOldestQueuedWorkAgeMilliseconds = 0)
 {
     public double MaximumQueueWaitMilliseconds => SerializedWorkspaceDispatcher.StopwatchTicksToMilliseconds(MaximumQueueWaitTicks);
 

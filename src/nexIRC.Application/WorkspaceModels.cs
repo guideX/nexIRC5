@@ -1337,6 +1337,8 @@ public sealed class NetworkWorkspace : ObservableObject
         ActiveView = view;
     }
 
+    internal void DeactivateActiveView() => ActiveView?.Deactivate();
+
     internal void Close(WorkspaceView view)
     {
         view.CloseView();

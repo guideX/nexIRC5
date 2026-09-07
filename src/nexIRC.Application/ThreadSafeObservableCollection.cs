@@ -80,9 +80,6 @@ public sealed class ThreadSafeObservableCollection<T> : ObservableCollection<T>,
 {
     private readonly object _gate = new();
     private bool _notificationsDeferred;
-    private bool _deferredReset;
-    private readonly List<T> _deferredAdded = [];
-    private readonly List<T> _deferredRemoved = [];
 
     public new int Count
     {
@@ -150,19 +147,6 @@ public sealed class ThreadSafeObservableCollection<T> : ObservableCollection<T>,
         if (WorkspaceProjectionBatch.IsActive)
         {
             _notificationsDeferred = true;
-            switch (e.Action)
-            {
-                case NotifyCollectionChangedAction.Add when e.NewItems is not null:
-                    foreach (var item in e.NewItems.OfType<T>()) _deferredAdded.Add(item);
-                    break;
-                case NotifyCollectionChangedAction.Remove when e.OldItems is not null:
-                    foreach (var item in e.OldItems.OfType<T>()) _deferredRemoved.Add(item);
-                    break;
-                default:
-                    _deferredReset = true;
-                    break;
-            }
-
             WorkspaceProjectionBatch.Register(this);
             return;
         }
@@ -214,35 +198,10 @@ public sealed class ThreadSafeObservableCollection<T> : ObservableCollection<T>,
         _notificationsDeferred = false;
         base.OnPropertyChanged(new PropertyChangedEventArgs(nameof(Count)));
         base.OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
-        // A bounded transcript trim changes both ends of the collection. A
-        // single range event for that mixed operation is not consistently
-        // consumed by every WPF ItemsControl, so use one Reset for that case.
-        // Add-only and remove-only batches retain their cheaper range events.
-        if (_deferredReset || (_deferredRemoved.Count > 0 && _deferredAdded.Count > 0))
-        {
-            base.OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
-        }
-        else
-        {
-            if (_deferredRemoved.Count > 0)
-            {
-                base.OnCollectionChanged(new NotifyCollectionChangedEventArgs(
-                    NotifyCollectionChangedAction.Remove,
-                    _deferredRemoved,
-                    0));
-            }
-
-            if (_deferredAdded.Count > 0)
-            {
-                base.OnCollectionChanged(new NotifyCollectionChangedEventArgs(
-                    NotifyCollectionChangedAction.Add,
-                    _deferredAdded,
-                    Math.Max(0, base.Count - _deferredAdded.Count)));
-            }
-        }
-
-        _deferredReset = false;
-        _deferredAdded.Clear();
-        _deferredRemoved.Clear();
+        // WPF ItemsControl generators do not consistently consume a range
+        // Add/Remove event when several ordered mutations occurred in one
+        // projection slice. A single Reset is both correct for add-only
+        // batches and safe for mixed transcript trim/rebuild operations.
+        base.OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
     }
 }

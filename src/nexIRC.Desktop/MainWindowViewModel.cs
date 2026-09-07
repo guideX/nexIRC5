@@ -867,9 +867,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private void ActivateConversation(object? parameter)
     {
-        if (parameter is ConversationNavigationItem item)
+        if (parameter is ConversationNavigationItem item
+            && Sessions.TryGetView(item.ViewId, out _, out var view)
+            && view is not null)
         {
-            SelectView(item.ViewId);
+            SelectView(view);
         }
     }
 

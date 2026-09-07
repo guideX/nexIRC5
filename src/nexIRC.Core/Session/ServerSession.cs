@@ -62,6 +62,7 @@ public sealed class ServerSession : IAsyncDisposable
     private bool _disposed;
     private Task? _disposeTask;
     private int _quitSent;
+    private readonly TaskCompletionSource _quitWritten = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public ServerSession(ServerSessionOptions options, IIrcTransportFactory transportFactory)
     {
@@ -267,8 +268,12 @@ public sealed class ServerSession : IAsyncDisposable
             try
             {
                 await SendCommandAsync("QUIT", trailingParameter: reason ?? "nexIRC disconnect").ConfigureAwait(false);
+                await _quitWritten.Task.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
             }
             catch (InvalidOperationException)
+            {
+            }
+            catch (TimeoutException)
             {
             }
         }
@@ -294,8 +299,8 @@ public sealed class ServerSession : IAsyncDisposable
 
     private async Task DisposeCoreAsync()
     {
-        _disposeCts.Cancel();
         await DisconnectAsync("nexIRC session disposed").ConfigureAwait(false);
+        _disposeCts.Cancel();
         _disposeCts.Dispose();
     }
 
@@ -570,6 +575,11 @@ public sealed class ServerSession : IAsyncDisposable
             await foreach (var command in reader.ReadAllAsync(connectionCts.Token).ConfigureAwait(false))
             {
                 await transport.WriteAsync(command.FramedBytes, connectionCts.Token).ConfigureAwait(false);
+                if (IsQuit(command.Line))
+                {
+                    _quitWritten.TrySetResult();
+                }
+
                 if (IsCurrentEpoch(epoch))
                 {
                     var redactedBytes = IrcSensitiveData.RedactFramedBytes(command.FramedBytes.Span);
@@ -1127,6 +1137,14 @@ public sealed class ServerSession : IAsyncDisposable
     private static bool IsSaslSuccess(int numeric) => numeric is 900 or 903 or 907;
 
     private static bool IsSaslFailure(int numeric) => numeric is 904 or 905 or 906 or 908;
+
+    private static bool IsQuit(string line)
+    {
+        var trimmed = line.TrimStart();
+        var separator = trimmed.IndexOfAny([' ', '\t']);
+        var command = separator < 0 ? trimmed : trimmed[..separator];
+        return string.Equals(command, "QUIT", StringComparison.OrdinalIgnoreCase);
+    }
 
     private void DisposeActiveCredential()
     {

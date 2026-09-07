@@ -71,6 +71,16 @@ internal sealed class PresentationTimingProbe
         }
     }
 
+    public void CancelPendingInteraction()
+    {
+        lock (_gate)
+        {
+            _pending = null;
+            _completion?.TrySetResult(null);
+            _completion = null;
+        }
+    }
+
     public void RecordRendering(long renderingTimestamp)
     {
         lock (_gate)

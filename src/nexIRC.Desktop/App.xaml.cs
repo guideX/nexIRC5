@@ -1,7 +1,10 @@
 using System.Windows;
+using System.Diagnostics;
 using System.IO;
 using nexIRC.Application;
 using nexIRC.Core.Networking;
+using nexIRC.Core.Protocol;
+using nexIRC.Core.Session;
 using nexIRC.Networking;
 using nexIRC.Networking.Testing;
 using MessageBox = System.Windows.MessageBox;
@@ -17,6 +20,7 @@ public partial class App : System.Windows.Application
         base.OnStartup(e);
 
         var demo = e.Args.Any(argument => string.Equals(argument, "--demo", StringComparison.OrdinalIgnoreCase));
+        var liveSmoke = e.Args.Any(argument => string.Equals(argument, "--live-smoke", StringComparison.OrdinalIgnoreCase));
         var smokeScenario = ReadSmokeScenario(e.Args);
         if (smokeScenario is not null && !demo)
         {
@@ -28,7 +32,7 @@ public partial class App : System.Windows.Application
 
         if (smokeScenario is not null && !UiSmokeHarness.IsKnownScenario(smokeScenario))
         {
-            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": unknown scenario. Expected participant, moderation, channel-properties, multi-network, lifecycle, read-state, reconnect, burst, burst-fairness, or query-nick.");
+            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": unknown scenario. Expected the existing smoke scenarios, sustained-interactivity, or close-idle/close-sustained/close-backlog/close-reconnect/close-partial/close-registered/close-persistence/close-interacted.");
             Environment.ExitCode = 2;
             Shutdown(2);
             return;
@@ -49,7 +53,7 @@ public partial class App : System.Windows.Application
         ProfileCredentialService credentials;
         IConversationLogStore logStore;
         ConfigurationLoadResult? loadResult = null;
-        if (demo)
+        if (demo || liveSmoke)
         {
             configuration = new ConfigurationService(new InMemoryConfigurationStore(new NexIrcConfiguration
             {
@@ -62,7 +66,7 @@ public partial class App : System.Windows.Application
                 }
             }));
             credentials = new ProfileCredentialService(new InMemoryProfileCredentialStore());
-            _demoHistoryRoot = Directory.CreateTempSubdirectory("nexirc5-demo-history-").FullName;
+            _demoHistoryRoot = Directory.CreateTempSubdirectory(liveSmoke ? "nexirc5-live-history-" : "nexirc5-demo-history-").FullName;
             logStore = new JsonlConversationLogStore(_demoHistoryRoot, maximumSegmentBytes: 32 * 1024);
         }
         else
@@ -91,7 +95,7 @@ public partial class App : System.Windows.Application
                 MessageBox.Show(window, exception.Message, "Demo mode", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
-        else if (!demo)
+        else if (!demo && !liveSmoke)
         {
             if (loadResult?.Diagnostic is { } diagnostic && loadResult.UsedDefaults)
             {
@@ -101,24 +105,36 @@ public partial class App : System.Windows.Application
             await window.ViewModel.RestoreProfilesAsync().ConfigureAwait(true);
         }
 
+        if (liveSmoke)
+        {
+            _ = RunLiveSmokeAsync(window);
+        }
+
         if (smokeScenario is not null && demoScenario is not null)
         {
             try
             {
                 await UiSmokeHarness.RunAsync(smokeScenario, window, demoScenario).ConfigureAwait(true);
-                await window.CloseAfterSmokeAsync().ConfigureAwait(true);
+                if (!UiSmokeHarness.IsExternalCloseScenario(smokeScenario))
+                {
+                    await window.CloseAfterSmokeAsync().ConfigureAwait(true);
+                }
+
                 Environment.ExitCode = 0;
                 Shutdown(0);
             }
             catch (Exception exception)
             {
                 Console.Error.WriteLine($"FAIL_UI_SMOKE {smokeScenario}: {exception.Message}");
-                try
+                if (!UiSmokeHarness.IsExternalCloseScenario(smokeScenario))
                 {
-                    await window.CloseAfterSmokeAsync().ConfigureAwait(true);
-                }
-                catch
-                {
+                    try
+                    {
+                        await window.CloseAfterSmokeAsync().ConfigureAwait(true);
+                    }
+                    catch
+                    {
+                    }
                 }
 
                 Environment.ExitCode = 1;
@@ -167,5 +183,128 @@ public partial class App : System.Windows.Application
         }
 
         return null;
+    }
+
+    private static async Task RunLiveSmokeAsync(MainWindow window)
+    {
+        try
+        {
+            var viewModel = window.ViewModel;
+            var nickname = $"nex5{Environment.ProcessId % 100_000:00000}";
+            var network = viewModel.Sessions.Add(new NetworkConnectionOptions
+            {
+                DisplayName = "Libera Phase 1S",
+                Endpoint = new IrcEndpoint("irc.libera.chat", 6697, true),
+                Nickname = nickname,
+                Username = nickname,
+                RealName = "nexIRC 5 Phase 1S live WPF close",
+                RequestedCapabilities = ["message-tags", "server-time", "multi-prefix"],
+                Reconnect = new ReconnectPolicy(Enabled: false)
+            });
+            viewModel.SelectView(network.StatusView);
+
+            var states = new List<ServerSessionState>();
+            var whois318 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var quitObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            void OnStateChanged(object? sender, SessionStateChangedEvent change)
+            {
+                if (!states.Contains(change.Current))
+                {
+                    states.Add(change.Current);
+                }
+            }
+
+            void OnSemanticEvent(object? sender, SessionSemanticEvent item)
+            {
+                if (item.Event is IrcWhoisEvent { Numeric: 318 })
+                {
+                    whois318.TrySetResult();
+                }
+            }
+
+            network.Session.StateChanged += OnStateChanged;
+            network.Session.SemanticEventReceived += OnSemanticEvent;
+            var outboundCancellation = new CancellationTokenSource();
+            var outboundReader = ObserveQuitAsync(network.Session, quitObserved, outboundCancellation.Token);
+            await viewModel.Sessions.ConnectAsync(network.Id).ConfigureAwait(true);
+            await WaitForLiveConditionAsync(
+                () => network.State == NetworkDisplayState.Registered,
+                "Libera registration did not reach 001").ConfigureAwait(true);
+            Console.WriteLine("LIVE_WPF_TRACE dns=true tcp=true tls=true registration=001");
+
+            var whois = await viewModel.Sessions.RequestWhoisAsync(network.Id, nickname).ConfigureAwait(true);
+            await WaitForLiveConditionAsync(
+                () => whois.View is WhoisView { IsCompleted: true },
+                "Libera self-WHOIS did not complete at 318").ConfigureAwait(true);
+            await whois318.Task.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(true);
+            Console.WriteLine("LIVE_WPF_TRACE whois=318");
+
+            var preCloseSnapshot = network.Session.Snapshot;
+            Console.WriteLine($"LIVE_WPF_TRACE preclose_state={preCloseSnapshot.State} preclose_registration={preCloseSnapshot.Registration}");
+            var closeStart = Stopwatch.GetTimestamp();
+            void OnWindowClosed(object? sender, EventArgs args)
+            {
+                var quit = quitObserved.Task.Wait(TimeSpan.FromSeconds(2));
+                outboundCancellation.Cancel();
+                var outboundReaderStopped = outboundReader.Wait(TimeSpan.FromSeconds(2));
+                outboundCancellation.Dispose();
+                Console.WriteLine(
+                    $"LIVE_WPF_RESULT states={string.Join(',', states)} quit={quit} disconnected={network.Session.Snapshot.State == ServerSessionState.Disconnected} outbound_reader_stopped={outboundReaderStopped} natural_window_close=true close_request_to_window_closed_ms={(Stopwatch.GetTimestamp() - closeStart) * 1000d / Stopwatch.Frequency:F3}");
+                Environment.ExitCode = quit && network.Session.Snapshot.State == ServerSessionState.Disconnected && outboundReaderStopped ? 0 : 1;
+                window.Closed -= OnWindowClosed;
+                network.Session.StateChanged -= OnStateChanged;
+                network.Session.SemanticEventReceived -= OnSemanticEvent;
+            }
+
+            window.Closed += OnWindowClosed;
+            Console.WriteLine("LIVE_WPF_TRACE close_origin=MainWindow.Close");
+            window.Close();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"FAIL_LIVE_WPF {exception.Message}");
+            Environment.ExitCode = 1;
+            if (window.IsVisible)
+            {
+                window.Close();
+            }
+        }
+    }
+
+    private static async Task ObserveQuitAsync(
+        ServerSession session,
+        TaskCompletionSource quitObserved,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (var command in session.ReadOutboundEventsAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var rawLine = command.RawLine.TrimStart();
+                var separator = rawLine.IndexOfAny([' ', '\t']);
+                var commandName = separator < 0 ? rawLine : rawLine[..separator];
+                if (string.Equals(commandName, "QUIT", StringComparison.OrdinalIgnoreCase))
+                {
+                    quitObserved.TrySetResult();
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+    }
+
+    private static async Task WaitForLiveConditionAsync(Func<bool> condition, string failure)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (!condition())
+        {
+            if (DateTime.UtcNow >= deadline)
+            {
+                throw new TimeoutException(failure);
+            }
+
+            await Task.Delay(50).ConfigureAwait(true);
+        }
     }
 }
