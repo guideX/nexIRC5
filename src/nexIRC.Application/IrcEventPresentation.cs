@@ -62,7 +62,17 @@ public static class IrcEventPresentation
             _ => Entry(TranscriptEntryKind.System, null, semanticEvent.Message.Command)
         };
 
-        return entry;
+        return entry is null
+            ? null
+            : entry with
+            {
+                ServerMessageId = semanticEvent.Message.ServerMessageId,
+                Provenance = ConversationEntryProvenance.Live,
+                TimestampSource = semanticEvent.Message.ServerTimestamp.HasValue
+                    ? ConversationTimestampSource.ServerTime
+                    : ConversationTimestampSource.LegacyOrLocalReceiveTime,
+                BatchId = semanticEvent.Message.BatchId
+            };
     }
 
     public static TranscriptEntry CreateLocalMessage(string sender, string text, bool isAction = false) =>

@@ -26,6 +26,8 @@ public enum ConversationLogSearchScope
 
 public sealed record ConversationLogRecord
 {
+    /// <summary>Version of the durable JSONL record shape.</summary>
+    public int SchemaVersion { get; init; } = ConversationHistorySchema.CurrentVersion;
     public DateTimeOffset Timestamp { get; init; }
     /// <summary>
     /// Local delivery/processing time. Timestamp remains the displayed
@@ -46,6 +48,22 @@ public sealed record ConversationLogRecord
     public LogDirection Direction { get; init; }
     public string Text { get; init; } = string.Empty;
     public bool IsHighlight { get; init; }
+    /// <summary>
+    /// Server supplied identity only.  A missing value is not replaced by a
+    /// hash of message content because repeated no-id messages are valid.
+    /// </summary>
+    public string? ServerMessageId { get; init; }
+    /// <summary>
+    /// Locally allocated ordering value, scoped to NetworkId and conversation.
+    /// It is not a server identity and is never used to claim replay equality.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public long DurableSequence { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public ConversationEntryProvenance Provenance { get; init; } = ConversationEntryProvenance.Live;
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public ConversationTimestampSource TimestampSource { get; init; } = ConversationTimestampSource.LegacyOrLocalReceiveTime;
+    public string? BatchId { get; init; }
 }
 
 internal static class ConversationLogRecordValidation
@@ -54,7 +72,9 @@ internal static class ConversationLogRecordValidation
         record is not null
         && record.Text is not null
         && record.ConversationName is not null
-        && record.ConversationKey is not null;
+        && record.ConversationKey is not null
+        && (record.ServerMessageId is null || record.ServerMessageId.Length <= 256)
+        && (record.BatchId is null || record.BatchId.Length <= 256);
 }
 
 public sealed record ConversationLogQuery
@@ -252,6 +272,14 @@ public sealed class ConversationLoggingService
 
     public void Record(Guid networkId, Guid? profileId, WorkspaceView view, TranscriptEntry entry)
     {
+        if (entry.Provenance == ConversationEntryProvenance.LocalHistory)
+        {
+            // Local reads are projection-only and must never feed the same
+            // JSONL store back into itself. Server playback has its own
+            // explicit candidate path and may be persisted once.
+            return;
+        }
+
         var preferences = _preferences();
         if (!preferences.ConversationLoggingEnabled
             || view.Kind == WorkspaceViewKind.Query && !preferences.PrivateMessageLoggingEnabled
@@ -285,7 +313,11 @@ public sealed class ConversationLoggingService
             MessageKind = ToLogKind(entry.Kind),
             Direction = entry.IsOutgoing ? LogDirection.Outgoing : LogDirection.Incoming,
             Text = text,
-            IsHighlight = entry.IsHighlight
+            IsHighlight = entry.IsHighlight,
+            ServerMessageId = entry.ServerMessageId,
+            Provenance = entry.Provenance,
+            TimestampSource = entry.TimestampSource,
+            BatchId = entry.BatchId
         };
         _ = AppendSafeAsync(record);
     }
@@ -326,7 +358,7 @@ public sealed class ConversationLoggingService
         {
             await using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 8192, FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
-                foreach (var record in range.Records.OrderBy(record => record.Timestamp))
+                foreach (var record in ConversationHistoryOrdering.OrderAscending(range.Records))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     var safeRecord = record with { Text = IrcSensitiveData.RedactLine(record.Text) };
@@ -442,6 +474,8 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
     private readonly Dictionary<string, JsonlHistoryIndexSnapshot> _historyIndexes = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _searchIndexGate = new();
     private readonly Dictionary<string, JsonlSearchIndexSnapshot> _searchIndexes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, long> _nextDurableSequences = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, HashSet<string>> _serverIdentityIndexes = new(StringComparer.OrdinalIgnoreCase);
     private string? _lastDiagnostic;
     private ConversationLogCleanupStatistics _lastCleanupStatistics = ConversationLogCleanupStatistics.Empty;
     private int _disposed;
@@ -583,7 +617,8 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             return HistoryPage.Empty;
         }
 
-        var records = selected.OrderByDescending(record => record.Timestamp).ToArray();
+        selected = ConversationHistoryMerge.DeduplicateExact(selected).ToList();
+        var records = ConversationHistoryOrdering.OrderDescending(selected).ToArray();
         var pageOldest = records[^1].Timestamp;
         var pageNewest = records[0].Timestamp;
         hasOlder |= discardedOldest < pageOldest;
@@ -633,7 +668,8 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             }
         }
 
-        return new ConversationHistoryRange(records.OrderBy(record => record.Timestamp).ToArray(), truncated);
+        return new ConversationHistoryRange(ConversationHistoryOrdering.OrderAscending(
+            ConversationHistoryMerge.DeduplicateExact(records)).ToArray(), truncated);
     }
 
     private async Task<HistoryPage?> ReadPageByScanAsync(
@@ -678,7 +714,8 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             SetDiagnostic($"Conversation history read failed safely: {exception.Message}");
         }
 
-        var records = selected.OrderByDescending(record => record.Timestamp).ToArray();
+        var records = ConversationHistoryOrdering.OrderDescending(
+            ConversationHistoryMerge.DeduplicateExact(selected)).ToArray();
         if (records.Length == 0)
         {
             return null;
@@ -1204,6 +1241,9 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         {
             _searchIndexes.Clear();
         }
+
+        _nextDurableSequences.Clear();
+        _serverIdentityIndexes.Clear();
     }
 
     private async Task WriterAsync()
@@ -1225,7 +1265,23 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                         : pending.Record.ConversationKey;
                     var path = GetPath(pending.Record.ScopeId, conversationKey);
                     Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-                    var line = JsonSerializer.SerializeToUtf8Bytes(pending.Record, JsonOptions);
+                    var identity = ConversationEntryIdentity.GetServerIdentityKey(pending.Record);
+                    var identities = await GetServerIdentityIndexAsync(path).ConfigureAwait(false);
+                    if (identity is not null && identities.Contains(identity))
+                    {
+                        // Exact server-id replay is an accepted no-op. The
+                        // caller must not mistake this for queue loss.
+                        pending.Completion.TrySetResult(true);
+                        continue;
+                    }
+
+                    var record = pending.Record with
+                    {
+                        SchemaVersion = ConversationHistorySchema.CurrentVersion,
+                        DurableSequence = AllocateDurableSequence(pending.Record, path),
+                        ServerMessageId = ConversationEntryIdentity.NormalizeServerMessageId(pending.Record.ServerMessageId)
+                    };
+                    var line = JsonSerializer.SerializeToUtf8Bytes(record, JsonOptions);
                     var requiredBytes = (long)line.Length + 1;
                     if (requiredBytes > ConfigurationLimits.MaximumHistoryFileBytes)
                     {
@@ -1275,6 +1331,10 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                     {
                         _searchIndexes.Remove(path);
                     }
+                    if (identity is not null)
+                    {
+                        identities.Add(identity);
+                    }
                     pending.Completion.TrySetResult(true);
                 }
                 catch (Exception exception)
@@ -1288,6 +1348,110 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         {
             SetDiagnostic($"Conversation log writer stopped safely: {exception.Message}");
         }
+    }
+
+    private Task<HashSet<string>> GetServerIdentityIndexAsync(string activePath)
+    {
+        if (_serverIdentityIndexes.TryGetValue(activePath, out var existing))
+        {
+            return Task.FromResult(existing);
+        }
+
+        var identities = new HashSet<string>(StringComparer.Ordinal);
+        var directory = Path.GetDirectoryName(activePath);
+        var baseName = Path.GetFileNameWithoutExtension(activePath);
+        if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
+        {
+            try
+            {
+                foreach (var sourcePath in Directory.EnumerateFiles(directory, $"{baseName}*.jsonl", SearchOption.TopDirectoryOnly))
+                {
+                    foreach (var line in File.ReadLines(sourcePath, Encoding.UTF8))
+                    {
+                        if (line.Length == 0 || line.Length > _maximumRecordBytes)
+                        {
+                            continue;
+                        }
+
+                        try
+                        {
+                            var record = JsonSerializer.Deserialize<ConversationLogRecord>(line, JsonOptions);
+                            var identity = record is null ? null : ConversationEntryIdentity.GetServerIdentityKey(record);
+                            if (identity is not null)
+                            {
+                                identities.Add(identity);
+                            }
+                        }
+                        catch (JsonException)
+                        {
+                            // A malformed line is already bounded by the
+                            // reader contract and cannot poison the index.
+                        }
+                    }
+                }
+            }
+            catch (IOException exception)
+            {
+                SetDiagnostic($"Conversation identity index rebuild failed safely: {exception.Message}");
+            }
+            catch (UnauthorizedAccessException exception)
+            {
+                SetDiagnostic($"Conversation identity index rebuild failed safely: {exception.Message}");
+            }
+        }
+
+        _serverIdentityIndexes[activePath] = identities;
+        return Task.FromResult(identities);
+    }
+
+    private long AllocateDurableSequence(ConversationLogRecord record, string activePath)
+    {
+        if (!_nextDurableSequences.TryGetValue(activePath, out var next))
+        {
+            next = 0;
+            var directory = Path.GetDirectoryName(activePath);
+            var baseName = Path.GetFileNameWithoutExtension(activePath);
+            if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
+            {
+                try
+                {
+                    foreach (var sourcePath in Directory.EnumerateFiles(directory, $"{baseName}*.jsonl", SearchOption.TopDirectoryOnly))
+                    {
+                        foreach (var line in File.ReadLines(sourcePath, Encoding.UTF8))
+                        {
+                            if (line.Length == 0 || line.Length > _maximumRecordBytes)
+                            {
+                                continue;
+                            }
+
+                            try
+                            {
+                                var existing = JsonSerializer.Deserialize<ConversationLogRecord>(line, JsonOptions);
+                                if (existing is not null)
+                                {
+                                    next = Math.Max(next, existing.DurableSequence);
+                                }
+                            }
+                            catch (JsonException)
+                            {
+                            }
+                        }
+                    }
+                }
+                catch (IOException)
+                {
+                }
+                catch (UnauthorizedAccessException)
+                {
+                }
+            }
+        }
+
+        var sequence = record.DurableSequence > 0
+            ? record.DurableSequence
+            : checked(next + 1);
+        _nextDurableSequences[activePath] = Math.Max(next, sequence);
+        return sequence;
     }
 
     private async IAsyncEnumerable<ConversationLogRecord> ReadFileAsync(string path, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
@@ -1539,16 +1703,10 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
     }
 
     private static int CompareDescending(ConversationLogRecord left, ConversationLogRecord right)
-    {
-        var timestamp = right.Timestamp.CompareTo(left.Timestamp);
-        return timestamp != 0 ? timestamp : right.ConversationName.CompareTo(left.ConversationName, StringComparison.Ordinal);
-    }
+        => ConversationHistoryOrdering.Compare(right, left);
 
     private static int CompareAscending(ConversationLogRecord left, ConversationLogRecord right)
-    {
-        var timestamp = left.Timestamp.CompareTo(right.Timestamp);
-        return timestamp != 0 ? timestamp : left.ConversationName.CompareTo(right.ConversationName, StringComparison.Ordinal);
-    }
+        => ConversationHistoryOrdering.Compare(left, right);
 
     private static int CompareAround(ConversationLogRecord left, ConversationLogRecord right, DateTimeOffset around)
     {
@@ -1630,7 +1788,8 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             return null;
         }
 
-        var records = loaded.OrderByDescending(record => record.Timestamp).ToArray();
+        var records = ConversationHistoryOrdering.OrderDescending(
+            ConversationHistoryMerge.DeduplicateExact(loaded)).ToArray();
         var oldest = index.Entries.Min(entry => entry.TimestampTicks);
         var newest = index.Entries.Max(entry => entry.TimestampTicks);
         return new HistoryPage(
@@ -1802,7 +1961,8 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
 
 internal sealed class SearchResultCollector
 {
-    private readonly PriorityQueue<Candidate, (long TimestampTicks, long Sequence)> _candidates = new();
+    private readonly PriorityQueue<Candidate, (long TimestampTicks, long DurableSequence, long Sequence)> _candidates = new();
+    private readonly HashSet<string> _serverIdentities = new(StringComparer.Ordinal);
     private readonly int _maximumCandidates;
     private long _sequence;
 
@@ -1815,16 +1975,22 @@ internal sealed class SearchResultCollector
 
     public IReadOnlyList<ConversationLogSearchResult> Results => _candidates.UnorderedItems
         .Select(item => item.Element)
-        .OrderByDescending(item => item.Result.Timestamp)
+        .OrderByDescending(item => item.Result.Record, Comparer<ConversationLogRecord>.Create(ConversationHistoryOrdering.Compare))
         .ThenByDescending(item => item.Sequence)
         .Select(item => item.Result)
         .ToArray();
 
     public void Add(ConversationLogSearchResult result)
     {
+        var identity = ConversationEntryIdentity.GetServerIdentityKey(result.Record);
+        if (identity is not null && !_serverIdentities.Add(identity))
+        {
+            return;
+        }
+
         MatchingRecords++;
         var candidate = new Candidate(result, _sequence++);
-        _candidates.Enqueue(candidate, (result.Timestamp.UtcTicks, candidate.Sequence));
+        _candidates.Enqueue(candidate, (result.Timestamp.UtcTicks, result.Record.DurableSequence, candidate.Sequence));
         if (_candidates.Count > _maximumCandidates)
         {
             _candidates.Dequeue();
@@ -1852,9 +2018,9 @@ internal static class HistoryPageSelector
 
     public static HistoryPage Select(IEnumerable<ConversationLogRecord> source, HistoryPageRequest request)
     {
-        var matching = source
+        var matching = ConversationHistoryMerge.DeduplicateExact(source
             .Where(record => record.ConversationKind == request.ConversationKind
-                && MatchesHistoryRecord(record, request))
+                && MatchesHistoryRecord(record, request)))
             .ToArray();
         if (matching.Length == 0)
         {
@@ -1868,11 +2034,13 @@ internal static class HistoryPageSelector
                     && (request.After is null || record.Timestamp > request.After.Value))
             .ToArray();
         var selected = request.Around is not null
-            ? eligible.OrderBy(record => Math.Abs((record.Timestamp - request.Around.Value).Ticks)).ThenByDescending(record => record.Timestamp).Take(pageSize).ToArray()
+            ? eligible.OrderBy(record => Math.Abs((record.Timestamp - request.Around.Value).Ticks))
+                .ThenBy(record => record, Comparer<ConversationLogRecord>.Create(ConversationHistoryOrdering.Compare))
+                .Take(pageSize).ToArray()
             : request.After is not null || request.Oldest
-                ? eligible.OrderBy(record => record.Timestamp).Take(pageSize).ToArray()
-                : eligible.OrderByDescending(record => record.Timestamp).Take(pageSize).ToArray();
-        var records = selected.OrderByDescending(record => record.Timestamp).ToArray();
+                ? ConversationHistoryOrdering.OrderAscending(eligible).Take(pageSize).ToArray()
+                : ConversationHistoryOrdering.OrderDescending(eligible).Take(pageSize).ToArray();
+        var records = ConversationHistoryOrdering.OrderDescending(selected).ToArray();
         if (records.Length == 0)
         {
             return HistoryPage.Empty;
@@ -1888,12 +2056,41 @@ public sealed class InMemoryConversationLogStore : IConversationLogStore
 {
     private readonly object _gate = new();
     private readonly List<ConversationLogRecord> _records = [];
+    private readonly Dictionary<string, long> _nextDurableSequences = new(StringComparer.Ordinal);
     public IReadOnlyList<ConversationLogRecord> Records { get { lock (_gate) return _records.ToArray(); } }
 
     public ValueTask<bool> AppendAsync(ConversationLogRecord record, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        lock (_gate) _records.Add(record);
+        ArgumentNullException.ThrowIfNull(record);
+        lock (_gate)
+        {
+            var identity = ConversationEntryIdentity.GetServerIdentityKey(record);
+            if (identity is not null && _records.Any(existing => string.Equals(
+                    ConversationEntryIdentity.GetServerIdentityKey(existing), identity, StringComparison.Ordinal)))
+            {
+                return ValueTask.FromResult(true);
+            }
+
+            var sequenceKey = $"{record.NetworkId:N}\0{ConversationLoggingService.EffectiveConversationKey(record)}";
+            var next = _nextDurableSequences.TryGetValue(sequenceKey, out var known)
+                ? known
+                : _records.Where(existing => string.Equals(
+                        $"{existing.NetworkId:N}\0{ConversationLoggingService.EffectiveConversationKey(existing)}",
+                        sequenceKey,
+                        StringComparison.Ordinal))
+                    .Select(existing => existing.DurableSequence)
+                    .DefaultIfEmpty()
+                    .Max();
+            var sequence = record.DurableSequence > 0 ? record.DurableSequence : checked(next + 1);
+            _nextDurableSequences[sequenceKey] = Math.Max(next, sequence);
+            _records.Add(record with
+            {
+                SchemaVersion = ConversationHistorySchema.CurrentVersion,
+                DurableSequence = sequence,
+                ServerMessageId = ConversationEntryIdentity.NormalizeServerMessageId(record.ServerMessageId)
+            });
+        }
         return ValueTask.FromResult(true);
     }
 
@@ -1939,12 +2136,12 @@ public sealed class InMemoryConversationLogStore : IConversationLogStore
         var maximum = Math.Clamp(request.MaximumRecords, 1, ConfigurationLimits.MaximumHistoryExportRecords);
         lock (_gate)
         {
-            var matching = _records.Where(record => record.ScopeId == request.ScopeId
+            var matching = ConversationHistoryMerge.DeduplicateExact(_records.Where(record => record.ScopeId == request.ScopeId
                     && record.ConversationKind == request.ConversationKind
                     && HistoryPageSelector.MatchesHistoryRecord(record, request)
                     && (request.From is null || record.Timestamp >= request.From.Value)
-                    && (request.To is null || record.Timestamp <= request.To.Value))
-                .OrderBy(record => record.Timestamp)
+                    && (request.To is null || record.Timestamp <= request.To.Value)))
+                .OrderBy(record => record, Comparer<ConversationLogRecord>.Create(ConversationHistoryOrdering.Compare))
                 .ToArray();
             return ValueTask.FromResult(new ConversationHistoryRange(matching.Take(maximum).ToArray(), matching.Length > maximum));
         }
@@ -2005,7 +2202,12 @@ public sealed class InMemoryConversationLogStore : IConversationLogStore
 
     public ValueTask<int> CleanupAsync(DateTimeOffset olderThan, CancellationToken cancellationToken = default)
     {
-        lock (_gate) { var count = _records.RemoveAll(record => record.Timestamp < olderThan); return ValueTask.FromResult(count); }
+        lock (_gate)
+        {
+            var count = _records.RemoveAll(record => record.Timestamp < olderThan);
+            _nextDurableSequences.Clear();
+            return ValueTask.FromResult(count);
+        }
     }
 
     public Task FlushAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;

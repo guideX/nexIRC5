@@ -109,6 +109,16 @@ public sealed record TranscriptEntry(
     long Sequence = 0,
     DateTimeOffset? ReceivedAt = null)
 {
+    /// <summary>Durable server identity when IRC supplied one.</summary>
+    public string? ServerMessageId { get; init; }
+
+    /// <summary>Origin used by the shared history/transcript boundary.</summary>
+    public ConversationEntryProvenance Provenance { get; init; } = ConversationEntryProvenance.Live;
+
+    public ConversationTimestampSource TimestampSource { get; init; } = ConversationTimestampSource.LegacyOrLocalReceiveTime;
+
+    public string? BatchId { get; init; }
+
     public string DisplayTime => Timestamp.ToLocalTime().ToString("HH:mm:ss", System.Globalization.CultureInfo.CurrentCulture);
 
     public bool IsOutgoing => Kind is TranscriptEntryKind.OutgoingMessage
@@ -410,6 +420,116 @@ public abstract class WorkspaceView : ObservableObject
                 ? WorkspaceActivity.Important
                 : WorkspaceActivity.Unread));
         }
+    }
+
+    /// <summary>
+    /// Inserts a candidate using the canonical conversation order. Historical
+    /// candidates are projection-only: they cannot mark activity or change
+    /// the live last-activity cursor.
+    /// </summary>
+    internal bool AppendConversationCandidate(
+        ConversationEntryCandidate candidate,
+        TranscriptEntry entry,
+        bool updateLastActivity = true)
+    {
+        ArgumentNullException.ThrowIfNull(candidate);
+        ArgumentNullException.ThrowIfNull(entry);
+        if (candidate.IsHistorical)
+        {
+            entry = entry with { Provenance = candidate.Provenance };
+        }
+
+        return AppendConversationEntry(entry, candidate.IsHistorical, updateLastActivity);
+    }
+
+    internal bool AppendConversationEntry(
+        TranscriptEntry entry,
+        bool historical = false,
+        bool updateLastActivity = true)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+
+        if (updateLastActivity && !historical)
+        {
+            LastActivity = entry.Timestamp;
+            LastActivitySequence = entry.Sequence;
+        }
+
+        lock (_entriesGate)
+        {
+            if (entry.ServerMessageId is { Length: > 0 } messageId
+                && Entries.Any(existing => string.Equals(existing.ServerMessageId, messageId, StringComparison.Ordinal)))
+            {
+                return false;
+            }
+
+            if (Entries.Count == 0
+                || CompareTranscriptEntries(Entries[^1], entry) <= 0)
+            {
+                Entries.Add(entry);
+                while (Entries.Count > MaximumEntries)
+                {
+                    Entries.RemoveAt(0);
+                }
+
+                return true;
+            }
+
+            var entries = Entries.ToList();
+            entries.Add(entry);
+            entries.Sort(static (left, right) => CompareTranscriptEntries(left, right));
+            if (entries.Count > MaximumEntries)
+            {
+                entries.RemoveRange(0, entries.Count - MaximumEntries);
+            }
+
+            using (WorkspaceProjectionBatch.Begin())
+            {
+                Entries.Clear();
+                foreach (var ordered in entries)
+                {
+                    Entries.Add(ordered);
+                }
+            }
+        }
+
+        return true;
+    }
+
+    internal bool AppendHistoryRecord(ConversationLogRecord record, ConversationEntryProvenance provenance)
+    {
+        var candidate = new ConversationEntryCandidate
+        {
+            Record = record,
+            Provenance = provenance,
+            Persist = provenance == ConversationEntryProvenance.ServerPlayback
+        };
+        return AppendConversationCandidate(candidate, ConversationHistoryProjection.ToTranscriptEntry(record, provenance), updateLastActivity: false);
+    }
+
+    private static int CompareTranscriptEntries(TranscriptEntry left, TranscriptEntry right)
+    {
+        // For two local-delivery entries, the manager's protocol sequence is
+        // the safer clock-regression tie breaker.  A valid server timestamp
+        // remains authoritative whenever either side carries one.
+        if (left.TimestampSource != ConversationTimestampSource.ServerTime
+            && right.TimestampSource != ConversationTimestampSource.ServerTime)
+        {
+            var localSequence = left.Sequence.CompareTo(right.Sequence);
+            if (localSequence != 0)
+            {
+                return localSequence;
+            }
+        }
+
+        var timestamp = left.Timestamp.CompareTo(right.Timestamp);
+        if (timestamp != 0) return timestamp;
+        var sequence = left.Sequence.CompareTo(right.Sequence);
+        if (sequence != 0) return sequence;
+        var id = string.Compare(left.ServerMessageId, right.ServerMessageId, StringComparison.Ordinal);
+        if (id != 0) return id;
+        var sender = string.Compare(left.Sender, right.Sender, StringComparison.Ordinal);
+        return sender != 0 ? sender : string.Compare(left.Text, right.Text, StringComparison.Ordinal);
     }
 
     public void MarkActivity(WorkspaceActivity activity)

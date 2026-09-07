@@ -1067,9 +1067,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     internal void AppendLocal(WorkspaceView view, TranscriptEntry entry)
     {
         entry = entry with { Sequence = NextActivitySequence() };
-        view.Append(entry, markActivity: false);
         if (TryGet(view.NetworkId, out var workspace) && workspace is not null)
         {
+            entry = entry with { Provenance = ConversationEntryProvenance.Live };
+            view.AppendConversationEntry(entry, updateLastActivity: false);
             _logging?.Record(workspace.Id, workspace.ProfileId, view, entry);
         }
 
@@ -2435,8 +2436,19 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             entry = entry with { Metadata = "highlight" };
         }
 
-        entry = entry with { Sequence = NextActivitySequence() };
-        view.Append(entry, markActivity: false, updateLastActivity: updateLastActivity && !isResynchronization);
+        entry = entry with { Sequence = NextActivitySequence(), Provenance = ConversationEntryProvenance.Live };
+        var inserted = entry.ServerMessageId is null
+            && entry.TimestampSource == ConversationTimestampSource.LegacyOrLocalReceiveTime
+            && entry.BatchId is null
+            ? view.AppendConversationEntry(entry, updateLastActivity && !isResynchronization)
+            : view.AppendConversationCandidate(
+                ConversationEntryCandidate.FromLive(CreateConversationRecord(workspace, view, entry)),
+                entry,
+                updateLastActivity && !isResynchronization);
+        if (!inserted)
+        {
+            return;
+        }
         if (entry.IsHighlight && !isResynchronization)
         {
             view.MarkHighlight();
@@ -2499,6 +2511,62 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             Notifications.Publish(notification);
         }
     }
+
+    private static LogMessageKind ToLogMessageKind(TranscriptEntryKind kind) => kind switch
+    {
+        TranscriptEntryKind.Action or TranscriptEntryKind.OutgoingAction => LogMessageKind.Action,
+        TranscriptEntryKind.Notice or TranscriptEntryKind.OutgoingNotice => LogMessageKind.Notice,
+        TranscriptEntryKind.Ctcp or TranscriptEntryKind.OutgoingCtcp => LogMessageKind.Ctcp,
+        TranscriptEntryKind.Join => LogMessageKind.Join,
+        TranscriptEntryKind.Part => LogMessageKind.Part,
+        TranscriptEntryKind.Quit => LogMessageKind.Quit,
+        TranscriptEntryKind.Kick => LogMessageKind.Kick,
+        TranscriptEntryKind.Nick => LogMessageKind.Nick,
+        TranscriptEntryKind.Topic => LogMessageKind.Topic,
+        TranscriptEntryKind.Mode => LogMessageKind.Mode,
+        TranscriptEntryKind.Error => LogMessageKind.Error,
+        TranscriptEntryKind.System or TranscriptEntryKind.Connection or TranscriptEntryKind.Registration => LogMessageKind.System,
+        _ => LogMessageKind.Message
+    };
+
+    private static ConversationLogRecord CreateConversationRecord(NetworkWorkspace workspace, WorkspaceView view, TranscriptEntry entry) =>
+        new()
+        {
+            Timestamp = entry.Timestamp,
+            NetworkId = view.NetworkId,
+            ScopeId = workspace.ProfileId ?? workspace.Id,
+            ProfileId = workspace.ProfileId,
+            ConversationKind = view.Kind switch
+            {
+                WorkspaceViewKind.Channel => LogConversationKind.Channel,
+                WorkspaceViewKind.Query => LogConversationKind.PrivateConversation,
+                _ => LogConversationKind.Status
+            },
+            ConversationName = view is ChannelView channelView
+                ? channelView.Channel
+                : view is QueryView queryView
+                    ? queryView.Nickname
+                    : "status",
+            ConversationKey = view is QueryView queryIdentity
+                ? queryIdentity.HistoryConversationKey
+                : ConversationLoggingService.BuildConversationKey(
+                    view.Kind switch
+                    {
+                        WorkspaceViewKind.Channel => LogConversationKind.Channel,
+                        WorkspaceViewKind.Query => LogConversationKind.PrivateConversation,
+                        _ => LogConversationKind.Status
+                    },
+                    view is ChannelView channel ? channel.Channel : view is QueryView query ? query.Nickname : "status"),
+            Sender = entry.Sender,
+            MessageKind = ToLogMessageKind(entry.Kind),
+            Direction = entry.IsOutgoing ? LogDirection.Outgoing : LogDirection.Incoming,
+            Text = entry.Text,
+            IsHighlight = entry.IsHighlight,
+            ServerMessageId = entry.ServerMessageId,
+            Provenance = entry.Provenance,
+            TimestampSource = entry.TimestampSource,
+            BatchId = entry.BatchId
+        };
 
     private void SaveConfigurationInBackground()
     {

@@ -111,6 +111,12 @@ public sealed class IrcMessage
             && IrcServerTime.TryParse(time, out var parsedTimestamp)
                 ? parsedTimestamp
                 : null;
+        ServerMessageId = IrcMessageIdentity.FindServerMessageId(TagValues);
+        BatchId = TagValues.TryGetValue("batch", out var batch)
+            && !string.IsNullOrWhiteSpace(batch)
+            && batch.Length <= 65
+                ? batch
+                : null;
     }
 
     public string RawLine { get; }
@@ -141,9 +147,39 @@ public sealed class IrcMessage
     /// </summary>
     public DateTimeOffset? ServerTimestamp { get; }
 
+    /// <summary>
+    /// The stable server supplied message identifier, when the server sent
+    /// either the standardized <c>msgid</c> tag or the older
+    /// <c>draft/msgid</c> spelling.  An absent value is meaningful: nexIRC
+    /// must not manufacture an authoritative identity from message content.
+    /// </summary>
+    public string? ServerMessageId { get; }
+
+    /// <summary>The IRCv3 batch association tag, when present.</summary>
+    public string? BatchId { get; }
+
     public bool IsNumeric => NumericCommand.HasValue;
 
     private static bool IsNumericCommand(string command) => command.Length == 3 && command.All(static c => c is >= '0' and <= '9');
+}
+
+public static class IrcMessageIdentity
+{
+    public static string? FindServerMessageId(IReadOnlyDictionary<string, string?> tags)
+    {
+        ArgumentNullException.ThrowIfNull(tags);
+        foreach (var key in new[] { "msgid", "draft/msgid" })
+        {
+            if (tags.TryGetValue(key, out var value)
+                && !string.IsNullOrWhiteSpace(value)
+                && value.Length <= 256)
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
 }
 
 public static class IrcServerTime
