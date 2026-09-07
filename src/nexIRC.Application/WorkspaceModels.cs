@@ -172,7 +172,7 @@ public sealed record NetworkConnectionOptions
 
     public IReadOnlyList<string> NicknameFallbacks { get; init; } = Array.Empty<string>();
 
-    public IReadOnlyList<string> RequestedCapabilities { get; init; } = IrcCapabilityCatalog.PreferredPhase1X;
+    public IReadOnlyList<string> RequestedCapabilities { get; init; } = IrcCapabilityCatalog.PreferredPhase1Y;
 
     public int MaximumChathistoryRequestSize { get; init; } = ChathistorySupport.DefaultClientMaximumRequestSize;
 
@@ -251,6 +251,8 @@ public abstract class WorkspaceView : ObservableObject
     private int _unreadCount;
     private int _importantCount;
     private int _highlightCount;
+    private bool _recoveredUnread;
+    private int _recoveredHistoryCount;
     private bool _isActive;
     private bool _isViewOpen = true;
     private ConversationLifecycleState _lifecycleState = ConversationLifecycleState.HistoricalOnly;
@@ -288,6 +290,7 @@ public abstract class WorkspaceView : ObservableObject
     {
         WorkspaceActivity.Important => $"! {Title}",
         WorkspaceActivity.Unread => $"• {Title}",
+        _ when RecoveredUnread => $"◌ {Title}",
         _ => Title
     };
 
@@ -323,6 +326,10 @@ public abstract class WorkspaceView : ObservableObject
     public bool HasUnread => _unreadCount > 0;
 
     public bool IsImportant => _importantCount > 0;
+
+    public bool RecoveredUnread => _recoveredUnread;
+
+    public int RecoveredHistoryCount => _recoveredHistoryCount;
 
     public DateTimeOffset LastActivity
     {
@@ -586,10 +593,28 @@ public abstract class WorkspaceView : ObservableObject
         _unreadCount = 0;
         _importantCount = 0;
         _highlightCount = 0;
+        _recoveredUnread = false;
+        _recoveredHistoryCount = 0;
         OnPropertyChanged(nameof(UnreadCount));
         OnPropertyChanged(nameof(ImportantCount));
         OnPropertyChanged(nameof(HighlightCount));
+        OnPropertyChanged(nameof(RecoveredUnread));
+        OnPropertyChanged(nameof(RecoveredHistoryCount));
         RefreshActivity();
+    }
+
+    internal void MarkRecoveredHistory(int count)
+    {
+        if (count <= 0)
+        {
+            return;
+        }
+
+        _recoveredUnread = true;
+        _recoveredHistoryCount = Math.Min(ConfigurationLimits.MaximumUnreadCount, _recoveredHistoryCount + count);
+        OnPropertyChanged(nameof(RecoveredUnread));
+        OnPropertyChanged(nameof(RecoveredHistoryCount));
+        OnPropertyChanged(nameof(DisplayLabel));
     }
 
     public void ClearEntries()
@@ -1183,6 +1208,13 @@ public sealed class QueryView : WorkspaceView
 
     public bool IsIdentityBoundToCurrentSession { get; private set; }
 
+    /// <summary>
+    /// Set only for a query that was open and had a real conversation before a
+    /// reconnect.  A matching live target in the new generation may reuse it;
+    /// a historical nickname by itself never clears an identity boundary.
+    /// </summary>
+    public bool CanReuseAfterReconnect { get; private set; }
+
     internal bool CanApplyNicknameChange(string previousNickname, string newNickname, IrcCaseMapping mapping) =>
         IrcCaseMappingComparer.Equals(Nickname, previousNickname, mapping)
         && !IrcCaseMappingComparer.Equals(Nickname, newNickname, mapping);
@@ -1203,6 +1235,7 @@ public sealed class QueryView : WorkspaceView
         SetTitle(newNickname);
         IdentityConnectionGeneration = connectionGeneration;
         IsIdentityBoundToCurrentSession = true;
+        CanReuseAfterReconnect = false;
         OnPropertyChanged(nameof(Nickname));
         OnPropertyChanged(nameof(HistoryConversationKey));
         return true;
@@ -1214,10 +1247,13 @@ public sealed class QueryView : WorkspaceView
         IsIdentityBoundToCurrentSession = false;
     }
 
+    internal void MarkReconnectCandidate() => CanReuseAfterReconnect = true;
+
     internal void MarkCurrentSessionIdentity(int connectionGeneration)
     {
         IdentityConnectionGeneration = connectionGeneration;
         IsIdentityBoundToCurrentSession = true;
+        CanReuseAfterReconnect = false;
     }
 
     internal void ApplyConnectionState(bool connected)
@@ -1426,8 +1462,21 @@ public sealed class NetworkWorkspace : ObservableObject
     internal QueryView EnsureIncomingQuery(string nickname)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
+        var existing = Queries.FirstOrDefault(item =>
+            IrcCaseMappingComparer.Equals(item.Nickname, nickname, _snapshot.Features.CaseMapping)
+            && (item.IsIdentityBoundToCurrentSession || item.CanReuseAfterReconnect));
+        if (existing is not null)
+        {
+            existing.MarkCurrentSessionIdentity(_snapshot.ConnectionGeneration);
+            ReopenView(existing);
+            return existing;
+        }
+
         return EnsureQuery(nickname, reopen: true, includeUnboundIdentity: false);
     }
+
+    internal QueryView? FindQueryByHistoryKey(string historyKey) =>
+        Queries.FirstOrDefault(query => string.Equals(query.HistoryConversationKey, historyKey, StringComparison.Ordinal));
 
     internal QueryView? FindQuery(string nickname) =>
         Queries.FirstOrDefault(item => IrcCaseMappingComparer.Equals(item.Nickname, nickname, _snapshot.Features.CaseMapping));

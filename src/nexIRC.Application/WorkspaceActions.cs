@@ -18,7 +18,8 @@ public enum WorkspaceActionId
     EditTopic,
     RequestModes,
     RefreshNames,
-    LoadOlderMessages
+    LoadOlderMessages,
+    LoadContextAround
 }
 
 public enum WorkspaceActionTargetKind
@@ -102,6 +103,9 @@ public sealed class WorkspaceActionRouter
         var authority = consistent ? ChannelAuthority.Evaluate(network, channel) : null;
         var target = new WorkspaceActionTarget(network.Id, channel.Id, channel.Channel);
         var canLoadOlder = joined && _sessions.CanLoadOlderHistory(network, channel);
+        var channelEntries = channel.EntriesSnapshot;
+        var contextAnchor = channelEntries.Count == 0 ? null : channelEntries[^1];
+        var canLoadContext = joined && contextAnchor is not null && _sessions.CanLoadContextAround(network, channel, contextAnchor);
         return
         [
             new(WorkspaceActionId.OpenChannel, "Open channel", WorkspaceActionTargetKind.Channel, target, consistent),
@@ -120,7 +124,9 @@ public sealed class WorkspaceActionRouter
             new(WorkspaceActionId.RefreshNames, "Refresh member list", WorkspaceActionTargetKind.Channel, target, joined,
                 joined ? null : "Join the channel first."),
             new(WorkspaceActionId.LoadOlderMessages, "Load older messages", WorkspaceActionTargetKind.Channel, target, canLoadOlder,
-                canLoadOlder ? null : !joined ? "Join the channel first." : "Server history is unavailable or already exhausted.")
+                canLoadOlder ? null : !joined ? "Join the channel first." : "Server history is unavailable or already exhausted."),
+            new(WorkspaceActionId.LoadContextAround, "Load context around latest message", WorkspaceActionTargetKind.Channel, target, canLoadContext,
+                canLoadContext ? null : "A supported server-time or msgid anchor is required.")
         ];
     }
 
@@ -132,10 +138,15 @@ public sealed class WorkspaceActionRouter
         var registered = consistent && IsRegistered(network);
         var target = new WorkspaceActionTarget(network.Id, query.Id, query.Nickname, query.Nickname);
         var canLoadOlder = registered && _sessions.CanLoadOlderHistory(network, query);
+        var queryEntries = query.EntriesSnapshot;
+        var contextAnchor = queryEntries.Count == 0 ? null : queryEntries[^1];
+        var canLoadContext = registered && contextAnchor is not null && _sessions.CanLoadContextAround(network, query, contextAnchor);
         return
         [
             new(WorkspaceActionId.LoadOlderMessages, "Load older messages", WorkspaceActionTargetKind.Query, target, canLoadOlder,
-                canLoadOlder ? null : !registered ? "The network is not registered." : "Server history is unavailable or already exhausted.")
+                canLoadOlder ? null : !registered ? "The network is not registered." : "Server history is unavailable or already exhausted."),
+            new(WorkspaceActionId.LoadContextAround, "Load context around latest message", WorkspaceActionTargetKind.Query, target, canLoadContext,
+                canLoadContext ? null : "A supported server-time or msgid anchor is required.")
         ];
     }
 
@@ -219,6 +230,8 @@ public sealed class WorkspaceActionRouter
                 return CommandDispatchResult.Success($"Refreshing members for {channel.Channel}.", channel);
             case WorkspaceActionId.LoadOlderMessages:
                 return await _sessions.LoadOlderMessagesAsync(network, channel, cancellationToken).ConfigureAwait(false);
+            case WorkspaceActionId.LoadContextAround:
+                return await _sessions.LoadContextAroundAsync(network, channel, channel.EntriesSnapshot[^1], cancellationToken).ConfigureAwait(false);
             default:
                 return CommandDispatchResult.Failure("The channel action is not supported.", channel);
         }
@@ -241,9 +254,12 @@ public sealed class WorkspaceActionRouter
             return CommandDispatchResult.Failure(descriptor.DisabledReason ?? "The query action is unavailable.", query);
         }
 
-        return action == WorkspaceActionId.LoadOlderMessages
-            ? await _sessions.LoadOlderMessagesAsync(network, query, cancellationToken).ConfigureAwait(false)
-            : CommandDispatchResult.Failure("The query action is not supported.", query);
+        return action switch
+        {
+            WorkspaceActionId.LoadOlderMessages => await _sessions.LoadOlderMessagesAsync(network, query, cancellationToken).ConfigureAwait(false),
+            WorkspaceActionId.LoadContextAround => await _sessions.LoadContextAroundAsync(network, query, query.EntriesSnapshot[^1], cancellationToken).ConfigureAwait(false),
+            _ => CommandDispatchResult.Failure("The query action is not supported.", query)
+        };
     }
 
     public async ValueTask<CommandDispatchResult> PartChannelAsync(

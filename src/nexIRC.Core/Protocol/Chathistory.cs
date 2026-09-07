@@ -10,14 +10,17 @@ public enum ChathistoryOperation
     Before,
     After,
     Around,
-    Between
+    Between,
+    Targets
 }
 
 public enum ChathistoryRequestPurpose
 {
     InitialContext,
     ReconnectGap,
-    LoadOlder
+    LoadOlder,
+    ReconnectDiscovery,
+    LoadContext
 }
 
 public enum ChathistoryReferenceType
@@ -46,7 +49,11 @@ public sealed record ChathistoryReference
 
     public bool IsWildcard { get; }
 
-    public static ChathistoryReference MessageId(string value) => Create(ChathistoryReferenceType.MessageId, value);
+    public static ChathistoryReference MessageId(string value)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(value);
+        return Create(ChathistoryReferenceType.MessageId, value.StartsWith("msgid=", StringComparison.OrdinalIgnoreCase) ? value["msgid=".Length..] : value);
+    }
 
     public static ChathistoryReference Timestamp(DateTimeOffset value) =>
         Create(ChathistoryReferenceType.Timestamp, value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ", CultureInfo.InvariantCulture));
@@ -54,6 +61,11 @@ public sealed record ChathistoryReference
     public static ChathistoryReference Timestamp(string value)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(value);
+        if (value.StartsWith("timestamp=", StringComparison.OrdinalIgnoreCase))
+        {
+            value = value["timestamp=".Length..];
+        }
+
         if (!DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var timestamp))
         {
             throw new ArgumentException("The timestamp reference must be an RFC3339 timestamp.", nameof(value));
@@ -65,6 +77,18 @@ public sealed record ChathistoryReference
     public static ChathistoryReference Wildcard { get; } = new(ChathistoryReferenceType.Timestamp, "*", true);
 
     public string Serialize() => IsWildcard ? "*" : Value;
+
+    /// <summary>
+    /// Serializes the selector syntax required by the current draft.  The
+    /// unprefixed value remains available for diagnostics and compatibility
+    /// with older persisted request descriptions; it is never used on the
+    /// current CHATHISTORY wire path.
+    /// </summary>
+    public string SerializeWire() => IsWildcard
+        ? "*"
+        : Type == ChathistoryReferenceType.MessageId
+            ? $"msgid={Value}"
+            : $"timestamp={Value}";
 
     private static ChathistoryReference Create(ChathistoryReferenceType type, string value)
     {
@@ -89,18 +113,68 @@ public sealed record ChathistoryRequest
 
     public required int ConnectionGeneration { get; init; }
 
-    public required string Conversation { get; init; }
+    /// <summary>
+    /// Logical conversation identity for content requests.  TARGETS has no
+    /// conversation target and therefore leaves this null.
+    /// </summary>
+    public string? Conversation { get; init; }
 
-    public required string Target { get; init; }
+    /// <summary>
+    /// IRC target for content requests.  TARGETS deliberately leaves this
+    /// null instead of using a fake channel name.
+    /// </summary>
+    public string? Target { get; init; }
 
     public required ChathistoryOperation Operation { get; init; }
 
+    /// <summary>
+    /// Primary selector.  For TARGETS this is the lower timestamp bound.
+    /// </summary>
     public required ChathistoryReference Reference { get; init; }
+
+    /// <summary>Second selector used only by BETWEEN and TARGETS.</summary>
+    public ChathistoryReference? SecondaryReference { get; init; }
+
+    /// <summary>Readable alias for callers that model an interval as an end reference.</summary>
+    public ChathistoryReference? EndReference { get; init; }
 
     public int Limit { get; init; }
 
     public ChathistoryRequestPurpose Purpose { get; init; } = ChathistoryRequestPurpose.LoadOlder;
+
+    public bool IsDiscovery => Operation == ChathistoryOperation.Targets;
+
+    public static ChathistoryRequest ForTargets(
+        Guid networkId,
+        int connectionGeneration,
+        ChathistoryReference from,
+        ChathistoryReference to,
+        int limit,
+        ChathistoryRequestPurpose purpose = ChathistoryRequestPurpose.ReconnectDiscovery) => new()
+        {
+            NetworkId = networkId,
+            ConnectionGeneration = connectionGeneration,
+            Operation = ChathistoryOperation.Targets,
+            Reference = from,
+            SecondaryReference = to,
+            Limit = limit,
+            Purpose = purpose
+        };
 }
+
+public enum ChathistoryTargetKind
+{
+    Unknown,
+    Channel,
+    Query
+}
+
+public sealed record ChathistoryTarget(
+    Guid NetworkId,
+    int ConnectionGeneration,
+    string Target,
+    DateTimeOffset LatestTimestamp,
+    ChathistoryTargetKind Kind);
 
 /// <summary>
 /// Capability and ISUPPORT-derived history support. The server limit of zero
@@ -120,6 +194,8 @@ public sealed record ChathistorySupport
     public bool ServerTimeEnabled { get; init; }
 
     public bool MessageTagsEnabled { get; init; }
+
+    public bool EventPlaybackEnabled { get; init; }
 
     public int? ServerMaximumRequestSize { get; init; }
 
@@ -143,13 +219,14 @@ public sealed record ChathistorySupport
         ArgumentNullException.ThrowIfNull(isupport);
         var references = isupport.MessageReferenceTypes.Count > 0
             ? isupport.MessageReferenceTypes
-            : [ChathistoryReferenceType.Timestamp];
+            : [ChathistoryReferenceType.Timestamp, ChathistoryReferenceType.MessageId];
         return new ChathistorySupport
         {
             CapabilityEnabled = capabilities.IsEnabled(CapabilityName),
             BatchEnabled = capabilities.IsEnabled(IrcCapabilityCatalog.Batch),
             ServerTimeEnabled = capabilities.IsEnabled(IrcCapabilityCatalog.ServerTime),
             MessageTagsEnabled = capabilities.IsEnabled(IrcCapabilityCatalog.MessageTags),
+            EventPlaybackEnabled = capabilities.IsEnabled(IrcCapabilityCatalog.EventPlayback),
             ServerMaximumRequestSize = isupport.ChathistoryLimit,
             ClientMaximumRequestSize = Math.Clamp(clientMaximumRequestSize, 1, 10000),
             SupportedReferenceTypes = references.Distinct().ToArray()
@@ -185,21 +262,55 @@ public static class ChathistoryCommandBuilder
             throw new InvalidOperationException("CHATHISTORY requires draft/chathistory, batch, server-time, and message-tags to be enabled.");
         }
 
-        ValidateTarget(request.Target);
-        if (string.IsNullOrWhiteSpace(request.Conversation) || request.Conversation.Length > 256)
-        {
-            throw new ArgumentException("A bounded logical conversation identity is required.", nameof(request));
-        }
-
         if (request.ConnectionGeneration < 1)
         {
             throw new ArgumentOutOfRangeException(nameof(request.ConnectionGeneration));
         }
 
         var operation = request.Operation.ToString().ToUpperInvariant();
-        if (request.Operation is ChathistoryOperation.Around or ChathistoryOperation.Between)
+        if (request.Operation == ChathistoryOperation.Targets)
         {
-            throw new NotSupportedException($"CHATHISTORY {operation} is reserved for a later bounded phase.");
+            if (request.Target is not null || request.Conversation is not null)
+            {
+                throw new ArgumentException("TARGETS must not carry a conversation target.", nameof(request));
+            }
+
+            if (request.Reference.IsWildcard
+                || request.Reference.Type != ChathistoryReferenceType.Timestamp
+                || !support.Supports(ChathistoryReferenceType.Timestamp)
+                || EffectiveSecondary(request) is not { IsWildcard: false, Type: ChathistoryReferenceType.Timestamp })
+            {
+                throw new ArgumentException("TARGETS requires two concrete timestamp references.", nameof(request));
+            }
+
+            var from = ParseTimestamp(request.Reference.Value);
+            var to = ParseTimestamp(EffectiveSecondary(request)!.Value);
+            if (from > to)
+            {
+                throw new ArgumentException("The TARGETS timestamp interval must be ordered.", nameof(request));
+            }
+
+            var targetsLimit = ValidateAndClampLimit(request.Limit, support);
+            var targetsCommand = new IrcCommandBuilder(maximumOutboundLineBytes).Build(
+                "CHATHISTORY",
+                [operation, request.Reference.SerializeWire(), EffectiveSecondary(request)!.SerializeWire(), targetsLimit.ToString(CultureInfo.InvariantCulture)]);
+            return new ChathistoryRequestBuildResult(targetsCommand, request with { Limit = targetsLimit }, targetsLimit);
+        }
+
+        ValidateTarget(request.Target);
+        if (string.IsNullOrWhiteSpace(request.Conversation) || request.Conversation.Length > 256)
+        {
+            throw new ArgumentException("A bounded logical conversation identity is required.", nameof(request));
+        }
+
+        if (EffectiveSecondary(request) is not null && request.Operation != ChathistoryOperation.Between)
+        {
+            throw new ArgumentException("A second selector is valid only for BETWEEN.", nameof(request));
+        }
+
+        if (request.Operation == ChathistoryOperation.Between && EffectiveSecondary(request) is null)
+        {
+            throw new ArgumentException("BETWEEN requires two concrete server references.", nameof(request));
         }
 
         if (!request.Operation.Equals(ChathistoryOperation.Latest) && request.Reference.IsWildcard)
@@ -212,20 +323,54 @@ public static class ChathistoryCommandBuilder
             throw new InvalidOperationException($"The server did not advertise {request.Reference.Type} CHATHISTORY references.");
         }
 
-        var limit = request.Limit;
-        if (limit <= 0)
+        if (request.Operation == ChathistoryOperation.Between
+            && (request.Reference.IsWildcard || EffectiveSecondary(request)!.IsWildcard
+                || !support.Supports(EffectiveSecondary(request)!.Type)))
         {
-            throw new ArgumentOutOfRangeException(nameof(request.Limit), "The CHATHISTORY limit must be positive.");
+            throw new ArgumentException("BETWEEN requires two supported concrete references.", nameof(request));
         }
 
-        limit = Math.Min(limit, support.EffectiveMaximumRequestSize);
+        var limit = ValidateAndClampLimit(request.Limit, support);
+        var parameters = request.Operation == ChathistoryOperation.Between
+            ? new[]
+            {
+                operation,
+                request.Target!,
+                request.Reference.SerializeWire(),
+                EffectiveSecondary(request)!.SerializeWire(),
+                limit.ToString(CultureInfo.InvariantCulture)
+            }
+            : new[]
+            {
+                operation,
+                request.Target!,
+                request.Reference.SerializeWire(),
+                limit.ToString(CultureInfo.InvariantCulture)
+            };
         var command = new IrcCommandBuilder(maximumOutboundLineBytes).Build(
             "CHATHISTORY",
-            [operation, request.Target, request.Reference.Serialize(), limit.ToString(CultureInfo.InvariantCulture)]);
+            parameters);
         return new ChathistoryRequestBuildResult(command, request with { Limit = limit }, limit);
     }
 
-    private static void ValidateTarget(string target)
+    private static int ValidateAndClampLimit(int requested, ChathistorySupport support)
+    {
+        if (requested <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(requested), "The CHATHISTORY limit must be positive.");
+        }
+
+        return Math.Min(requested, support.EffectiveMaximumRequestSize);
+    }
+
+    private static DateTimeOffset ParseTimestamp(string value) =>
+        DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var timestamp)
+            ? timestamp
+            : throw new ArgumentException("The history timestamp is invalid.", nameof(value));
+
+    private static ChathistoryReference? EffectiveSecondary(ChathistoryRequest request) => request.SecondaryReference ?? request.EndReference;
+
+    private static void ValidateTarget(string? target)
     {
         if (string.IsNullOrWhiteSpace(target)
             || target.Length > 256
@@ -255,6 +400,8 @@ public sealed record ChathistoryResult(
     string? Failure = null,
     bool Exhausted = false)
 {
+    public IReadOnlyList<ChathistoryTarget> Targets { get; init; } = Array.Empty<ChathistoryTarget>();
+
     public bool Succeeded => Completion == ChathistoryRequestCompletion.Succeeded;
 
     public bool IsEmpty => Messages.Count == 0;

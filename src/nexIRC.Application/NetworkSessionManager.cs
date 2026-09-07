@@ -33,6 +33,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private Task? _disposeTask;
 
     private const int MaximumOutstandingOperations = 64;
+    private const int MaximumReconnectTargetResults = 16;
+    private const int MaximumReconnectHistoryRequests = 32;
+    private const int MaximumReconnectMessages = 200;
+    private const int MaximumRecoveredQueries = 8;
+    private static readonly TimeSpan MaximumDiscoveryAge = TimeSpan.FromHours(24);
+    private static readonly TimeSpan DiscoveryClockFuzz = TimeSpan.FromSeconds(5);
 
     public NetworkSessionManager(
         nexIRC.Core.Networking.IIrcTransportFactory transportFactory,
@@ -244,6 +250,105 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         var conversation = HistoryConversation(view);
         return network.Session.CanLoadOlderHistory(conversation)
             && FindHistoryBoundary(view) is not null;
+    }
+
+    public bool CanLoadContextAround(NetworkWorkspace network, WorkspaceView view, TranscriptEntry anchor)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(view);
+        ArgumentNullException.ThrowIfNull(anchor);
+        if (network.Id != view.NetworkId
+            || network.Snapshot.Registration != RegistrationState.Registered
+            || view is not (ChannelView or QueryView)
+            || !network.Session.ChathistorySupport.IsUsable)
+        {
+            return false;
+        }
+
+        return SelectHistoryReference(network.Session.ChathistorySupport, anchor.ServerMessageId, anchor.Timestamp, anchor.TimestampSource) is not null;
+    }
+
+    public async ValueTask<CommandDispatchResult> LoadContextAroundAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        TranscriptEntry anchor,
+        CancellationToken cancellationToken = default)
+    {
+        if (!CanLoadContextAround(network, view, anchor))
+        {
+            return CommandDispatchResult.Failure("Context history is unavailable for this message.", view);
+        }
+
+        var reference = SelectHistoryReference(network.Session.ChathistorySupport, anchor.ServerMessageId, anchor.Timestamp, anchor.TimestampSource)!;
+        var request = new ChathistoryRequest
+        {
+            NetworkId = network.Id,
+            ConnectionGeneration = network.Snapshot.ConnectionGeneration,
+            Conversation = HistoryConversation(view),
+            Target = view is ChannelView channel ? channel.Channel : ((QueryView)view).Nickname,
+            Operation = ChathistoryOperation.Around,
+            Reference = reference,
+            Limit = Math.Min(network.Session.MaximumChathistoryRequestSize, 50),
+            Purpose = ChathistoryRequestPurpose.LoadContext
+        };
+        try
+        {
+            var result = await network.Session.RequestHistoryAsync(request, cancellationToken).ConfigureAwait(false);
+            return result.Succeeded
+                ? CommandDispatchResult.Success($"Loaded context around {anchor.Timestamp:O}.", view)
+                : CommandDispatchResult.Failure(result.Failure ?? "The context history request failed.", view);
+        }
+        catch (InvalidOperationException exception)
+        {
+            return CommandDispatchResult.Failure(exception.Message, view);
+        }
+    }
+
+    public async ValueTask<CommandDispatchResult> LoadContextBetweenAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        TranscriptEntry first,
+        TranscriptEntry second,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(first);
+        ArgumentNullException.ThrowIfNull(second);
+        if (network.Id != view.NetworkId || network.Snapshot.Registration != RegistrationState.Registered || view is not (ChannelView or QueryView))
+        {
+            return CommandDispatchResult.Failure("Between-history context is unavailable.", view);
+        }
+
+        var support = network.Session.ChathistorySupport;
+        var firstReference = SelectHistoryReference(support, first.ServerMessageId, first.Timestamp, first.TimestampSource);
+        var secondReference = SelectHistoryReference(support, second.ServerMessageId, second.Timestamp, second.TimestampSource);
+        if (firstReference is null || secondReference is null)
+        {
+            return CommandDispatchResult.Failure("Both history anchors need supported server references.", view);
+        }
+
+        var request = new ChathistoryRequest
+        {
+            NetworkId = network.Id,
+            ConnectionGeneration = network.Snapshot.ConnectionGeneration,
+            Conversation = HistoryConversation(view),
+            Target = view is ChannelView channel ? channel.Channel : ((QueryView)view).Nickname,
+            Operation = ChathistoryOperation.Between,
+            Reference = firstReference,
+            SecondaryReference = secondReference,
+            Limit = Math.Min(network.Session.MaximumChathistoryRequestSize, 50),
+            Purpose = ChathistoryRequestPurpose.LoadContext
+        };
+        try
+        {
+            var result = await network.Session.RequestHistoryAsync(request, cancellationToken).ConfigureAwait(false);
+            return result.Succeeded
+                ? CommandDispatchResult.Success("Loaded bounded history between the selected anchors.", view)
+                : CommandDispatchResult.Failure(result.Failure ?? "The between-history request failed.", view);
+        }
+        catch (InvalidOperationException exception)
+        {
+            return CommandDispatchResult.Failure(exception.Message, view);
+        }
     }
 
     /// <summary>
@@ -2246,13 +2351,21 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     private void CaptureReconnectBoundaries(SessionEntry entry)
     {
+        entry.LastDisconnectAt = DateTimeOffset.UtcNow;
         foreach (var view in entry.Workspace.Views)
         {
-            if (view is not ChannelView channel || !channel.IsJoined)
+            if (view is not ChannelView channel && view is not QueryView)
             {
-                // Query continuity is intentionally left to manual paging in
-                // this phase: IRC cannot prove that a historical nickname is
-                // still the same private conversation across a reconnect.
+                continue;
+            }
+
+            if (view is ChannelView channelView && !channelView.IsJoined)
+            {
+                continue;
+            }
+
+            if (view is QueryView queryCandidate && (!queryCandidate.IsViewOpen || queryCandidate.EntryCount == 0))
+            {
                 continue;
             }
 
@@ -2265,28 +2378,35 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 continue;
             }
 
+            if (view is QueryView query)
+            {
+                query.MarkReconnectCandidate();
+            }
+
             entry.ReconnectBoundaries[HistoryConversation(view)] = new ReconnectHistoryBoundary(
                 HistoryConversation(view),
-                channel.Channel,
+                view is ChannelView channelTarget ? channelTarget.Channel : ((QueryView)view).Nickname,
                 boundary.ServerMessageId,
                 boundary.Timestamp,
                 boundary.TimestampSource,
-                IsChannel: true);
+                IsChannel: view is ChannelView,
+                view.Id);
         }
     }
 
     private async Task RecoverReconnectHistoryAsync(SessionEntry entry, ServerSession session, int generation)
     {
-        if (entry.ReconnectBoundaries.Count == 0 || !session.ChathistorySupport.IsUsable)
+        if (!session.ChathistorySupport.IsUsable)
         {
             return;
         }
 
         var recovered = 0;
         var requests = 0;
-        foreach (var boundary in entry.ReconnectBoundaries.Values.Take(16).ToArray())
+        var channelBoundaries = entry.ReconnectBoundaries.Values.Where(static boundary => boundary.IsChannel).Take(16).ToArray();
+        foreach (var boundary in channelBoundaries)
         {
-            if (requests >= 16 || recovered >= 200 || session.Snapshot.ConnectionGeneration != generation)
+            if (requests >= MaximumReconnectHistoryRequests || recovered >= MaximumReconnectMessages || session.Snapshot.ConnectionGeneration != generation)
             {
                 break;
             }
@@ -2318,12 +2438,156 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 var result = await session.RequestHistoryAsync(request).ConfigureAwait(false);
                 if (result.Succeeded)
                 {
-                    recovered += result.MessageCount;
+                    recovered = Math.Min(MaximumReconnectMessages, recovered + result.MessageCount);
                 }
             }
             catch (InvalidOperationException)
             {
                 break;
+            }
+        }
+
+        if (entry.LastDisconnectAt is not null
+            && session.Snapshot.ConnectionGeneration == generation
+            && requests < MaximumReconnectHistoryRequests
+            && recovered < MaximumReconnectMessages)
+        {
+            var queryBoundaries = entry.ReconnectBoundaries.Values.Where(static boundary => !boundary.IsChannel).ToArray();
+            var lower = queryBoundaries.Length == 0
+                ? (entry.LastDisconnectAt ?? DateTimeOffset.UtcNow).Subtract(DiscoveryClockFuzz)
+                : queryBoundaries.Min(static boundary => boundary.Timestamp).Subtract(DiscoveryClockFuzz);
+            var upper = DateTimeOffset.UtcNow.Add(DiscoveryClockFuzz);
+            if (upper - lower > MaximumDiscoveryAge)
+            {
+                lower = upper.Subtract(MaximumDiscoveryAge);
+            }
+
+            var discovery = ChathistoryRequest.ForTargets(
+                entry.Workspace.Id,
+                generation,
+                ChathistoryReference.Timestamp(lower),
+                ChathistoryReference.Timestamp(upper),
+                MaximumReconnectTargetResults);
+            try
+            {
+                requests++;
+                var targets = await session.RequestHistoryAsync(discovery).ConfigureAwait(false);
+                if (targets.Succeeded)
+                {
+                    var recoveredQueries = 0;
+                    foreach (var target in targets.Targets.Take(MaximumReconnectTargetResults))
+                    {
+                        if (target.Kind != ChathistoryTargetKind.Query
+                            || recoveredQueries >= MaximumRecoveredQueries
+                            || requests >= MaximumReconnectHistoryRequests
+                            || recovered >= MaximumReconnectMessages
+                            || session.Snapshot.ConnectionGeneration != generation)
+                        {
+                            continue;
+                        }
+
+                        var matchingBoundary = queryBoundaries.FirstOrDefault(boundary =>
+                            IrcCaseMappingComparer.Equals(boundary.Target, target.Target, session.Snapshot.Features.CaseMapping));
+                        var queryViews = await InvokeOnDispatcherAsync(
+                            () =>
+                            {
+                                var knownQuery = matchingBoundary is not null
+                                    ? entry.Workspace.FindQueryByHistoryKey(matchingBoundary.Conversation)
+                                    : null;
+                                return (KnownQuery: knownQuery, ExistingByTarget: entry.Workspace.FindQuery(target.Target));
+                            },
+                            WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
+                        var query = queryViews.KnownQuery;
+                        var existingByTarget = queryViews.ExistingByTarget;
+                        var candidate = new HistoryTargetCandidate(
+                            target.NetworkId,
+                            target.ConnectionGeneration,
+                            target.Target,
+                            target.LatestTimestamp,
+                            target.Kind);
+                        var continuity = QueryContinuityPolicy.Evaluate(
+                            candidate,
+                            new QueryContinuityEvidence(
+                                SameNetwork: target.NetworkId == Guid.Empty || target.NetworkId == entry.Workspace.Id,
+                                QueryWasOpenBeforeDisconnect: matchingBoundary is not null,
+                                CurrentTargetMatches: matchingBoundary is not null,
+                                CurrentSessionMessageObserved: existingByTarget?.IsIdentityBoundToCurrentSession == true),
+                            existingByTarget is not null || query is not null);
+                        if (continuity == QueryContinuityOutcome.ReuseExistingQuery)
+                        {
+                            query ??= existingByTarget;
+                        }
+                        else if (continuity == QueryContinuityOutcome.CreateRecoveredQuery)
+                        {
+                            if (existingByTarget is not null && matchingBoundary is null)
+                            {
+                                // Same spelling without reconnect evidence is
+                                // ambiguous; retain the candidate for a later
+                                // live/account match instead of merging.
+                                continue;
+                            }
+
+                            query ??= await InvokeOnDispatcherAsync(
+                                () => entry.Workspace.EnsureQuery(target.Target, reopen: false),
+                                WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            continue;
+                        }
+
+                        if (query is null)
+                        {
+                            continue;
+                        }
+
+                        var isKnownContinuity = matchingBoundary is not null && continuity == QueryContinuityOutcome.ReuseExistingQuery;
+                        var reference = isKnownContinuity
+                            ? SelectHistoryReference(session.ChathistorySupport, matchingBoundary!.ServerMessageId, matchingBoundary.Timestamp, matchingBoundary.TimestampSource)
+                            : session.ChathistorySupport.Supports(ChathistoryReferenceType.Timestamp)
+                                ? ChathistoryReference.Timestamp(target.LatestTimestamp.Subtract(MaximumDiscoveryAge))
+                                : null;
+                        if (reference is null)
+                        {
+                            continue;
+                        }
+
+                        var request = new ChathistoryRequest
+                        {
+                            NetworkId = entry.Workspace.Id,
+                            ConnectionGeneration = generation,
+                            Conversation = query.HistoryConversationKey,
+                            Target = target.Target,
+                            Operation = ChathistoryOperation.Latest,
+                            Reference = reference,
+                            Limit = Math.Min(session.MaximumChathistoryRequestSize, 50),
+                            Purpose = ChathistoryRequestPurpose.ReconnectGap
+                        };
+                        requests++;
+                        var result = await session.RequestHistoryAsync(request).ConfigureAwait(false);
+                        if (result.Succeeded)
+                        {
+                            var count = result.MessageCount;
+                            recovered = Math.Min(MaximumReconnectMessages, recovered + count);
+                            if (count > 0)
+                            {
+                                await InvokeOnDispatcherAsync(
+                                    () =>
+                                    {
+                                        query.MarkRecoveredHistory(count);
+                                        return true;
+                                    },
+                                    WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
+                                recoveredQueries++;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // Capability loss, disconnect, or a stale generation ends the
+                // bounded discovery sequence without retrying indefinitely.
             }
         }
 
@@ -2338,7 +2602,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 }
 
                 entry.Workspace.StatusView.Append(
-                    IrcEventPresentation.CreateLocalCommand($"Recovered {recovered} message{(recovered == 1 ? string.Empty : "s")} after reconnect."),
+                    IrcEventPresentation.CreateLocalCommand($"Recovered {recovered} message{(recovered == 1 ? string.Empty : "s")} after reconnect, including bounded private-history discovery."),
                     markActivity: false,
                     updateLastActivity: false);
                 NotifyNavigationChanged();
@@ -2405,10 +2669,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 Append(workspace.EnsureChannel(ctcp.Target, reopen: false), semanticEvent);
                 break;
             case IrcCtcpEvent ctcp when IrcIdentity.Equals(ctcp.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping):
-                Append(workspace.EnsureIncomingQuery(ctcp.Target), semanticEvent);
+                Append(ResolveQuery(workspace, semanticEvent, ctcp.Target), semanticEvent);
                 break;
             case IrcCtcpEvent ctcp when ctcp.Message.Prefix?.Name is { } sender:
-                Append(workspace.EnsureIncomingQuery(sender), semanticEvent, WorkspaceActivity.Important);
+                Append(ResolveQuery(workspace, semanticEvent, sender), semanticEvent, WorkspaceActivity.Important);
                 break;
             case IrcPrivmsgEvent message when snapshot.Features.ChannelTypes.Contains(message.Target.FirstOrDefault()):
                 Append(workspace.EnsureChannel(message.Target, reopen: false), semanticEvent);
@@ -2421,7 +2685,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 // event below; do not duplicate it in server status.
                 break;
             case IrcQueryMessageEvent query:
-                Append(workspace.EnsureIncomingQuery(query.Nickname), semanticEvent, WorkspaceActivity.Important);
+                Append(ResolveQuery(workspace, semanticEvent, query.Nickname), semanticEvent, WorkspaceActivity.Important);
                 break;
             case IrcJoinEvent join:
                 Append(workspace.EnsureChannel(join.Channel, reopen: false), semanticEvent);
@@ -2430,11 +2694,17 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 Append(workspace.EnsureChannel(part.Channel, reopen: false), semanticEvent);
                 break;
             case IrcKickEvent kick:
-                ReconcileKickEvent(workspace, kick);
+                if (!kick.IsHistorical)
+                {
+                    ReconcileKickEvent(workspace, kick);
+                }
                 Append(workspace.EnsureChannel(kick.Channel, reopen: false), semanticEvent);
                 break;
             case IrcTopicEvent topic:
-                ReconcileTopicEvent(workspace, topic);
+                if (!topic.IsHistorical)
+                {
+                    ReconcileTopicEvent(workspace, topic);
+                }
                 Append(workspace.EnsureChannel(topic.Channel, reopen: false), semanticEvent);
                 break;
             case IrcTopicUnsetEvent topic:
@@ -2450,8 +2720,16 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 Append(workspace.EnsureChannel(who.Channel, reopen: false), semanticEvent);
                 break;
             case IrcModeEvent mode:
-                ReconcileModeEvent(workspace, mode);
+                if (!mode.IsHistorical)
+                {
+                    ReconcileModeEvent(workspace, mode);
+                }
                 Append(workspace.EnsureChannel(mode.Channel, reopen: false), semanticEvent);
+                break;
+            case IrcHistoryTargetEvent:
+            case IrcTagmsgEvent:
+                // TARGETS is discovery metadata and TAGMSG has no Phase 1Y
+                // reaction/read-marker semantics. Neither is transcript state.
                 break;
             case IrcBanListItemEvent banListItem:
                 if (RouteBanListItemEvent(workspace, banListItem) is not null)
@@ -2543,8 +2821,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
                 break;
             case IrcNicknameChangedEvent nickname:
-                ReconcileNicknameChange(workspace, nickname);
-                var followedQuery = ReconcileQueryNicknameChange(workspace, nickname, snapshot);
+                if (!nickname.IsHistorical)
+                {
+                    ReconcileNicknameChange(workspace, nickname);
+                }
+
+                var followedQuery = nickname.IsHistorical ? null : ReconcileQueryNicknameChange(workspace, nickname, snapshot);
                 foreach (var channel in workspace.Channels)
                 {
                     Append(channel, semanticEvent);
@@ -2569,6 +2851,18 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 Append(workspace.StatusView, semanticEvent);
                 break;
         }
+    }
+
+    private static QueryView ResolveQuery(NetworkWorkspace workspace, IrcSemanticEvent semanticEvent, string nickname)
+    {
+        if (semanticEvent.IsHistorical
+            && semanticEvent.HistoricalConversation is { Length: > 0 } historyKey
+            && workspace.FindQueryByHistoryKey(historyKey) is { } historicalQuery)
+        {
+            return historicalQuery;
+        }
+
+        return workspace.EnsureIncomingQuery(nickname);
     }
 
     private bool ShouldSuppressIgnoredPresentation(NetworkWorkspace workspace, IrcSemanticEvent semanticEvent) =>
@@ -2991,6 +3285,14 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         _ = RemovePendingAsync(task);
     }
 
+    private async ValueTask<T> InvokeOnDispatcherAsync<T>(Func<T> action, WorkspaceDispatchActionCategory category)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        var result = default(T);
+        await _dispatcher.InvokeAsync(() => result = action(), category).ConfigureAwait(false);
+        return result!;
+    }
+
     private static WorkspaceDispatchActionCategory DispatchCategory(IrcSemanticEvent semanticEvent) => semanticEvent switch
     {
         IrcPrivmsgEvent or IrcQueryMessageEvent or IrcCtcpEvent => WorkspaceDispatchActionCategory.IncomingMessage,
@@ -3120,6 +3422,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         public ConcurrentQueue<string> RecentSemanticEventOrder { get; } = new();
 
         public Dictionary<string, ReconnectHistoryBoundary> ReconnectBoundaries { get; } = new(StringComparer.Ordinal);
+
+        public DateTimeOffset? LastDisconnectAt { get; set; }
     }
 
     private sealed record ReconnectHistoryBoundary(
@@ -3128,5 +3432,6 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         string? ServerMessageId,
         DateTimeOffset Timestamp,
         ConversationTimestampSource TimestampSource,
-        bool IsChannel);
+        bool IsChannel,
+        Guid ViewId);
 }

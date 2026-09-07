@@ -31,6 +31,12 @@ public sealed class DemoScenario
         return reconnect;
     }
 
+    internal void EnqueuePhase1YRegistration(FakeIrcTransport transport)
+    {
+        ArgumentNullException.ThrowIfNull(transport);
+        Register(transport, "alpha.server", "nexAlpha", "AlphaNet", "(qaohv)~&@%+", "beI,k,l,imnpst", "batch", "draft/chathistory", "draft/event-playback", "message-tags", "server-time");
+    }
+
     internal void AddTransport(FakeIrcTransport transport)
     {
         ArgumentNullException.ThrowIfNull(transport);
@@ -43,7 +49,7 @@ public sealed class DemoScenario
         var sessions = viewModel.Sessions;
         var alpha = sessions.Add(Options("AlphaNet", _alpha.Endpoint, "nexAlpha", "#general") with
         {
-            RequestedCapabilities = IrcCapabilityCatalog.PreferredPhase1X,
+            RequestedCapabilities = IrcCapabilityCatalog.PreferredPhase1Y,
             Reconnect = new ReconnectPolicy(
                 Enabled: true,
                 MaximumAttempts: 3,
@@ -59,7 +65,7 @@ public sealed class DemoScenario
         await sessions.ConnectAsync(beta.Id).ConfigureAwait(true);
         await WaitForConditionAsync(sessions, () => _alpha.ConnectCount == 1 && _beta.ConnectCount == 1, "fake transports did not connect").ConfigureAwait(true);
 
-        Register(_alpha, "alpha.server", "nexAlpha", "AlphaNet", "(qaohv)~&@%+", "beI,k,l,imnpst", "batch draft/chathistory message-tags server-time");
+        Register(_alpha, "alpha.server", "nexAlpha", "AlphaNet", "(qaohv)~&@%+", "beI,k,l,imnpst", "batch", "draft/chathistory", "message-tags", "server-time");
         Register(_beta, "beta.server", "nexBeta", "BetaNet", "(ov)@+", "be,k,s,im");
         EnqueueSmokeChannel(_alpha, "alpha.server", "nexAlpha", "#general", "Alpha topic", "alpha-setter", "@nexAlpha +Alex", "+nt");
         EnqueueSmokeChannel(_beta, "beta.server", "nexBeta", "#general", "Beta topic", "beta-setter", "+nexBeta Alex", "+i");

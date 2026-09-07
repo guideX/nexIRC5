@@ -178,11 +178,28 @@ internal sealed class SessionStateStore
             && _batches.TryGetValue(batchId, out var activeBatch)
             && string.Equals(activeBatch.Type, "chathistory", StringComparison.OrdinalIgnoreCase))
         {
-            if (historicalPlayback && (command is "PRIVMSG" or "NOTICE"))
+            if (historicalPlayback)
             {
-                ApplyHistoricalMessage(message, features, events, command == "NOTICE");
+                if (command is "PRIVMSG" or "NOTICE")
+                {
+                    ApplyHistoricalMessage(message, features, events, command == "NOTICE");
+                }
+                else if (features.Capabilities.IsEnabled(IrcCapabilityCatalog.EventPlayback))
+                {
+                    ApplyHistoricalStateEvent(message, features, events);
+                }
             }
 
+            return events;
+        }
+
+        if (command != "BATCH"
+            && message.BatchId is { } targetBatchId
+            && _batches.TryGetValue(targetBatchId, out var targetBatch)
+            && string.Equals(targetBatch.Type, "draft/chathistory-targets", StringComparison.OrdinalIgnoreCase)
+            && historicalPlayback)
+        {
+            ApplyHistoricalTarget(message, features, events);
             return events;
         }
 
@@ -608,6 +625,103 @@ internal sealed class SessionStateStore
             events.Add(new IrcQueryMessageEvent(message, message.Prefix!.Name, text, isNotice) { IsHistorical = true });
         }
     }
+
+    private static void ApplyHistoricalStateEvent(IrcMessage message, ServerFeatureSet features, List<IrcSemanticEvent> events)
+    {
+        IrcSemanticEvent? historical = message.Command switch
+        {
+            "JOIN" when Parameter(message, 0) is { Length: > 0 } channel
+                && message.Prefix?.Name is { Length: > 0 } nickname
+                => new IrcJoinEvent(message, channel, nickname, ExtendedAccount(message), ExtendedRealName(message)),
+            "PART" when Parameter(message, 0) is { Length: > 0 } partChannel
+                && message.Prefix?.Name is { Length: > 0 } partNickname
+                => new IrcPartEvent(message, partChannel, partNickname),
+            "QUIT" when message.Prefix?.Name is { Length: > 0 } quitNickname
+                => new IrcQuitEvent(message, quitNickname, message.HasTrailingParameter ? message.TrailingParameter : null),
+            "NICK" when Parameter(message, 0) is { Length: > 0 } newNickname
+                => new IrcNicknameChangedEvent(message, message.Prefix?.Name, newNickname),
+            "MODE" when Parameter(message, 0) is { Length: > 0 } modeChannel
+                && IsChannelTarget(modeChannel, features.ChannelTypes)
+                => HistoricalMode(message, modeChannel, features),
+            "TOPIC" when Parameter(message, 0) is { Length: > 0 } topicChannel
+                => new IrcTopicEvent(message, topicChannel, message.HasTrailingParameter ? message.TrailingParameter ?? string.Empty : Parameter(message, 1) ?? string.Empty, message.Prefix?.Name, ParseServerTime(message)),
+            "KICK" when Parameter(message, 0) is { Length: > 0 } kickChannel
+                && Parameter(message, 1) is { Length: > 0 } kickedNickname
+                => new IrcKickEvent(message, kickChannel, kickedNickname, message.HasTrailingParameter ? message.TrailingParameter : null),
+            "AWAY" when message.Prefix?.Name is { Length: > 0 } awayNickname
+                => HistoricalAway(message, awayNickname),
+            "ACCOUNT" when message.Prefix?.Name is { Length: > 0 } accountNickname
+                => new IrcAccountEvent(message, accountNickname, HistoricalAccount(message)),
+            "TAGMSG" when Parameter(message, 0) is { Length: > 0 } tagTarget
+                => new IrcTagmsgEvent(message, tagTarget),
+            _ => null
+        };
+
+        if (historical is not null)
+        {
+            events.Add(historical with { IsHistorical = true, Source = IrcSemanticEventSource.ServerPlayback });
+        }
+    }
+
+    private static void ApplyHistoricalTarget(IrcMessage message, ServerFeatureSet features, List<IrcSemanticEvent> events)
+    {
+        if (!string.Equals(message.Command, "CHATHISTORY", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var hasSubcommand = string.Equals(Parameter(message, 0), "TARGETS", StringComparison.OrdinalIgnoreCase);
+        var target = Parameter(message, hasSubcommand ? 1 : 0);
+        var rawTimestamp = Parameter(message, hasSubcommand ? 2 : 1);
+        if (string.IsNullOrWhiteSpace(target)
+            || target.Length > 64
+            || target.Any(static character => char.IsWhiteSpace(character) || char.IsControl(character) || character == ':' || character == '\0')
+            || string.IsNullOrWhiteSpace(rawTimestamp))
+        {
+            return;
+        }
+
+        rawTimestamp = rawTimestamp.StartsWith("timestamp=", StringComparison.OrdinalIgnoreCase)
+            ? rawTimestamp["timestamp=".Length..]
+            : rawTimestamp;
+        if (!DateTimeOffset.TryParse(rawTimestamp, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var timestamp))
+        {
+            return;
+        }
+
+        var kind = IsChannelTarget(target, features.ChannelTypes)
+            ? ChathistoryTargetKind.Channel
+            : ChathistoryTargetKind.Query;
+        events.Add(new IrcHistoryTargetEvent(message, target, timestamp, kind)
+        {
+            IsHistorical = true,
+            Source = IrcSemanticEventSource.DiscoveryMetadata
+        });
+    }
+
+    private static IrcModeEvent HistoricalMode(IrcMessage message, string channel, ServerFeatureSet features)
+    {
+        var modeState = new IrcChannelModeState(channel);
+        modeState.SetCaseMapping(features.CaseMapping);
+        return new IrcModeEvent(message, channel, modeState.Apply(message, features));
+    }
+
+    private static IrcAwayEvent HistoricalAway(IrcMessage message, string nickname)
+    {
+        var isAway = message.HasTrailingParameter || message.Parameters.Count > 0;
+        var reason = isAway ? message.HasTrailingParameter ? message.TrailingParameter : Parameter(message, 0) : null;
+        return new IrcAwayEvent(message, nickname, isAway, reason);
+    }
+
+    private static string? HistoricalAccount(IrcMessage message)
+    {
+        var account = message.HasTrailingParameter ? message.TrailingParameter : Parameter(message, 0);
+        return string.IsNullOrWhiteSpace(account) || string.Equals(account, "*", StringComparison.Ordinal) ? null : account;
+    }
+
+    private static string? ExtendedAccount(IrcMessage message) => message.Parameters.Count >= 2 && message.Parameters[1] != "*" ? message.Parameters[1] : null;
+
+    private static string? ExtendedRealName(IrcMessage message) => message.Parameters.Count >= 3 ? message.Parameters[2] : null;
 
     private static bool TryParseCtcp(string text, out string command, out string arguments)
     {

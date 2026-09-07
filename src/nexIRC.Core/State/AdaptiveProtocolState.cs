@@ -113,6 +113,7 @@ public static class IrcCapabilityCatalog
     public const string Batch = "batch";
     public const string ServerTime = "server-time";
     public const string Chathistory = "draft/chathistory";
+    public const string EventPlayback = "draft/event-playback";
     public const string AwayNotify = "away-notify";
     public const string ExtendedJoin = "extended-join";
     public const string MultiPrefix = "multi-prefix";
@@ -132,8 +133,11 @@ public static class IrcCapabilityCatalog
     public static IReadOnlyList<string> PreferredPhase1X { get; } =
     [MessageTags, ServerTime, Batch, Chathistory, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
 
+    public static IReadOnlyList<string> PreferredPhase1Y { get; } =
+    [MessageTags, ServerTime, Batch, Chathistory, EventPlayback, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
+
     public static IReadOnlySet<string> Known { get; } =
-        new HashSet<string>(PreferredPhase1X.Concat([AccountTag, Sasl]), StringComparer.Ordinal);
+        new HashSet<string>(PreferredPhase1Y.Concat([AccountTag, Sasl]), StringComparer.Ordinal);
 }
 
 public enum CapNegotiationState

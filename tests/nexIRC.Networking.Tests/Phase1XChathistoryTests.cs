@@ -48,7 +48,7 @@ public sealed class Phase1XChathistoryTests
             Purpose = ChathistoryRequestPurpose.LoadOlder
         };
         var pending = session.RequestHistoryAsync(request).AsTask();
-        await WaitForAsync(() => transport.OutboundLines.Any(line => line.StartsWith("CHATHISTORY BEFORE #room oldest", StringComparison.Ordinal)));
+        await WaitForAsync(() => transport.OutboundLines.Any(line => line.StartsWith("CHATHISTORY BEFORE #room msgid=oldest", StringComparison.Ordinal)));
 
         transport.EnqueueInboundLine(":srv BATCH +h chathistory #room");
         transport.EnqueueInboundLine("@batch=h;msgid=history-1;time=2026-09-07T12:00:00.000Z :alice!u@h PRIVMSG #room :older");

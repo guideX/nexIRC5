@@ -161,6 +161,22 @@ public abstract record IrcSemanticEvent(IrcMessage Message)
     /// remaining outside the live participant/activity state machine.
     /// </summary>
     public bool IsHistorical { get; init; }
+
+    /// <summary>Delivery provenance independent of the application history schema.</summary>
+    public IrcSemanticEventSource Source { get; init; } = IrcSemanticEventSource.Live;
+
+    /// <summary>Network scope carried onto server-playback events.</summary>
+    public Guid? NetworkId { get; init; }
+
+    /// <summary>Logical conversation supplied by the owning history request.</summary>
+    public string? HistoricalConversation { get; init; }
+}
+
+public enum IrcSemanticEventSource
+{
+    Live,
+    ServerPlayback,
+    DiscoveryMetadata
 }
 
 public sealed record IrcWelcomeEvent(IrcMessage Message, string? NetworkName) : IrcSemanticEvent(Message);
@@ -226,6 +242,16 @@ public sealed record IrcBatchEvent(
     bool IsStart,
     string? Type,
     IReadOnlyList<string> Parameters) : IrcSemanticEvent(Message);
+
+public sealed record IrcHistoryTargetEvent(
+    IrcMessage Message,
+    string Target,
+    DateTimeOffset LatestTimestamp,
+    ChathistoryTargetKind Kind) : IrcSemanticEvent(Message);
+
+public sealed record IrcTagmsgEvent(
+    IrcMessage Message,
+    string Target) : IrcSemanticEvent(Message);
 
 public enum IrcStandardReplyKind
 {

@@ -81,7 +81,7 @@ public sealed class Phase1XProtocolTests
         };
 
         Assert.Equal("CHATHISTORY LATEST #room * 5", ChathistoryCommandBuilder.Build(latest, support).Line);
-        Assert.Equal("CHATHISTORY BEFORE #room abc 5", ChathistoryCommandBuilder.Build(before, support).Line);
+        Assert.Equal("CHATHISTORY BEFORE #room msgid=abc 5", ChathistoryCommandBuilder.Build(before, support).Line);
         Assert.Throws<ArgumentException>(() => ChathistoryCommandBuilder.Build(latest with { Target = "#bad target" }, support));
         Assert.Throws<ArgumentOutOfRangeException>(() => ChathistoryCommandBuilder.Build(latest with { Limit = 0 }, support));
     }

@@ -29,6 +29,7 @@ internal static class UiSmokeHarness
         "query-nick",
         "ircv3-metadata",
         "chathistory",
+        "history-discovery",
         "contextual-actions",
         "sustained-interactivity",
         "close-idle",
@@ -103,6 +104,9 @@ internal static class UiSmokeHarness
                 break;
             case "chathistory":
                 await ChathistoryAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "history-discovery":
+                await HistoryDiscoveryAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
             case "contextual-actions":
                 await ContextualActionsAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -271,6 +275,87 @@ internal static class UiSmokeHarness
         Require(channel.EntriesSnapshot.Count(entry => entry.Text == "legitimate repeat") == 2, "CHATHISTORY no-ID repeats were not retained");
         Require(channel.EntriesSnapshot.Count(entry => entry.ServerMessageId == "live-boundary") == 1, "CHATHISTORY authoritative overlap was not deduplicated");
         Console.WriteLine($"CHATHISTORY_UI_TRACE entries={channel.EntryCount} unread={channel.UnreadCount} members={channel.Members.Count}");
+    }
+
+    private static async Task HistoryDiscoveryAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var sessions = window.ViewModel.Sessions;
+        var channel = RequiredChannel(network);
+        var knownQuery = sessions.EnsureQuery(network.Id, "Alice");
+        window.ViewModel.SelectView(network.StatusView);
+        demo.AlphaTransport.EnqueueInboundLine("@msgid=pre-channel;time=2026-09-07T11:58:00.000Z :Alex!u@alpha PRIVMSG #general :before channel reconnect");
+        demo.AlphaTransport.EnqueueInboundLine("@msgid=pre-disconnect;time=2026-09-07T11:59:00.000Z :Alice!u@alpha PRIVMSG nexAlpha :before reconnect");
+        await WaitForAsync(sessions, () => channel.EntriesSnapshot.Any(entry => entry.ServerMessageId == "pre-channel") && knownQuery.EntriesSnapshot.Any(entry => entry.ServerMessageId == "pre-disconnect"), "pre-disconnect history evidence did not arrive").ConfigureAwait(true);
+
+        var replacement = demo.AddAlphaReconnectTransport();
+        demo.AlphaTransport.EnqueueRemoteDisconnect();
+        await WaitForAsync(sessions, () => replacement.ConnectCount == 1 && channel.IsStale, "history discovery reconnect did not establish a new generation").ConfigureAwait(true);
+
+        demo.EnqueuePhase1YRegistration(replacement);
+        replacement.EnqueueInboundLine(":nexAlpha!demo@alpha.server JOIN #general");
+        replacement.EnqueueInboundLine(":alpha.server 332 nexAlpha #general :Current topic after reconnect");
+        replacement.EnqueueInboundLine(":alpha.server 324 nexAlpha #general +nt");
+        replacement.EnqueueInboundLine(":alpha.server 353 nexAlpha = #general :@nexAlpha +Alex");
+        replacement.EnqueueInboundLine(":alpha.server 366 nexAlpha #general :End of names");
+        await WaitForPollingAsync(() => replacement.OutboundLines.Any(line => line.StartsWith("CHATHISTORY LATEST #general", StringComparison.Ordinal)), "channel reconnect history request was not sent").ConfigureAwait(true);
+        await WaitForAsync(sessions, () => channel.Synchronization == ChannelSynchronizationState.Synchronized, "current channel state did not resynchronize").ConfigureAwait(true);
+
+        var currentMembers = channel.MembersSnapshot.Select(member => $"{member.Nickname}:{string.Join(',', member.PrefixModes.OrderBy(value => value))}").OrderBy(value => value, StringComparer.Ordinal).ToArray();
+        var currentTopic = channel.Topic;
+        var currentModes = channel.Modes.OrderBy(value => value).ToArray();
+        var currentUnread = channel.UnreadCount;
+        var playbackStart = Stopwatch.StartNew();
+        replacement.EnqueueInboundLine(":alpha.server BATCH +channel-history chathistory #general");
+        for (var index = 0; index < 40; index++)
+        {
+            replacement.EnqueueInboundLine($"@batch=channel-history;msgid=phase1y-message-{index:00};time=2026-09-07T10:{index / 2:00}:{index % 60:00}.000Z :ReplayUser!u@history PRIVMSG #general :mixed-playback-{index:00}");
+        }
+
+        replacement.EnqueueInboundLine("@batch=channel-history;msgid=phase1y-join;time=2026-09-07T10:20:00.000Z :OldAlice!u@history JOIN #general");
+        replacement.EnqueueInboundLine("@batch=channel-history;msgid=phase1y-part;time=2026-09-07T10:20:01.000Z :OldAlice!u@history PART #general :old");
+        replacement.EnqueueInboundLine("@batch=channel-history;msgid=phase1y-quit;time=2026-09-07T10:20:02.000Z :OldAlice!u@history QUIT :old");
+        replacement.EnqueueInboundLine("@batch=channel-history;msgid=phase1y-nick;time=2026-09-07T10:20:03.000Z :Alice!u@history NICK Alicia");
+        replacement.EnqueueInboundLine("@batch=channel-history;msgid=phase1y-mode;time=2026-09-07T10:20:04.000Z :OldOp!u@history MODE #general +o OldAlice");
+        replacement.EnqueueInboundLine("@batch=channel-history;msgid=phase1y-topic;time=2026-09-07T10:20:05.000Z :OldOp!u@history TOPIC #general :historical topic");
+        replacement.EnqueueInboundLine("@batch=channel-history;msgid=phase1y-away;time=2026-09-07T10:20:06.000Z :OldAlice!u@history AWAY :historical away");
+        replacement.EnqueueInboundLine("@batch=channel-history;msgid=phase1y-account;time=2026-09-07T10:20:07.000Z :OldAlice!u@history ACCOUNT old-account");
+        replacement.EnqueueInboundLine("@batch=channel-history;msgid=phase1y-kick;time=2026-09-07T10:20:08.000Z :OldOp!u@history KICK #general OldAlice :historical kick");
+        replacement.EnqueueInboundLine("@batch=channel-history;msgid=phase1y-tagmsg;time=2026-09-07T10:20:09.000Z :OldAlice!u@history TAGMSG #general");
+        replacement.EnqueueInboundLine(":alpha.server BATCH -channel-history");
+
+        await WaitForPollingAsync(() => replacement.OutboundLines.Any(line => line.StartsWith("CHATHISTORY TARGETS timestamp=", StringComparison.Ordinal)), "TARGETS discovery request was not sent").ConfigureAwait(true);
+        replacement.EnqueueInboundLine(":alpha.server BATCH +targets draft/chathistory-targets");
+        replacement.EnqueueInboundLine("@batch=targets :alpha.server CHATHISTORY TARGETS Alice 2026-09-07T12:15:00.000Z");
+        replacement.EnqueueInboundLine("@batch=targets :alpha.server CHATHISTORY TARGETS Alice 2026-09-07T12:15:00.000Z");
+        replacement.EnqueueInboundLine("@batch=targets :alpha.server CHATHISTORY TARGETS Bob 2026-09-07T12:16:00.000Z");
+        replacement.EnqueueInboundLine(":alpha.server BATCH -targets");
+
+        await WaitForPollingAsync(() => replacement.OutboundLines.Any(line => line.StartsWith("CHATHISTORY LATEST Alice", StringComparison.Ordinal)), "known-query history recovery was not sent").ConfigureAwait(true);
+        replacement.EnqueueInboundLine("@msgid=live-after-reconnect;time=2026-09-07T12:17:00.000Z :Alice!u@alpha PRIVMSG nexAlpha :live after reconnect");
+        replacement.EnqueueInboundLine(":alpha.server BATCH +alice-history chathistory Alice");
+        replacement.EnqueueInboundLine("@batch=alice-history;msgid=alice-old;time=2026-09-07T12:10:00.000Z :Alice!u@alpha PRIVMSG nexAlpha :offline Alice history");
+        replacement.EnqueueInboundLine(":alpha.server BATCH -alice-history");
+
+        await WaitForPollingAsync(() => !network.Session.GetChathistoryState(knownQuery.HistoryConversationKey).RequestActive, "known-query history request did not complete").ConfigureAwait(true);
+        await WaitForPollingAsync(() => replacement.OutboundLines.Any(line => line.StartsWith("CHATHISTORY LATEST Bob", StringComparison.Ordinal)), $"new recovered-query history request was not sent; outbound={string.Join(" | ", replacement.OutboundLines)}").ConfigureAwait(true);
+        replacement.EnqueueInboundLine(":alpha.server BATCH +bob-history chathistory Bob");
+        replacement.EnqueueInboundLine("@batch=bob-history;msgid=bob-old;time=2026-09-07T12:12:00.000Z :Bob!u@alpha PRIVMSG nexAlpha :offline Bob history");
+        replacement.EnqueueInboundLine(":alpha.server BATCH -bob-history");
+
+        await WaitForAsync(sessions, () => network.Queries.Any(query => query.Nickname == "Bob" && query.RecoveredHistoryCount > 0), "recovered query was not projected").ConfigureAwait(true);
+        await sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+        playbackStart.Stop();
+
+        var afterMembers = channel.MembersSnapshot.Select(member => $"{member.Nickname}:{string.Join(',', member.PrefixModes.OrderBy(value => value))}").OrderBy(value => value, StringComparer.Ordinal).ToArray();
+        Require(channel.EntriesSnapshot.Any(entry => entry.Text == "mixed-playback-39"), "mixed historical message playback did not reach the channel");
+        Require(channel.EntriesSnapshot.Any(entry => entry.Text == "joined #general" && entry.Provenance == ConversationEntryProvenance.ServerPlayback), "historical JOIN was not rendered");
+        Require(Enumerable.SequenceEqual(currentMembers, afterMembers), "historical state playback changed current members or privileges");
+        Require(channel.Topic == currentTopic, "historical TOPIC playback changed the current topic");
+        Require(channel.Modes.OrderBy(value => value).SequenceEqual(currentModes), "historical MODE playback changed current channel modes");
+        Require(channel.UnreadCount == currentUnread, "historical mixed playback changed live unread state");
+        Require(network.Queries.Count == 2 && network.Queries.Count(query => query.Nickname == "Alice") == 1, "TARGETS/recovery created a duplicate known query");
+        Require(knownQuery.Nickname == "Alice" && knownQuery.EntriesSnapshot.Any(entry => entry.Text == "live after reconnect"), "live query traffic did not reuse the known query");
+        Console.WriteLine($"HISTORY_DISCOVERY_UI_METRICS messages=40 state_events=10 playback_ms={playbackStart.Elapsed.TotalMilliseconds:F3} queries={network.Queries.Count} recovered_bob={network.Queries.Single(query => query.Nickname == "Bob").RecoveredHistoryCount} members_unchanged=true current_topic_unchanged=true current_modes_unchanged=true");
     }
 
     private static async Task ModerationAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
