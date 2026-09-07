@@ -55,6 +55,17 @@ public sealed class FakeIrcTransport : IIrcTransport, IIrcTransportCallbackSourc
 
     public int MaximumActiveReadCount => Volatile.Read(ref _maximumActiveReads);
 
+    public int PendingInboundItemCount
+    {
+        get
+        {
+            lock (_pendingGate)
+            {
+                return _inbound.Reader.Count + (_pendingBytes is null ? 0 : 1);
+            }
+        }
+    }
+
     public ConnectionFailure? ConnectFailure { get; set; }
 
     public event Func<IrcTransportCallback, ValueTask>? CallbackReceived

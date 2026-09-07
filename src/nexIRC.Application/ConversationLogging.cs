@@ -454,6 +454,37 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
     public string? LastDiagnostic { get { lock (_diagnosticGate) return _lastDiagnostic; } }
     public ConversationLogCleanupStatistics LastCleanupStatistics => Volatile.Read(ref _lastCleanupStatistics);
 
+    /// <summary>
+    /// Diagnostic counters for the disposable history worker and its
+    /// disposable in-memory index snapshots. No records or objects are
+    /// exposed, so these properties do not extend their lifetime.
+    /// </summary>
+    public int PendingWriteCount => _queue.Reader.CanCount ? _queue.Reader.Count : -1;
+
+    public bool IsWriterCompleted => _writer.IsCompleted;
+
+    public int HistoryIndexCount
+    {
+        get
+        {
+            lock (_historyIndexGate)
+            {
+                return _historyIndexes.Count;
+            }
+        }
+    }
+
+    public int SearchIndexCount
+    {
+        get
+        {
+            lock (_searchIndexGate)
+            {
+                return _searchIndexes.Count;
+            }
+        }
+    }
+
     public ValueTask<bool> AppendAsync(ConversationLogRecord record, CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
@@ -1155,6 +1186,15 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _queue.Writer.TryComplete();
         await _writer.ConfigureAwait(false);
+        lock (_historyIndexGate)
+        {
+            _historyIndexes.Clear();
+        }
+
+        lock (_searchIndexGate)
+        {
+            _searchIndexes.Clear();
+        }
     }
 
     private async Task WriterAsync()

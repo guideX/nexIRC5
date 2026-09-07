@@ -88,6 +88,36 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         Interlocked.Read(ref _duplicateSemanticEventsDiscarded),
         Interlocked.Read(ref _resynchronizationEventsSuppressed));
 
+    /// <summary>
+    /// Number of manager-owned dispatch tasks that have not retired yet.
+    /// This is diagnostic state only and does not retain completed work.
+    /// </summary>
+    public int PendingDispatchCount
+    {
+        get
+        {
+            lock (_pendingGate)
+            {
+                return _pendingDispatches.Count;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Number of session entries currently owned by this manager.
+    /// This is diagnostic state only and does not retain completed work.
+    /// </summary>
+    public int ManagedSessionCount
+    {
+        get
+        {
+            lock (_entriesGate)
+            {
+                return _entries.Count;
+            }
+        }
+    }
+
     public ValueTask FlushStateDispatchAsync() => _dispatcher.FlushAsync();
 
     public bool IsIgnored(NetworkWorkspace workspace, IrcPrefix? prefix, string? account = null)

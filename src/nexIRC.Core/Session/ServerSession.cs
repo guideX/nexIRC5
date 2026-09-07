@@ -11,6 +11,7 @@ namespace nexIRC.Core.Session;
 /// </summary>
 public sealed class ServerSession : IAsyncDisposable
 {
+    private static int _liveInstanceCount;
     private static readonly HashSet<int> KnownNumerics =
     [
         1, 4, 5, 301, 307, 310, 311, 312, 313, 315, 317, 318, 319, 321, 322, 323, 324, 331, 332, 333,
@@ -91,6 +92,7 @@ public sealed class ServerSession : IAsyncDisposable
         _authenticationState = options.SaslPolicy == SaslAuthenticationPolicy.Disabled
             ? SaslAuthenticationState.Disabled
             : SaslAuthenticationState.WaitingForCapability;
+        Interlocked.Increment(ref _liveInstanceCount);
     }
 
     public event EventHandler<SessionStateChangedEvent>? StateChanged;
@@ -111,6 +113,12 @@ public sealed class ServerSession : IAsyncDisposable
     }
 
     public Task Completion => _runTask ?? Task.CompletedTask;
+
+    /// <summary>
+    /// Test and diagnostic visibility for session ownership. This is a count,
+    /// not an object registry, so observability cannot retain a session.
+    /// </summary>
+    public static int LiveInstanceCount => Volatile.Read(ref _liveInstanceCount);
 
     public int MaximumOutboundLineBytes => _options.MaximumOutboundLineBytes;
 
@@ -299,9 +307,16 @@ public sealed class ServerSession : IAsyncDisposable
 
     private async Task DisposeCoreAsync()
     {
-        await DisconnectAsync("nexIRC session disposed").ConfigureAwait(false);
-        _disposeCts.Cancel();
-        _disposeCts.Dispose();
+        try
+        {
+            await DisconnectAsync("nexIRC session disposed").ConfigureAwait(false);
+        }
+        finally
+        {
+            _disposeCts.Cancel();
+            _disposeCts.Dispose();
+            Interlocked.Decrement(ref _liveInstanceCount);
+        }
     }
 
     private Task StartRun(CancellationToken cancellationToken)

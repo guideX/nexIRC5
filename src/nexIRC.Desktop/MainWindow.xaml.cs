@@ -55,6 +55,8 @@ public partial class MainWindow : Window
 
     internal bool IsPresentationRenderingSubscribed => _renderingSubscribed;
 
+    internal bool IsPresentationTimingPending => _presentationTiming.HasPendingInteraction;
+
     internal Task WaitForClosedAsync() => _closed.Task;
 
     internal async Task CloseAfterSmokeAsync()

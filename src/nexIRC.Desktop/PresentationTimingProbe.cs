@@ -26,6 +26,17 @@ internal sealed class PresentationTimingProbe
         }
     }
 
+    internal bool HasPendingInteraction
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _pending is not null;
+            }
+        }
+    }
+
     public long BeginInteraction()
     {
         lock (_gate)
