@@ -69,6 +69,7 @@ public partial class App : System.Windows.Application
             credentials = new ProfileCredentialService(new InMemoryProfileCredentialStore());
             _demoHistoryRoot = Directory.CreateTempSubdirectory(liveSmoke ? "nexirc5-live-history-" : "nexirc5-demo-history-").FullName;
             logStore = new JsonlConversationLogStore(_demoHistoryRoot, maximumSegmentBytes: 32 * 1024);
+            await configuration.LoadAsync().ConfigureAwait(true);
         }
         else
         {

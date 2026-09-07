@@ -244,6 +244,9 @@ public interface IConversationLogStore : IAsyncDisposable
     ValueTask<IReadOnlyList<ConversationLogRecord>> ReadPageAsync(Guid scopeId, LogConversationKind kind, string conversationName, int pageSize = ConfigurationLimits.MaximumHistoryPageSize, DateTimeOffset? before = null, CancellationToken cancellationToken = default);
     ValueTask<HistoryPage> ReadPageWindowAsync(HistoryPageRequest request, CancellationToken cancellationToken = default);
     ValueTask<ConversationHistoryRange> ReadRangeAsync(HistoryExportRequest request, CancellationToken cancellationToken = default);
+    ValueTask<HistoryAnchorResult> FindByServerMessageIdAsync(HistoryServerMessageAnchorRequest request, CancellationToken cancellationToken = default);
+    ValueTask<HistoryAnchorResult> FindByTimestampAsync(HistoryTimestampAnchorRequest request, CancellationToken cancellationToken = default);
+    ValueTask<HistoryContextResult> ReadContextAroundAsync(HistoryContextRequest request, CancellationToken cancellationToken = default);
     ValueTask<IReadOnlyList<ConversationLogSearchResult>> SearchAsync(ConversationLogQuery query, CancellationToken cancellationToken = default);
     ValueTask<ConversationLogSearchPage> SearchDetailedAsync(ConversationLogQuery query, CancellationToken cancellationToken = default);
     ValueTask<int> CleanupAsync(DateTimeOffset olderThan, CancellationToken cancellationToken = default);
@@ -670,6 +673,237 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
 
         return new ConversationHistoryRange(ConversationHistoryOrdering.OrderAscending(
             ConversationHistoryMerge.DeduplicateExact(records)).ToArray(), truncated);
+    }
+
+    public async ValueTask<HistoryAnchorResult> FindByServerMessageIdAsync(
+        HistoryServerMessageAnchorRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var messageId = ConversationEntryIdentity.NormalizeServerMessageId(request.ServerMessageId);
+        if (messageId is null)
+        {
+            return HistoryAnchorResult.Missing;
+        }
+
+        await FlushAsync(cancellationToken).ConfigureAwait(false);
+        var locations = new List<HistoryAnchorLocation>();
+        foreach (var path in GetConversationPaths(request.Conversation.ScopeId, request.Conversation.EffectiveConversationKey))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var index = await GetHistoryIndexAsync(
+                path,
+                request.Conversation.ScopeId,
+                request.Conversation.ConversationKind,
+                request.Conversation.ConversationName,
+                request.Conversation.ConversationKey,
+                cancellationToken,
+                allowSmallFile: true).ConfigureAwait(false);
+            if (index is null)
+            {
+                continue;
+            }
+
+            var entries = index.Entries
+                .Where(entry => entry.NetworkId == request.Conversation.NetworkId
+                    && string.Equals(entry.ServerMessageId, messageId, StringComparison.Ordinal))
+                .ToArray();
+            if (entries.Length == 0)
+            {
+                continue;
+            }
+
+            var loaded = await ReadIndexedLocationsAsync(path, entries, request.Conversation, cancellationToken).ConfigureAwait(false);
+            if (loaded is not null)
+            {
+                locations.AddRange(loaded);
+            }
+        }
+
+        var anchor = locations
+            .OrderBy(item => item, Comparer<HistoryAnchorLocation>.Create(HistoryAnchorPolicy.Compare))
+            .FirstOrDefault();
+        return anchor is null
+            ? HistoryAnchorResult.Missing
+            : new HistoryAnchorResult(HistoryAnchorMatch.Exact, anchor);
+    }
+
+    public async ValueTask<HistoryAnchorResult> FindByTimestampAsync(
+        HistoryTimestampAnchorRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        await FlushAsync(cancellationToken).ConfigureAwait(false);
+        var candidates = await ReadIndexedAnchorCandidatesAsync(request.Conversation, cancellationToken).ConfigureAwait(false);
+        if (candidates is null)
+        {
+            return HistoryAnchorResult.Missing;
+        }
+
+        var selected = HistoryAnchorPolicy.SelectTimestamp(
+            candidates.Select(item => item.Location),
+            request.Timestamp,
+            request.Direction);
+        return await MaterializeAnchorResultAsync(selected, candidates, request.Conversation, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<HistoryContextResult> ReadContextAroundAsync(
+        HistoryContextRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var beforeCount = Math.Clamp(request.BeforeCount, 0, ConfigurationLimits.MaximumHistoryContextEntries);
+        var afterCount = Math.Clamp(request.AfterCount, 0, ConfigurationLimits.MaximumHistoryContextEntries);
+        HistoryAnchorResult anchor;
+        if (request.ServerMessageId is { Length: > 0 } messageId)
+        {
+            anchor = await FindByServerMessageIdAsync(new HistoryServerMessageAnchorRequest
+            {
+                Conversation = request.Conversation,
+                ServerMessageId = messageId
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        else if (request.Timestamp is { } timestamp)
+        {
+            anchor = await FindByTimestampAsync(new HistoryTimestampAnchorRequest
+            {
+                Conversation = request.Conversation,
+                Timestamp = timestamp,
+                Direction = request.TimestampDirection
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            return HistoryContextResult.Missing;
+        }
+
+        if (!anchor.Found || anchor.Anchor is null)
+        {
+            return new HistoryContextResult(anchor, Array.Empty<ConversationLogRecord>(), false);
+        }
+
+        var candidates = await ReadIndexedAnchorCandidatesAsync(request.Conversation, cancellationToken).ConfigureAwait(false);
+        if (candidates is null || candidates.Count > ConfigurationLimits.MaximumHistoryIndexEntries)
+        {
+            // The exact anchor remains useful to a caller, but a context
+            // window is deliberately not built from an unbounded aggregate.
+            return new HistoryContextResult(anchor, Array.Empty<ConversationLogRecord>(), false);
+        }
+
+        var ordered = candidates
+            .OrderBy(item => item.Location, Comparer<HistoryAnchorLocation>.Create(HistoryAnchorPolicy.Compare))
+            .ToArray();
+        var anchorIndex = Array.FindIndex(ordered, item =>
+            string.Equals(item.Location.SourcePath, anchor.Anchor.SourcePath, StringComparison.OrdinalIgnoreCase)
+            && item.Location.SourceOffset == anchor.Anchor.SourceOffset);
+        if (anchorIndex < 0)
+        {
+            return new HistoryContextResult(anchor, Array.Empty<ConversationLogRecord>(), false);
+        }
+
+        var first = Math.Max(0, anchorIndex - beforeCount);
+        var last = Math.Min(ordered.Length - 1, anchorIndex + afterCount);
+        var selected = ordered[first..(last + 1)];
+        var records = new List<ConversationLogRecord>(selected.Length);
+        foreach (var group in selected.GroupBy(item => item.Location.SourcePath, StringComparer.OrdinalIgnoreCase))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var entries = group.Select(item => item.Entry).ToArray();
+            var loaded = await ReadIndexedLocationsAsync(group.Key!, entries, request.Conversation, cancellationToken).ConfigureAwait(false);
+            if (loaded is not null)
+            {
+                records.AddRange(loaded.Select(item => item.Record));
+            }
+        }
+
+        var canonical = ConversationHistoryOrdering.OrderAscending(
+            ConversationHistoryMerge.DeduplicateExact(records)).ToArray();
+        return new HistoryContextResult(anchor, canonical, canonical.Length == selected.Length);
+    }
+
+    private async Task<HistoryAnchorResult> MaterializeAnchorResultAsync(
+        HistoryAnchorResult selected,
+        IReadOnlyList<IndexedAnchorCandidate> candidates,
+        HistoryConversationAddress address,
+        CancellationToken cancellationToken)
+    {
+        if (!selected.Found)
+        {
+            return selected;
+        }
+
+        var selectedLocations = new[] { selected.Anchor, selected.Before, selected.After }
+            .OfType<HistoryAnchorLocation>()
+            .DistinctBy(item => (item.SourcePath, item.SourceOffset))
+            .ToArray();
+        var materialized = new List<HistoryAnchorLocation>();
+        foreach (var group in selectedLocations.GroupBy(item => item.SourcePath, StringComparer.OrdinalIgnoreCase))
+        {
+            var entries = candidates
+                .Where(item => string.Equals(item.Location.SourcePath, group.Key, StringComparison.OrdinalIgnoreCase)
+                    && group.Any(selectedItem => selectedItem.SourceOffset == item.Location.SourceOffset))
+                .Select(item => item.Entry)
+                .ToArray();
+            var loaded = await ReadIndexedLocationsAsync(group.Key!, entries, address, cancellationToken).ConfigureAwait(false);
+            if (loaded is not null)
+            {
+                materialized.AddRange(loaded);
+            }
+        }
+
+        HistoryAnchorLocation? Resolve(HistoryAnchorLocation? location) => location is null
+            ? null
+            : materialized.FirstOrDefault(item =>
+                string.Equals(item.SourcePath, location.SourcePath, StringComparison.OrdinalIgnoreCase)
+                && item.SourceOffset == location.SourceOffset);
+
+        var resolvedAnchor = Resolve(selected.Anchor);
+        return resolvedAnchor is null
+            ? HistoryAnchorResult.Missing
+            : selected with { Anchor = resolvedAnchor, Before = Resolve(selected.Before), After = Resolve(selected.After) };
+    }
+
+    private async Task<List<IndexedAnchorCandidate>?> ReadIndexedAnchorCandidatesAsync(
+        HistoryConversationAddress address,
+        CancellationToken cancellationToken)
+    {
+        var candidates = new List<IndexedAnchorCandidate>();
+        foreach (var path in GetConversationPaths(address.ScopeId, address.EffectiveConversationKey))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var index = await GetHistoryIndexAsync(
+                path,
+                address.ScopeId,
+                address.ConversationKind,
+                address.ConversationName,
+                address.ConversationKey,
+                cancellationToken,
+                allowSmallFile: true).ConfigureAwait(false);
+            if (index is null)
+            {
+                return null;
+            }
+
+            foreach (var entry in index.Entries.Where(item => item.NetworkId == address.NetworkId))
+            {
+                var synthetic = new ConversationLogRecord
+                {
+                    Timestamp = new DateTimeOffset(entry.TimestampTicks, TimeSpan.Zero),
+                    NetworkId = entry.NetworkId,
+                    ScopeId = address.ScopeId,
+                    ConversationKind = address.ConversationKind,
+                    ConversationName = address.ConversationName,
+                    ConversationKey = address.EffectiveConversationKey,
+                    ServerMessageId = entry.ServerMessageId,
+                    DurableSequence = entry.DurableSequence
+                };
+                candidates.Add(new IndexedAnchorCandidate(
+                    new HistoryAnchorLocation(synthetic, entry.Offset, entry.Length) { SourcePath = path },
+                    entry));
+            }
+        }
+
+        return candidates;
     }
 
     private async Task<HistoryPage?> ReadPageByScanAsync(
@@ -1806,13 +2040,14 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         LogConversationKind conversationKind,
         string conversationName,
         string? conversationKey,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool allowSmallFile = false)
     {
         try
         {
             var sourceInfo = new FileInfo(path);
             if (!sourceInfo.Exists
-                || sourceInfo.Length < ConfigurationLimits.MinimumHistoryIndexFileBytes
+                || !allowSmallFile && sourceInfo.Length < ConfigurationLimits.MinimumHistoryIndexFileBytes
                 || sourceInfo.Length > ConfigurationLimits.MaximumHistoryFileBytes)
             {
                 return null;
@@ -1836,7 +2071,8 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                 conversationName,
                 conversationKey,
                 _maximumRecordBytes,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                allowSmallFile).ConfigureAwait(false);
             if (index is not null)
             {
                 lock (_historyIndexGate)
@@ -1902,11 +2138,58 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         }
     }
 
+    private static async Task<List<HistoryAnchorLocation>?> ReadIndexedLocationsAsync(
+        string path,
+        IEnumerable<JsonlHistoryIndexEntry> selected,
+        HistoryConversationAddress address,
+        CancellationToken cancellationToken)
+    {
+        var entries = selected.ToArray();
+        if (entries.Length == 0)
+        {
+            return [];
+        }
+
+        try
+        {
+            await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 64 * 1024, FileOptions.Asynchronous | FileOptions.RandomAccess);
+            var locations = new List<HistoryAnchorLocation>(entries.Length);
+            foreach (var entry in entries.OrderBy(item => item.Offset))
+            {
+                var bytes = new byte[entry.Length];
+                stream.Position = entry.Offset;
+                await stream.ReadExactlyAsync(bytes, cancellationToken).ConfigureAwait(false);
+                var record = JsonSerializer.Deserialize<ConversationLogRecord>(bytes, JsonOptions);
+                if (!ConversationLogRecordValidation.IsReadable(record)
+                    || record!.Text.Length > ConfigurationLimits.MaximumLogRecordBytes
+                    || !HistoryAnchorPolicy.IsAddressMatch(record, address)
+                    || record.Timestamp.UtcTicks != entry.TimestampTicks
+                    || !string.Equals(
+                        ConversationEntryIdentity.NormalizeServerMessageId(record.ServerMessageId),
+                        entry.ServerMessageId,
+                        StringComparison.Ordinal))
+                {
+                    return null;
+                }
+
+                locations.Add(new HistoryAnchorLocation(record, entry.Offset, entry.Length) { SourcePath = path });
+            }
+
+            return locations;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return null;
+        }
+    }
+
     private static long Distance(long left, long right)
     {
         var difference = left - right;
         return difference == long.MinValue ? long.MaxValue : Math.Abs(difference);
     }
+
+    private sealed record IndexedAnchorCandidate(HistoryAnchorLocation Location, JsonlHistoryIndexEntry Entry);
 
     private void InvalidateHistoryIndex(string path)
     {
@@ -2144,6 +2427,99 @@ public sealed class InMemoryConversationLogStore : IConversationLogStore
                 .OrderBy(record => record, Comparer<ConversationLogRecord>.Create(ConversationHistoryOrdering.Compare))
                 .ToArray();
             return ValueTask.FromResult(new ConversationHistoryRange(matching.Take(maximum).ToArray(), matching.Length > maximum));
+        }
+    }
+
+    public ValueTask<HistoryAnchorResult> FindByServerMessageIdAsync(
+        HistoryServerMessageAnchorRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+        var messageId = ConversationEntryIdentity.NormalizeServerMessageId(request.ServerMessageId);
+        if (messageId is null)
+        {
+            return ValueTask.FromResult(HistoryAnchorResult.Missing);
+        }
+
+        var locations = SnapshotLocations(request.Conversation)
+            .Where(item => string.Equals(item.Record.ServerMessageId, messageId, StringComparison.Ordinal))
+            .OrderBy(item => item, Comparer<HistoryAnchorLocation>.Create(HistoryAnchorPolicy.Compare))
+            .ToArray();
+        return ValueTask.FromResult(locations.Length == 0
+            ? HistoryAnchorResult.Missing
+            : new HistoryAnchorResult(HistoryAnchorMatch.Exact, locations[0]));
+    }
+
+    public ValueTask<HistoryAnchorResult> FindByTimestampAsync(
+        HistoryTimestampAnchorRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.FromResult(HistoryAnchorPolicy.SelectTimestamp(
+            SnapshotLocations(request.Conversation),
+            request.Timestamp,
+            request.Direction));
+    }
+
+    public async ValueTask<HistoryContextResult> ReadContextAroundAsync(
+        HistoryContextRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+        var locations = SnapshotLocations(request.Conversation)
+            .OrderBy(item => item, Comparer<HistoryAnchorLocation>.Create(HistoryAnchorPolicy.Compare))
+            .ToArray();
+        HistoryAnchorResult anchor;
+        if (request.ServerMessageId is { Length: > 0 } messageId)
+        {
+            var normalized = ConversationEntryIdentity.NormalizeServerMessageId(messageId);
+            var exact = locations.FirstOrDefault(item => string.Equals(item.Record.ServerMessageId, normalized, StringComparison.Ordinal));
+            anchor = exact is null
+                ? HistoryAnchorResult.Missing
+                : new HistoryAnchorResult(HistoryAnchorMatch.Exact, exact);
+        }
+        else if (request.Timestamp is { } timestamp)
+        {
+            anchor = HistoryAnchorPolicy.SelectTimestamp(locations, timestamp, request.TimestampDirection);
+        }
+        else
+        {
+            return HistoryContextResult.Missing;
+        }
+
+        if (!anchor.Found || anchor.Anchor is null)
+        {
+            return new HistoryContextResult(anchor, Array.Empty<ConversationLogRecord>(), false);
+        }
+
+        var anchorIndex = Array.FindIndex(locations, item => item.SourceOffset == anchor.Anchor.SourceOffset);
+        if (anchorIndex < 0)
+        {
+            return new HistoryContextResult(anchor, Array.Empty<ConversationLogRecord>(), false);
+        }
+
+        var before = Math.Clamp(request.BeforeCount, 0, ConfigurationLimits.MaximumHistoryContextEntries);
+        var after = Math.Clamp(request.AfterCount, 0, ConfigurationLimits.MaximumHistoryContextEntries);
+        var first = Math.Max(0, anchorIndex - before);
+        var last = Math.Min(locations.Length - 1, anchorIndex + after);
+        var records = locations[first..(last + 1)]
+            .Select(item => item.Record)
+            .ToArray();
+        return await Task.FromResult(new HistoryContextResult(anchor, records, true)).ConfigureAwait(false);
+    }
+
+    private HistoryAnchorLocation[] SnapshotLocations(HistoryConversationAddress address)
+    {
+        lock (_gate)
+        {
+            return _records
+                .Select((record, index) => (record, index))
+                .Where(item => HistoryAnchorPolicy.IsAddressMatch(item.record, address))
+                .Select(item => new HistoryAnchorLocation(item.record, item.index, 0) { SourcePath = "memory" })
+                .ToArray();
         }
     }
 

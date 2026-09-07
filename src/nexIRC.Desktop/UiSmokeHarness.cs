@@ -30,6 +30,7 @@ internal static class UiSmokeHarness
         "ircv3-metadata",
         "chathistory",
         "history-discovery",
+        "history-identity",
         "contextual-actions",
         "sustained-interactivity",
         "close-idle",
@@ -107,6 +108,9 @@ internal static class UiSmokeHarness
                 break;
             case "history-discovery":
                 await HistoryDiscoveryAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "history-identity":
+                await HistoryIdentityAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
             case "contextual-actions":
                 await ContextualActionsAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -356,6 +360,103 @@ internal static class UiSmokeHarness
         Require(network.Queries.Count == 2 && network.Queries.Count(query => query.Nickname == "Alice") == 1, "TARGETS/recovery created a duplicate known query");
         Require(knownQuery.Nickname == "Alice" && knownQuery.EntriesSnapshot.Any(entry => entry.Text == "live after reconnect"), "live query traffic did not reuse the known query");
         Console.WriteLine($"HISTORY_DISCOVERY_UI_METRICS messages=40 state_events=10 playback_ms={playbackStart.Elapsed.TotalMilliseconds:F3} queries={network.Queries.Count} recovered_bob={network.Queries.Single(query => query.Nickname == "Bob").RecoveredHistoryCount} members_unchanged=true current_topic_unchanged=true current_modes_unchanged=true");
+    }
+
+    private static async Task HistoryIdentityAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var sessions = window.ViewModel.Sessions;
+        var query = sessions.EnsureQuery(network.Id, "Alice");
+        window.ViewModel.SelectView(network.StatusView);
+        demo.AlphaTransport.EnqueueInboundLine("@account=alice-account;msgid=identity-1;time=2026-09-07T11:58:00.000Z :Alice!u@alpha PRIVMSG nexAlpha :identity one");
+        demo.AlphaTransport.EnqueueInboundLine("@account=alice-account;msgid=identity-2;time=2026-09-07T11:59:00.000Z :Alice!u@alpha PRIVMSG nexAlpha :identity two");
+        demo.AlphaTransport.EnqueueInboundLine("@account=alice-account;msgid=identity-3;time=2026-09-07T12:00:00.000Z :Alice!u@alpha PRIVMSG nexAlpha :identity three");
+        await WaitForAsync(sessions, () => query.EntryCount == 3 && query.IdentityEvidence.HasAccount("alice-account"), "live account evidence did not arrive").ConfigureAwait(true);
+
+        var reconnectGeneration = network.Snapshot.ConnectionGeneration;
+        var replacement = demo.AddAlphaReconnectTransport();
+        demo.AlphaTransport.EnqueueRemoteDisconnect();
+        await WaitForAsync(sessions, () => replacement.ConnectCount == 1 && !query.IsIdentityBoundToCurrentSession, "identity smoke reconnect did not cross the generation boundary").ConfigureAwait(true);
+        demo.EnqueuePhase1YRegistration(replacement);
+        await WaitForAsync(sessions, () => network.Snapshot.ConnectionGeneration > reconnectGeneration && network.State == NetworkDisplayState.Registered, "identity smoke reconnect did not register").ConfigureAwait(true);
+
+        replacement.EnqueueInboundLine("@account=alice-account;msgid=identity-4;time=2026-09-07T12:01:00.000Z :Alicia!u@alpha PRIVMSG nexAlpha :same account after reconnect");
+        await WaitForAsync(sessions, () => query.Nickname == "Alicia" && network.Queries.Count == 1 && query.EntryCount == 4, "strong account evidence did not reuse the query after reconnect").ConfigureAwait(true);
+
+        replacement.EnqueueInboundLine("@account=other-account;msgid=identity-5;time=2026-09-07T12:02:00.000Z :Alice!other@alpha PRIVMSG nexAlpha :conflicting account");
+        await WaitForAsync(sessions, () => network.Queries.Count == 2 && network.Queries.Any(item => item.EntryCount == 1), "conflicting account was incorrectly merged").ConfigureAwait(true);
+        var conflicting = network.Queries.Single(item => !ReferenceEquals(item, query));
+        Require(conflicting.IdentityEvidence.HasAccount("other-account"), "conflicting account evidence was not retained on the safe duplicate");
+
+        await sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+        await sessions.LogStore!.FlushAsync().ConfigureAwait(true);
+        var selected = query.EntriesSnapshot.Single(item => item.ServerMessageId == "identity-2");
+        var contextResult = await sessions.LoadContextAroundAsync(network, query, selected).ConfigureAwait(true);
+        Require(contextResult.Succeeded, "local context around the selected msgid was not loaded");
+        Require(query.HistoryContext.Select(item => item.Record.ServerMessageId).SequenceEqual(["identity-1", "identity-2", "identity-3", "identity-4"]), "local msgid context was not canonical or bounded");
+        var unread = query.UnreadCount;
+
+        var channel = RequiredChannel(network);
+        await WaitForPollingAsync(
+            () => !network.Session.GetChathistoryState(ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, channel.Channel)).RequestActive
+                && !network.Session.GetChathistoryState(query.HistoryConversationKey).RequestActive,
+            "automatic reconnect history requests did not drain").ConfigureAwait(true);
+        var members = channel.MembersSnapshot.Select(member => member.Nickname).OrderBy(item => item, StringComparer.Ordinal).ToArray();
+        var topic = channel.Topic;
+        await WaitForPollingAsync(
+            () => replacement.OutboundLines.Any(line => line.StartsWith("CHATHISTORY TARGETS timestamp=", StringComparison.Ordinal)),
+            "identity smoke discovery request was not sent").ConfigureAwait(true);
+        replacement.EnqueueInboundLine(":alpha.server BATCH +identity-targets draft/chathistory-targets");
+        replacement.EnqueueInboundLine(":alpha.server BATCH -identity-targets");
+        await Task.Delay(25).ConfigureAwait(true);
+        var pending = network.Session.RequestHistoryAsync(new nexIRC.Core.Protocol.ChathistoryRequest
+        {
+            NetworkId = network.Id,
+            ConnectionGeneration = network.Snapshot.ConnectionGeneration,
+            Conversation = "Channel:#general",
+            Target = "#general",
+            Operation = nexIRC.Core.Protocol.ChathistoryOperation.Around,
+            Reference = nexIRC.Core.Protocol.ChathistoryReference.MessageId("identity-remote-anchor"),
+            Limit = 12,
+            Purpose = nexIRC.Core.Protocol.ChathistoryRequestPurpose.LoadContext
+        }).AsTask();
+        await WaitForPollingAsync(() => replacement.OutboundLines.Any(line => line.StartsWith("CHATHISTORY AROUND #general", StringComparison.Ordinal)), "identity firewall history request was not sent").ConfigureAwait(true);
+        replacement.EnqueueInboundLine(":alpha.server BATCH +identity-history chathistory #general");
+        replacement.EnqueueInboundLine("@batch=identity-history;msgid=identity-historical-join;time=2026-09-07T10:00:00.000Z :Historical!u@history JOIN #general");
+        replacement.EnqueueInboundLine("@batch=identity-history;msgid=identity-historical-account;time=2026-09-07T10:00:01.000Z :Alicia!u@history ACCOUNT historical-account");
+        replacement.EnqueueInboundLine("@batch=identity-history;msgid=identity-historical-nick;time=2026-09-07T10:00:02.000Z :Alicia!u@history NICK HistoricalAlicia");
+        replacement.EnqueueInboundLine("@batch=identity-history;msgid=identity-historical-message;time=2026-09-07T10:00:03.000Z :Historical!u@history PRIVMSG #general :historical context");
+        replacement.EnqueueInboundLine(":alpha.server BATCH -identity-history");
+        var history = await pending.ConfigureAwait(true);
+        await sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+
+        var queryHistory = network.Session.RequestHistoryAsync(new nexIRC.Core.Protocol.ChathistoryRequest
+        {
+            NetworkId = network.Id,
+            ConnectionGeneration = network.Snapshot.ConnectionGeneration,
+            Conversation = query.HistoryConversationKey,
+            Target = "Alicia",
+            Operation = nexIRC.Core.Protocol.ChathistoryOperation.Around,
+            Reference = nexIRC.Core.Protocol.ChathistoryReference.MessageId("identity-query-anchor"),
+            Limit = 8,
+            Purpose = nexIRC.Core.Protocol.ChathistoryRequestPurpose.LoadContext
+        }).AsTask();
+        await WaitForPollingAsync(() => replacement.OutboundLines.Any(line => line.StartsWith("CHATHISTORY AROUND Alicia", StringComparison.Ordinal)), "historical query identity request was not sent").ConfigureAwait(true);
+        replacement.EnqueueInboundLine(":alpha.server BATCH +identity-query-history chathistory Alicia");
+        replacement.EnqueueInboundLine("@batch=identity-query-history;msgid=identity-query-account;time=2026-09-07T10:00:01.000Z :Alicia!u@history ACCOUNT historical-account");
+        replacement.EnqueueInboundLine("@batch=identity-query-history;msgid=identity-query-nick;time=2026-09-07T10:00:02.000Z :Alicia!u@history NICK HistoricalAlicia");
+        replacement.EnqueueInboundLine("@batch=identity-query-history;msgid=identity-query-message;time=2026-09-07T10:00:03.000Z :Historical!u@history PRIVMSG Alicia :historical query context");
+        replacement.EnqueueInboundLine(":alpha.server BATCH -identity-query-history");
+        var queryHistoryResult = await queryHistory.ConfigureAwait(true);
+        await sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+
+        Require(history.Succeeded, "identity firewall history playback did not complete");
+        Require(queryHistoryResult.Succeeded, "historical query identity playback did not complete");
+        Require(Enumerable.SequenceEqual(members, channel.MembersSnapshot.Select(member => member.Nickname).OrderBy(item => item, StringComparer.Ordinal)), "historical JOIN changed current members");
+        Require(channel.Topic == topic, "historical playback changed current topic");
+        Require(query.Nickname == "Alicia" && query.IdentityEvidence.HasAccount("alice-account"), "historical identity evidence rewrote current query identity");
+        Require(query.HistoricalIdentityEvidence.HasAccount("historical-account"), "historical account evidence was not retained as provenance");
+        Require(query.UnreadCount == unread, "historical identity playback changed unread state");
+        Console.WriteLine($"HISTORY_IDENTITY_UI_METRICS queries={network.Queries.Count} context={query.HistoryContext.Count} account_reuse=true conflict_separate=true historical_firewall=true unread_unchanged=true");
     }
 
     private static async Task ModerationAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)

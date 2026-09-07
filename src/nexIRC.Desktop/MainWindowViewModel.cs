@@ -546,17 +546,36 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             SelectView(view);
             if (Sessions.LogStore is { } store)
             {
-                var page = await store.ReadPageWindowAsync(new HistoryPageRequest
+                var address = new HistoryConversationAddress
                 {
+                    NetworkId = result.NetworkId,
                     ScopeId = result.Location.ScopeId,
                     ConversationKind = result.ConversationKind,
                     ConversationName = result.ConversationName,
-                    ConversationKey = result.Location.ConversationKey,
-                    PageSize = ConfigurationLimits.MaximumHistoryContextEntries,
-                    Around = result.Timestamp
-                }, cancellationToken).ConfigureAwait(true);
+                    ConversationKey = result.Location.ConversationKey
+                };
+                var anchored = result.Record.ServerMessageId is { Length: > 0 }
+                    ? await store.ReadContextAroundAsync(new HistoryContextRequest
+                    {
+                        Conversation = address,
+                        ServerMessageId = result.Record.ServerMessageId,
+                        BeforeCount = ConfigurationLimits.MaximumHistoryContextEntries / 2,
+                        AfterCount = ConfigurationLimits.MaximumHistoryContextEntries / 2
+                    }, cancellationToken).ConfigureAwait(true)
+                    : HistoryContextResult.Missing;
+                var records = anchored.Anchor.Found && anchored.IsCompleteLocally
+                    ? anchored.Records
+                    : (await store.ReadPageWindowAsync(new HistoryPageRequest
+                    {
+                        ScopeId = result.Location.ScopeId,
+                        ConversationKind = result.ConversationKind,
+                        ConversationName = result.ConversationName,
+                        ConversationKey = result.Location.ConversationKey,
+                        PageSize = ConfigurationLimits.MaximumHistoryContextEntries,
+                        Around = result.Timestamp
+                    }, cancellationToken).ConfigureAwait(true)).Records;
                 view.SetHistoryContext(
-                    page.Records.Select(record => new HistoryContextEntry(record, IsSameHistoryRecord(record, result))),
+                    records.Select(record => new HistoryContextEntry(record, IsSameHistoryRecord(record, result))),
                     result.Preview);
             }
             else

@@ -1187,12 +1187,17 @@ public sealed class ChannelView : WorkspaceView
 public sealed class QueryView : WorkspaceView
 {
     private string _nickname;
+    private readonly ConversationIdentityEvidenceLedger _identityEvidence;
+    private readonly ConversationIdentityEvidenceLedger _historicalIdentityEvidence;
 
-    internal QueryView(Guid networkId, Guid id, string nickname)
+    internal QueryView(Guid networkId, Guid id, string nickname, string? historyConversationKey = null)
         : base(networkId, id, WorkspaceViewKind.Query, nickname)
     {
         _nickname = nickname;
-        HistoryConversationKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.PrivateConversation, nickname);
+        _identityEvidence = new ConversationIdentityEvidenceLedger(networkId);
+        _historicalIdentityEvidence = new ConversationIdentityEvidenceLedger(networkId);
+        HistoryConversationKey = historyConversationKey
+            ?? ConversationLoggingService.BuildConversationKey(LogConversationKind.PrivateConversation, nickname);
     }
 
     public string Nickname => _nickname;
@@ -1214,6 +1219,46 @@ public sealed class QueryView : WorkspaceView
     /// a historical nickname by itself never clears an identity boundary.
     /// </summary>
     public bool CanReuseAfterReconnect { get; private set; }
+
+    public ConversationIdentityEvidenceSnapshot IdentityEvidence => _identityEvidence.Snapshot();
+
+    public ConversationIdentityEvidenceSnapshot HistoricalIdentityEvidence => _historicalIdentityEvidence.Snapshot();
+
+    internal void ObserveIdentityEvidence(ConversationIdentityEvidence evidence)
+    {
+        if (evidence.IsHistorical)
+        {
+            _historicalIdentityEvidence.Observe(evidence);
+        }
+        else
+        {
+            _identityEvidence.Observe(evidence);
+        }
+    }
+
+    internal bool HasAccountEvidence(string account) => IdentityEvidence.HasAccount(account);
+
+    internal bool HasObservedNickname(string nickname, IrcCaseMapping mapping) =>
+        IdentityEvidence.Nicknames.Any(item => IrcCaseMappingComparer.Equals(item, nickname, mapping));
+
+    internal bool HasConflictingAccountEvidence => IdentityEvidence.HasConflictingAccounts;
+
+    internal bool RebindNicknameFromStrongAccount(string nickname, IrcCaseMapping mapping, int connectionGeneration)
+    {
+        if (string.IsNullOrWhiteSpace(nickname)
+            || IrcCaseMappingComparer.Equals(Nickname, nickname, mapping))
+        {
+            return false;
+        }
+
+        _nickname = nickname;
+        SetTitle(nickname);
+        IdentityConnectionGeneration = connectionGeneration;
+        IsIdentityBoundToCurrentSession = true;
+        CanReuseAfterReconnect = false;
+        OnPropertyChanged(nameof(Nickname));
+        return true;
+    }
 
     internal bool CanApplyNicknameChange(string previousNickname, string newNickname, IrcCaseMapping mapping) =>
         IrcCaseMappingComparer.Equals(Nickname, previousNickname, mapping)
@@ -1435,12 +1480,14 @@ public sealed class NetworkWorkspace : ObservableObject
         return view;
     }
 
-    internal QueryView EnsureQuery(string nickname, bool reopen = true, bool includeUnboundIdentity = true)
+    internal QueryView EnsureQuery(string nickname, bool reopen = true, bool includeUnboundIdentity = true, bool forceNew = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
-        var existing = Queries.FirstOrDefault(item =>
-            (includeUnboundIdentity || item.IsIdentityBoundToCurrentSession)
-            && IrcCaseMappingComparer.Equals(item.Nickname, nickname, _snapshot.Features.CaseMapping));
+        var existing = forceNew
+            ? null
+            : Queries.FirstOrDefault(item =>
+                (includeUnboundIdentity || item.IsIdentityBoundToCurrentSession)
+                && IrcCaseMappingComparer.Equals(item.Nickname, nickname, _snapshot.Features.CaseMapping));
         if (existing is not null)
         {
             if (reopen)
@@ -1451,7 +1498,11 @@ public sealed class NetworkWorkspace : ObservableObject
             return existing;
         }
 
-        var view = new QueryView(Id, Guid.NewGuid(), nickname);
+        var viewId = Guid.NewGuid();
+        var historyKey = forceNew
+            ? $"{ConversationLoggingService.BuildConversationKey(LogConversationKind.PrivateConversation, nickname)}:isolated-{viewId:N}"
+            : null;
+        var view = new QueryView(Id, viewId, nickname, historyKey);
         view.MarkCurrentSessionIdentity(_snapshot.ConnectionGeneration);
         view.ApplyConnectionState(_snapshot.State is not (ServerSessionState.Disconnected or ServerSessionState.Failed or ServerSessionState.ReconnectWaiting));
         Queries.Add(view);
@@ -1459,20 +1510,108 @@ public sealed class NetworkWorkspace : ObservableObject
         return view;
     }
 
-    internal QueryView EnsureIncomingQuery(string nickname)
+    internal QueryView EnsureIncomingQuery(string nickname, string? account = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
-        var existing = Queries.FirstOrDefault(item =>
-            IrcCaseMappingComparer.Equals(item.Nickname, nickname, _snapshot.Features.CaseMapping)
-            && (item.IsIdentityBoundToCurrentSession || item.CanReuseAfterReconnect));
-        if (existing is not null)
+        var mapping = _snapshot.Features.CaseMapping;
+        var nicknameMatches = Queries
+            .Where(item => IrcCaseMappingComparer.Equals(item.Nickname, nickname, mapping))
+            .ToArray();
+        var observedNicknameMatches = Queries
+            .Where(item => item.HasObservedNickname(nickname, mapping))
+            .ToArray();
+        var normalizedAccount = ConversationIdentityEvidence.NormalizeAccount(account);
+        if (normalizedAccount is not null)
         {
+            var accountMatches = Queries.Where(item => item.HasAccountEvidence(normalizedAccount)).ToArray();
+            if (accountMatches.Length == 1)
+            {
+                var accountMatch = accountMatches[0];
+                if (accountMatch.HasConflictingAccountEvidence)
+                {
+                    return EnsureQuery(nickname, reopen: true, includeUnboundIdentity: false, forceNew: true);
+                }
+
+                accountMatch.RebindNicknameFromStrongAccount(nickname, mapping, _snapshot.ConnectionGeneration);
+                accountMatch.MarkCurrentSessionIdentity(_snapshot.ConnectionGeneration);
+                accountMatch.ObserveIdentityEvidence(new ConversationIdentityEvidence(
+                    Id,
+                    nickname,
+                    normalizedAccount,
+                    null,
+                    null,
+                    _snapshot.ConnectionGeneration,
+                    DateTimeOffset.UtcNow,
+                    IdentityEvidenceSource.LiveAccountTag));
+                ReopenView(accountMatch);
+                return accountMatch;
+            }
+
+            if (accountMatches.Length > 1
+                || observedNicknameMatches.Any(item => item.HasConflictingAccountEvidence
+                    || item.IdentityEvidence.Accounts.Count > 0
+                        && !item.HasAccountEvidence(normalizedAccount)))
+            {
+                return EnsureQuery(nickname, reopen: true, includeUnboundIdentity: false, forceNew: true);
+            }
+        }
+
+        var currentMatches = nicknameMatches
+            .Where(item => item.IsIdentityBoundToCurrentSession || item.CanReuseAfterReconnect)
+            .ToArray();
+        if (currentMatches.Length == 1)
+        {
+            var existing = currentMatches[0];
             existing.MarkCurrentSessionIdentity(_snapshot.ConnectionGeneration);
+            existing.ObserveIdentityEvidence(new ConversationIdentityEvidence(
+                Id,
+                nickname,
+                normalizedAccount,
+                null,
+                null,
+                _snapshot.ConnectionGeneration,
+                DateTimeOffset.UtcNow,
+                normalizedAccount is null ? IdentityEvidenceSource.LivePrefix : IdentityEvidenceSource.LiveAccountTag));
             ReopenView(existing);
             return existing;
         }
 
+        if (currentMatches.Length > 1)
+        {
+            return EnsureQuery(nickname, reopen: true, includeUnboundIdentity: false, forceNew: true);
+        }
+
+        if (observedNicknameMatches.Length > 0)
+        {
+            return EnsureQuery(nickname, reopen: true, includeUnboundIdentity: false, forceNew: true);
+        }
+
         return EnsureQuery(nickname, reopen: true, includeUnboundIdentity: false);
+    }
+
+    internal QueryView EnsureRecoveredQuery(string nickname)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
+        var existing = Queries.FirstOrDefault(item =>
+            IrcCaseMappingComparer.Equals(item.Nickname, nickname, _snapshot.Features.CaseMapping)
+            && !item.IsIdentityBoundToCurrentSession);
+        if (existing is not null)
+        {
+            ReopenView(existing);
+            return existing;
+        }
+
+        var view = new QueryView(Id, Guid.NewGuid(), nickname);
+        view.MarkIdentityBoundary(_snapshot.ConnectionGeneration);
+        Queries.Add(view);
+        InsertView(view);
+        return view;
+    }
+
+    internal QueryView? FindQueryByAccount(string account)
+    {
+        var matches = Queries.Where(item => item.HasAccountEvidence(account)).Take(2).ToArray();
+        return matches.Length == 1 ? matches[0] : null;
     }
 
     internal QueryView? FindQueryByHistoryKey(string historyKey) =>
@@ -1480,6 +1619,11 @@ public sealed class NetworkWorkspace : ObservableObject
 
     internal QueryView? FindQuery(string nickname) =>
         Queries.FirstOrDefault(item => IrcCaseMappingComparer.Equals(item.Nickname, nickname, _snapshot.Features.CaseMapping));
+
+    internal int CountQueryCandidates(string nickname) =>
+        Queries.Count(item =>
+            IrcCaseMappingComparer.Equals(item.Nickname, nickname, _snapshot.Features.CaseMapping)
+            && (item.IsIdentityBoundToCurrentSession || item.CanReuseAfterReconnect));
 
     internal WhoisView EnsureWhois(string nickname, bool beginRequest = false, bool forceNew = false)
     {

@@ -260,12 +260,13 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         if (network.Id != view.NetworkId
             || network.Snapshot.Registration != RegistrationState.Registered
             || view is not (ChannelView or QueryView)
-            || !network.Session.ChathistorySupport.IsUsable)
+            || _logStore is null && !network.Session.ChathistorySupport.IsUsable)
         {
             return false;
         }
 
-        return SelectHistoryReference(network.Session.ChathistorySupport, anchor.ServerMessageId, anchor.Timestamp, anchor.TimestampSource) is not null;
+        return _logStore is not null
+            || SelectHistoryReference(network.Session.ChathistorySupport, anchor.ServerMessageId, anchor.Timestamp, anchor.TimestampSource) is not null;
     }
 
     public async ValueTask<CommandDispatchResult> LoadContextAroundAsync(
@@ -279,7 +280,41 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             return CommandDispatchResult.Failure("Context history is unavailable for this message.", view);
         }
 
-        var reference = SelectHistoryReference(network.Session.ChathistorySupport, anchor.ServerMessageId, anchor.Timestamp, anchor.TimestampSource)!;
+        if (_logStore is not null)
+        {
+            var local = await _logStore.ReadContextAroundAsync(new HistoryContextRequest
+            {
+                Conversation = HistoryAddress(network, view),
+                ServerMessageId = anchor.ServerMessageId,
+                Timestamp = anchor.Timestamp,
+                TimestampDirection = HistoryAnchorDirection.Around,
+                BeforeCount = ConfigurationLimits.MaximumHistoryContextEntries / 2,
+                AfterCount = ConfigurationLimits.MaximumHistoryContextEntries / 2
+            }, cancellationToken).ConfigureAwait(false);
+            if (local.Anchor.Found && local.IsCompleteLocally && local.Records.Count > 0)
+            {
+                await InvokeOnDispatcherAsync(
+                    () =>
+                    {
+                        view.SetHistoryContext(
+                            local.Records.Select(record => new HistoryContextEntry(
+                                record,
+                                anchor.ServerMessageId is not null
+                                    ? string.Equals(record.ServerMessageId, anchor.ServerMessageId, StringComparison.Ordinal)
+                                    : record.Timestamp == anchor.Timestamp)),
+                            anchor.ServerMessageId ?? anchor.Timestamp.ToString("O"));
+                        return true;
+                    },
+                    WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
+                return CommandDispatchResult.Success($"Loaded local context around {anchor.Timestamp:O}.", view);
+            }
+        }
+
+        var reference = SelectHistoryReference(network.Session.ChathistorySupport, anchor.ServerMessageId, anchor.Timestamp, anchor.TimestampSource);
+        if (reference is null)
+        {
+            return CommandDispatchResult.Failure("Local context was not found and the server has no supported history reference.", view);
+        }
         var request = new ChathistoryRequest
         {
             NetworkId = network.Id,
@@ -422,6 +457,27 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     {
         QueryView query => query.HistoryConversationKey,
         ChannelView channel => ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, channel.Channel),
+        _ => throw new ArgumentException("History is available only for channels and queries.", nameof(view))
+    };
+
+    private static HistoryConversationAddress HistoryAddress(NetworkWorkspace network, WorkspaceView view) => view switch
+    {
+        QueryView query => new HistoryConversationAddress
+        {
+            NetworkId = network.Id,
+            ScopeId = network.ProfileId ?? network.Id,
+            ConversationKind = LogConversationKind.PrivateConversation,
+            ConversationName = query.Nickname,
+            ConversationKey = query.HistoryConversationKey
+        },
+        ChannelView channel => new HistoryConversationAddress
+        {
+            NetworkId = network.Id,
+            ScopeId = network.ProfileId ?? network.Id,
+            ConversationKind = LogConversationKind.Channel,
+            ConversationName = channel.Channel,
+            ConversationKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, channel.Channel)
+        },
         _ => throw new ArgumentException("History is available only for channels and queries.", nameof(view))
     };
 
@@ -2494,11 +2550,25 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                                 var knownQuery = matchingBoundary is not null
                                     ? entry.Workspace.FindQueryByHistoryKey(matchingBoundary.Conversation)
                                     : null;
-                                return (KnownQuery: knownQuery, ExistingByTarget: entry.Workspace.FindQuery(target.Target));
+                                return (
+                                    KnownQuery: knownQuery,
+                                    ExistingByTarget: entry.Workspace.FindQuery(target.Target),
+                                    CandidateCount: entry.Workspace.CountQueryCandidates(target.Target));
                             },
                             WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
                         var query = queryViews.KnownQuery;
                         var existingByTarget = queryViews.ExistingByTarget;
+                        var account = existingByTarget?.IdentityEvidence.Accounts.FirstOrDefault();
+                        var identityMatch = query is null || account is null
+                            ? IdentityEvidenceMatch.NoMatch
+                            : ConversationIdentityEvidencePolicy.Assess(
+                                entry.Workspace.Id,
+                                target.Target,
+                                account,
+                                query.IdentityEvidence,
+                                session.Snapshot.Features.CaseMapping,
+                                existingByTarget is not null && existingByTarget.IsIdentityBoundToCurrentSession,
+                                matchingBoundary is not null);
                         var candidate = new HistoryTargetCandidate(
                             target.NetworkId,
                             target.ConnectionGeneration,
@@ -2511,7 +2581,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                                 SameNetwork: target.NetworkId == Guid.Empty || target.NetworkId == entry.Workspace.Id,
                                 QueryWasOpenBeforeDisconnect: matchingBoundary is not null,
                                 CurrentTargetMatches: matchingBoundary is not null,
-                                CurrentSessionMessageObserved: existingByTarget?.IsIdentityBoundToCurrentSession == true),
+                                CurrentSessionMessageObserved: existingByTarget?.IsIdentityBoundToCurrentSession == true,
+                                IdentityMatch: identityMatch,
+                                PlausibleExistingCandidates: Math.Max(1, queryViews.CandidateCount)),
                             existingByTarget is not null || query is not null);
                         if (continuity == QueryContinuityOutcome.ReuseExistingQuery)
                         {
@@ -2528,7 +2600,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                             }
 
                             query ??= await InvokeOnDispatcherAsync(
-                                () => entry.Workspace.EnsureQuery(target.Target, reopen: false),
+                                () => entry.Workspace.EnsureRecoveredQuery(target.Target),
                                 WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
                         }
                         else
@@ -2687,7 +2759,37 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             case IrcQueryMessageEvent query:
                 Append(ResolveQuery(workspace, semanticEvent, query.Nickname), semanticEvent, WorkspaceActivity.Important);
                 break;
+            case IrcAccountEvent account:
+                if (account.IsHistorical
+                    && account.HistoricalConversation is { } historicalConversation
+                    && historicalConversation.StartsWith($"{LogConversationKind.PrivateConversation}:", StringComparison.Ordinal)
+                    && workspace.FindQueryByHistoryKey(historicalConversation) is { } historicalAccountQuery)
+                {
+                    ObserveQueryIdentity(historicalAccountQuery, account.Nickname, account.Account, account, historical: true);
+                }
+                else if (workspace.FindQuery(account.Nickname) is not null)
+                {
+                    var liveAccountQuery = workspace.EnsureIncomingQuery(account.Nickname, account.Account);
+                    ObserveQueryIdentity(liveAccountQuery, account.Nickname, account.Account, account, historical: false);
+                }
+
+                Append(workspace.StatusView, semanticEvent, WorkspaceActivity.None, publishNotification: false);
+                break;
             case IrcJoinEvent join:
+                if (!join.IsHistorical
+                    && join.Account is { Length: > 0 }
+                    && workspace.FindQuery(join.Nickname) is not null)
+                {
+                    var extendedJoinQuery = workspace.EnsureIncomingQuery(join.Nickname, join.Account);
+                    ObserveQueryIdentity(
+                        extendedJoinQuery,
+                        join.Nickname,
+                        join.Account,
+                        join,
+                        historical: false,
+                        sourceOverride: IdentityEvidenceSource.LiveExtendedJoin);
+                }
+
                 Append(workspace.EnsureChannel(join.Channel, reopen: false), semanticEvent);
                 break;
             case IrcPartEvent part:
@@ -2859,10 +2961,43 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             && semanticEvent.HistoricalConversation is { Length: > 0 } historyKey
             && workspace.FindQueryByHistoryKey(historyKey) is { } historicalQuery)
         {
+            ObserveQueryIdentity(historicalQuery, nickname, AccountTag(semanticEvent.Message), semanticEvent, historical: true);
             return historicalQuery;
         }
 
-        return workspace.EnsureIncomingQuery(nickname);
+        var query = semanticEvent.IsHistorical
+            ? workspace.EnsureRecoveredQuery(nickname)
+            : workspace.EnsureIncomingQuery(nickname, AccountTag(semanticEvent.Message));
+        ObserveQueryIdentity(query, nickname, AccountTag(semanticEvent.Message), semanticEvent, semanticEvent.IsHistorical);
+        return query;
+    }
+
+    private static void ObserveQueryIdentity(
+        QueryView query,
+        string nickname,
+        string? account,
+        IrcSemanticEvent semanticEvent,
+        bool historical,
+        IdentityEvidenceSource? sourceOverride = null)
+    {
+        var source = sourceOverride ?? (historical
+            ? account is null ? IdentityEvidenceSource.HistoricalPrefix : IdentityEvidenceSource.HistoricalAccountTag
+            : account is null ? IdentityEvidenceSource.LivePrefix : IdentityEvidenceSource.LiveAccountTag);
+        if (sourceOverride is null && semanticEvent is IrcAccountEvent)
+        {
+            source = historical ? IdentityEvidenceSource.HistoricalAccountCommand : IdentityEvidenceSource.LiveAccountCommand;
+        }
+
+        query.ObserveIdentityEvidence(new ConversationIdentityEvidence(
+            query.NetworkId,
+            nickname,
+            account,
+            semanticEvent.Message.Prefix?.User,
+            semanticEvent.Message.Prefix?.Host,
+            null,
+            semanticEvent.Message.ServerTimestamp,
+            source,
+            historical));
     }
 
     private bool ShouldSuppressIgnoredPresentation(NetworkWorkspace workspace, IrcSemanticEvent semanticEvent) =>

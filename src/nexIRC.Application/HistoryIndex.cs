@@ -6,7 +6,13 @@ using nexIRC.Core.State;
 
 namespace nexIRC.Application;
 
-internal sealed record JsonlHistoryIndexEntry(long TimestampTicks, long Offset, int Length);
+internal sealed record JsonlHistoryIndexEntry(
+    Guid NetworkId,
+    long TimestampTicks,
+    long DurableSequence,
+    long Offset,
+    int Length,
+    string? ServerMessageId);
 
 internal sealed record JsonlHistoryIndexSnapshot(
     long SourceLength,
@@ -23,8 +29,9 @@ internal sealed record JsonlHistoryIndexSnapshot(
 internal static class JsonlHistoryIndex
 {
     private static readonly byte[] Magic = "NEXHIDX1"u8.ToArray();
-    private const int FormatVersion = 1;
-    private const int EntryBytes = sizeof(long) + sizeof(long) + sizeof(int);
+    private const int FormatVersion = 2;
+    private const int FixedEntryBytes = 16 + sizeof(long) + sizeof(long) + sizeof(long) + sizeof(int) + sizeof(ushort);
+    private const int MaximumServerMessageIdBytes = 1024;
     private const int HeaderBytes = 8 + sizeof(int) + sizeof(long) + sizeof(long) + sizeof(int);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -41,11 +48,12 @@ internal static class JsonlHistoryIndex
         string conversationName,
         string? conversationKey,
         int maximumRecordBytes,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool allowSmallFile = false)
     {
         var sourceInfo = new FileInfo(sourcePath);
         if (!sourceInfo.Exists
-            || sourceInfo.Length < ConfigurationLimits.MinimumHistoryIndexFileBytes
+            || !allowSmallFile && sourceInfo.Length < ConfigurationLimits.MinimumHistoryIndexFileBytes
             || sourceInfo.Length > ConfigurationLimits.MaximumHistoryFileBytes)
         {
             return null;
@@ -149,7 +157,13 @@ internal static class JsonlHistoryIndex
                 return null;
             }
 
-            entries.Add(new JsonlHistoryIndexEntry(record.Timestamp.UtcTicks, line.Offset, line.Bytes.Length));
+            entries.Add(new JsonlHistoryIndexEntry(
+                record.NetworkId,
+                record.Timestamp.UtcTicks,
+                record.DurableSequence,
+                line.Offset,
+                line.Bytes.Length,
+                ConversationEntryIdentity.NormalizeServerMessageId(record.ServerMessageId)));
         }
 
         return entries;
@@ -190,32 +204,62 @@ internal static class JsonlHistoryIndex
                 || indexedLastWriteTicks != sourceLastWriteTicks
                 || count < 0
                 || count > ConfigurationLimits.MaximumHistoryIndexEntries
-                || stream.Length != HeaderBytes + (long)count * EntryBytes)
+                || stream.Length < HeaderBytes + (long)count * FixedEntryBytes)
             {
                 return false;
             }
 
             var entries = new List<JsonlHistoryIndexEntry>(count);
-            var entryBuffer = new byte[EntryBytes];
+            var entryBuffer = new byte[FixedEntryBytes];
             long previousOffset = -1;
             for (var index = 0; index < count; index++)
             {
                 stream.ReadExactly(entryBuffer);
-                var timestampTicks = BinaryPrimitives.ReadInt64LittleEndian(entryBuffer);
-                var offset = BinaryPrimitives.ReadInt64LittleEndian(entryBuffer.AsSpan(8));
-                var length = BinaryPrimitives.ReadInt32LittleEndian(entryBuffer.AsSpan(16));
+                var networkId = new Guid(entryBuffer.AsSpan(0, 16));
+                var timestampTicks = BinaryPrimitives.ReadInt64LittleEndian(entryBuffer.AsSpan(16));
+                var durableSequence = BinaryPrimitives.ReadInt64LittleEndian(entryBuffer.AsSpan(24));
+                var offset = BinaryPrimitives.ReadInt64LittleEndian(entryBuffer.AsSpan(32));
+                var length = BinaryPrimitives.ReadInt32LittleEndian(entryBuffer.AsSpan(40));
+                var messageIdBytes = BinaryPrimitives.ReadUInt16LittleEndian(entryBuffer.AsSpan(44));
                 if (offset <= previousOffset
                     || offset < 0
                     || length <= 0
                     || length > ConfigurationLimits.MaximumLogRecordBytes
                     || offset > sourceLength
-                    || length > sourceLength - offset)
+                    || length > sourceLength - offset
+                    || messageIdBytes > MaximumServerMessageIdBytes)
                 {
                     return false;
                 }
 
-                entries.Add(new JsonlHistoryIndexEntry(timestampTicks, offset, length));
+                string? serverMessageId = null;
+                if (messageIdBytes > 0)
+                {
+                    var messageIdBuffer = new byte[messageIdBytes];
+                    stream.ReadExactly(messageIdBuffer);
+                    try
+                    {
+                        serverMessageId = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
+                            .GetString(messageIdBuffer);
+                    }
+                    catch (DecoderFallbackException)
+                    {
+                        return false;
+                    }
+
+                    if (ConversationEntryIdentity.NormalizeServerMessageId(serverMessageId) is null)
+                    {
+                        return false;
+                    }
+                }
+
+                entries.Add(new JsonlHistoryIndexEntry(networkId, timestampTicks, durableSequence, offset, length, serverMessageId));
                 previousOffset = offset;
+            }
+
+            if (stream.Position != stream.Length)
+            {
+                return false;
             }
 
             var sidecarInfo = new FileInfo(path);
@@ -269,14 +313,30 @@ internal static class JsonlHistoryIndex
                 await WriteInt64Async(stream, snapshot.SourceLength, cancellationToken).ConfigureAwait(false);
                 await WriteInt64Async(stream, snapshot.SourceLastWriteTicks, cancellationToken).ConfigureAwait(false);
                 await WriteInt32Async(stream, snapshot.Entries.Count, cancellationToken).ConfigureAwait(false);
-                var entryBuffer = new byte[EntryBytes];
+                var entryBuffer = new byte[FixedEntryBytes];
                 foreach (var entry in snapshot.Entries)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    BinaryPrimitives.WriteInt64LittleEndian(entryBuffer, entry.TimestampTicks);
-                    BinaryPrimitives.WriteInt64LittleEndian(entryBuffer.AsSpan(8), entry.Offset);
-                    BinaryPrimitives.WriteInt32LittleEndian(entryBuffer.AsSpan(16), entry.Length);
+                    var messageIdBytes = entry.ServerMessageId is null
+                        ? Array.Empty<byte>()
+                        : Encoding.UTF8.GetBytes(entry.ServerMessageId);
+                    if (messageIdBytes.Length > MaximumServerMessageIdBytes)
+                    {
+                        throw new InvalidDataException("The history anchor message id exceeded the supported index size.");
+                    }
+
+                    entryBuffer.AsSpan().Clear();
+                    entry.NetworkId.TryWriteBytes(entryBuffer.AsSpan(0, 16));
+                    BinaryPrimitives.WriteInt64LittleEndian(entryBuffer.AsSpan(16), entry.TimestampTicks);
+                    BinaryPrimitives.WriteInt64LittleEndian(entryBuffer.AsSpan(24), entry.DurableSequence);
+                    BinaryPrimitives.WriteInt64LittleEndian(entryBuffer.AsSpan(32), entry.Offset);
+                    BinaryPrimitives.WriteInt32LittleEndian(entryBuffer.AsSpan(40), entry.Length);
+                    BinaryPrimitives.WriteUInt16LittleEndian(entryBuffer.AsSpan(44), (ushort)messageIdBytes.Length);
                     await stream.WriteAsync(entryBuffer, cancellationToken).ConfigureAwait(false);
+                    if (messageIdBytes.Length > 0)
+                    {
+                        await stream.WriteAsync(messageIdBytes, cancellationToken).ConfigureAwait(false);
+                    }
                 }
 
                 await stream.FlushAsync(cancellationToken).ConfigureAwait(false);

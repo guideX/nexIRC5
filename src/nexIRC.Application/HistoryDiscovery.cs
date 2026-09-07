@@ -29,7 +29,9 @@ public sealed record QueryContinuityEvidence(
     bool CurrentTargetMatches,
     bool AccountConsistent = false,
     bool CurrentSessionMessageObserved = false,
-    bool TargetIsValidQuery = true);
+    bool TargetIsValidQuery = true,
+    IdentityEvidenceMatch IdentityMatch = IdentityEvidenceMatch.NoMatch,
+    int PlausibleExistingCandidates = 1);
 
 /// <summary>
 /// Conservative query identity policy.  A nickname string alone is never
@@ -53,11 +55,25 @@ public static class QueryContinuityPolicy
             return QueryContinuityOutcome.Reject;
         }
 
+        if (!evidence.SameNetwork
+            || evidence.IdentityMatch is IdentityEvidenceMatch.ConflictingAccount or IdentityEvidenceMatch.ConflictingNetwork
+            || evidence.PlausibleExistingCandidates < 1)
+        {
+            return QueryContinuityOutcome.LeaveAsCandidate;
+        }
+
+        var strongIdentity = evidence.IdentityMatch is IdentityEvidenceMatch.StrongAccount
+            or IdentityEvidenceMatch.BoundedContinuity
+            or IdentityEvidenceMatch.CurrentLiveNickname
+            || evidence.AccountConsistent;
+        var nicknameOnlyAmbiguous = evidence.IdentityMatch is IdentityEvidenceMatch.NicknameOnly
+            && evidence.PlausibleExistingCandidates > 1;
         if (existingQuery
-            && evidence.SameNetwork
             && evidence.QueryWasOpenBeforeDisconnect
-            && evidence.CurrentTargetMatches
-            && (evidence.AccountConsistent || evidence.CurrentSessionMessageObserved || evidence.CurrentTargetMatches))
+            && !nicknameOnlyAmbiguous
+            && (strongIdentity
+                || evidence.CurrentSessionMessageObserved
+                || evidence.CurrentTargetMatches && evidence.PlausibleExistingCandidates == 1))
         {
             return QueryContinuityOutcome.ReuseExistingQuery;
         }
