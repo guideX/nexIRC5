@@ -2,6 +2,7 @@ using System.IO;
 using nexIRC.Application;
 using nexIRC.Core.Networking;
 using nexIRC.Core.Session;
+using IrcCapabilityCatalog = nexIRC.Core.State.IrcCapabilityCatalog;
 using nexIRC.Networking.Testing;
 
 namespace nexIRC.Desktop;
@@ -42,7 +43,7 @@ public sealed class DemoScenario
         var sessions = viewModel.Sessions;
         var alpha = sessions.Add(Options("AlphaNet", _alpha.Endpoint, "nexAlpha", "#general") with
         {
-            RequestedCapabilities = Array.Empty<string>(),
+            RequestedCapabilities = IrcCapabilityCatalog.PreferredPhase1X,
             Reconnect = new ReconnectPolicy(
                 Enabled: true,
                 MaximumAttempts: 3,
@@ -58,7 +59,7 @@ public sealed class DemoScenario
         await sessions.ConnectAsync(beta.Id).ConfigureAwait(true);
         await WaitForConditionAsync(sessions, () => _alpha.ConnectCount == 1 && _beta.ConnectCount == 1, "fake transports did not connect").ConfigureAwait(true);
 
-        Register(_alpha, "alpha.server", "nexAlpha", "AlphaNet", "(qaohv)~&@%+", "beI,k,l,imnpst");
+        Register(_alpha, "alpha.server", "nexAlpha", "AlphaNet", "(qaohv)~&@%+", "beI,k,l,imnpst", "batch draft/chathistory message-tags server-time");
         Register(_beta, "beta.server", "nexBeta", "BetaNet", "(ov)@+", "be,k,s,im");
         EnqueueSmokeChannel(_alpha, "alpha.server", "nexAlpha", "#general", "Alpha topic", "alpha-setter", "@nexAlpha +Alex", "+nt");
         EnqueueSmokeChannel(_beta, "beta.server", "nexBeta", "#general", "Beta topic", "beta-setter", "+nexBeta Alex", "+i");
@@ -464,10 +465,17 @@ public sealed class DemoScenario
             Text = text
         };
 
-    private static void Register(FakeIrcTransport transport, string server, string nickname, string network, string prefix, string chanModes)
+    private static void Register(FakeIrcTransport transport, string server, string nickname, string network, string prefix, string chanModes, params string[] capabilities)
     {
-        transport.EnqueueInboundLine($":{server} CAP * LS :");
-        transport.EnqueueInboundLine($":{server} 005 {nickname} NETWORK={network} PREFIX={prefix} CHANMODES={chanModes} CHANTYPES=#&+! :demo features");
+        transport.EnqueueInboundLine($":{server} CAP * LS :{string.Join(' ', capabilities)}");
+        if (capabilities.Length > 0)
+        {
+            transport.EnqueueInboundLine($":{server} CAP * ACK :{string.Join(' ', capabilities)}");
+        }
+        var history = capabilities.Any(static capability => capability.Equals("draft/chathistory", StringComparison.OrdinalIgnoreCase))
+            ? " CHATHISTORY=50 MSGREFTYPES=msgid,timestamp"
+            : string.Empty;
+        transport.EnqueueInboundLine($":{server} 005 {nickname} NETWORK={network} PREFIX={prefix} CHANMODES={chanModes} CHANTYPES=#&+!{history} :demo features");
         transport.EnqueueInboundLine($":{server} 001 {nickname} :Welcome to the nexIRC 5 demo workspace");
     }
 

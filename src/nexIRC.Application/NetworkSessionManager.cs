@@ -172,8 +172,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(options);
         ValidateOptions(options);
 
-        var session = new ServerSession(options.ToSessionOptions(), _transportFactory);
-        var workspace = new NetworkWorkspace(Guid.NewGuid(), options, session);
+        var networkId = Guid.NewGuid();
+        var session = new ServerSession(options.ToSessionOptions(networkId), _transportFactory);
+        var workspace = new NetworkWorkspace(networkId, options, session);
         var entry = new SessionEntry(workspace, options, session);
         lock (_entriesGate)
         {
@@ -227,6 +228,146 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     {
         var workspace = GetWorkspace(networkId);
         return workspace.EnsureQuery(nickname);
+    }
+
+    public bool CanLoadOlderHistory(NetworkWorkspace network, WorkspaceView view)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(view);
+        if (network.Id != view.NetworkId
+            || network.Snapshot.Registration != RegistrationState.Registered
+            || view is not (ChannelView or QueryView))
+        {
+            return false;
+        }
+
+        var conversation = HistoryConversation(view);
+        return network.Session.CanLoadOlderHistory(conversation)
+            && FindHistoryBoundary(view) is not null;
+    }
+
+    /// <summary>
+    /// Routes the shared "load older" action through the session's bounded
+    /// request lifecycle. The WPF layer does not construct protocol lines.
+    /// </summary>
+    public async ValueTask<CommandDispatchResult> LoadOlderMessagesAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        CancellationToken cancellationToken = default)
+    {
+        if (!CanLoadOlderHistory(network, view))
+        {
+            return CommandDispatchResult.Failure("Older server history is unavailable for this conversation.", view);
+        }
+
+        var boundary = FindHistoryBoundary(view)!;
+        var knownServerIds = view.EntriesSnapshot
+            .Select(static entry => entry.ServerMessageId)
+            .Where(static id => id is not null)
+            .ToHashSet(StringComparer.Ordinal);
+        var support = network.Session.ChathistorySupport;
+        var reference = SelectHistoryReference(support, boundary.ServerMessageId, boundary.Timestamp, boundary.TimestampSource);
+        if (reference is null)
+        {
+            return CommandDispatchResult.Failure("No authoritative server history boundary is available.", view);
+        }
+
+        var request = new ChathistoryRequest
+        {
+            NetworkId = network.Id,
+            ConnectionGeneration = network.Snapshot.ConnectionGeneration,
+            Conversation = HistoryConversation(view),
+            Target = view is ChannelView channel ? channel.Channel : ((QueryView)view).Nickname,
+            Operation = ChathistoryOperation.Before,
+            Reference = reference,
+            Limit = network.Session.MaximumChathistoryRequestSize,
+            Purpose = ChathistoryRequestPurpose.LoadOlder
+        };
+
+        ChathistoryResult result;
+        try
+        {
+            result = await network.Session.RequestHistoryAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException exception)
+        {
+            return CommandDispatchResult.Failure(exception.Message, view);
+        }
+
+        if (!result.Succeeded)
+        {
+            return CommandDispatchResult.Failure(result.Failure ?? "The server history request failed.", view);
+        }
+
+        var uniquePlaybackMessages = new HashSet<IrcMessage>();
+        foreach (var item in result.Messages)
+        {
+            uniquePlaybackMessages.Add(item.Message);
+        }
+
+        var loadedCount = uniquePlaybackMessages
+            .Count(message => message.ServerMessageId is null || !knownServerIds.Contains(message.ServerMessageId));
+        var message = loadedCount == 0
+            ? "No older server history is available."
+            : $"Loaded {loadedCount} older message{(loadedCount == 1 ? string.Empty : "s")}.";
+        return CommandDispatchResult.Success(message, view);
+    }
+
+    private static string HistoryConversation(WorkspaceView view) => view switch
+    {
+        QueryView query => query.HistoryConversationKey,
+        ChannelView channel => ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, channel.Channel),
+        _ => throw new ArgumentException("History is available only for channels and queries.", nameof(view))
+    };
+
+    private static TranscriptEntry? FindHistoryBoundary(WorkspaceView view) => view.EntriesSnapshot
+        .Where(static entry => entry.Kind is TranscriptEntryKind.Message
+            or TranscriptEntryKind.Notice
+            or TranscriptEntryKind.Action
+            or TranscriptEntryKind.Ctcp
+            or TranscriptEntryKind.OutgoingMessage
+            or TranscriptEntryKind.OutgoingPrivateMessage
+            or TranscriptEntryKind.OutgoingAction
+            or TranscriptEntryKind.OutgoingNotice
+            or TranscriptEntryKind.OutgoingCtcp)
+        .Where(IsHistoryMessageBoundary)
+        .OrderBy(static entry => entry.Timestamp)
+        .ThenBy(static entry => entry.Sequence)
+        .FirstOrDefault();
+
+    private static bool IsHistoryMessageBoundary(TranscriptEntry entry) =>
+        entry.Kind is TranscriptEntryKind.Message
+            or TranscriptEntryKind.Notice
+            or TranscriptEntryKind.Action
+            or TranscriptEntryKind.Ctcp
+            or TranscriptEntryKind.OutgoingMessage
+            or TranscriptEntryKind.OutgoingPrivateMessage
+            or TranscriptEntryKind.OutgoingAction
+            or TranscriptEntryKind.OutgoingNotice
+            or TranscriptEntryKind.OutgoingCtcp
+        && (entry.ServerMessageId is { Length: > 0 }
+            || entry.TimestampSource == ConversationTimestampSource.ServerTime);
+
+    private static ChathistoryReference? SelectHistoryReference(
+        ChathistorySupport support,
+        string? serverMessageId,
+        DateTimeOffset timestamp,
+        ConversationTimestampSource timestampSource)
+    {
+        foreach (var type in support.SupportedReferenceTypes)
+        {
+            if (type == ChathistoryReferenceType.MessageId && serverMessageId is { Length: > 0 })
+            {
+                return ChathistoryReference.MessageId(serverMessageId);
+            }
+
+            if (type == ChathistoryReferenceType.Timestamp && timestampSource == ConversationTimestampSource.ServerTime)
+            {
+                return ChathistoryReference.Timestamp(timestamp);
+            }
+        }
+
+        return null;
     }
 
     public WorkspaceView OpenHistoricalConversation(Guid networkId, DestinationKind kind, string name)
@@ -700,6 +841,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             // Closing a view only changes presentation. The logical
             // conversation remains addressable for reopen/history routing.
             RecordRecent(workspace, view is ChannelView ? DestinationKind.Channel : DestinationKind.Query, ConversationIdentity.From(view).Name);
+            workspace.Session.CancelHistoryRequest(HistoryConversation(view));
             workspace.Close(view);
         }
         else if (view is WhoisView whois)
@@ -1979,7 +2121,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     private void ReplaceSession(SessionEntry entry)
     {
-        entry.Session = new ServerSession(entry.Options.ToSessionOptions(), _transportFactory);
+        entry.Session = new ServerSession(entry.Options.ToSessionOptions(entry.Workspace.Id), _transportFactory);
         entry.Workspace.Options = entry.Options;
         entry.Workspace.Session = entry.Session;
         entry.Workspace.ResetForNewSession(entry.Session);
@@ -2043,6 +2185,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             return;
         }
 
+        if (change.Current == ServerSessionState.ReconnectWaiting)
+        {
+            CaptureReconnectBoundaries(entry);
+        }
+
         var snapshot = session.Snapshot;
         Dispatch(() =>
         {
@@ -2058,6 +2205,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             }
 
             entry.Workspace.ApplySnapshot(snapshot);
+            if (change.Current == ServerSessionState.Registered)
+            {
+                _ = RecoverReconnectHistoryAsync(entry, session, change.ConnectionGeneration);
+            }
             if (change.Current is ServerSessionState.Disconnected or ServerSessionState.Failed)
             {
                 ClearOperations(entry.Workspace.Id);
@@ -2091,6 +2242,108 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                     nameof(SessionStateChangedEvent)));
             }
         }, WorkspaceDispatchActionCategory.Lifecycle);
+    }
+
+    private void CaptureReconnectBoundaries(SessionEntry entry)
+    {
+        foreach (var view in entry.Workspace.Views)
+        {
+            if (view is not ChannelView channel || !channel.IsJoined)
+            {
+                // Query continuity is intentionally left to manual paging in
+                // this phase: IRC cannot prove that a historical nickname is
+                // still the same private conversation across a reconnect.
+                continue;
+            }
+
+            var boundary = view.EntriesSnapshot
+                .OrderByDescending(static item => item.Timestamp)
+                .ThenByDescending(static item => item.Sequence)
+                .FirstOrDefault(IsHistoryMessageBoundary);
+            if (boundary is null)
+            {
+                continue;
+            }
+
+            entry.ReconnectBoundaries[HistoryConversation(view)] = new ReconnectHistoryBoundary(
+                HistoryConversation(view),
+                channel.Channel,
+                boundary.ServerMessageId,
+                boundary.Timestamp,
+                boundary.TimestampSource,
+                IsChannel: true);
+        }
+    }
+
+    private async Task RecoverReconnectHistoryAsync(SessionEntry entry, ServerSession session, int generation)
+    {
+        if (entry.ReconnectBoundaries.Count == 0 || !session.ChathistorySupport.IsUsable)
+        {
+            return;
+        }
+
+        var recovered = 0;
+        var requests = 0;
+        foreach (var boundary in entry.ReconnectBoundaries.Values.Take(16).ToArray())
+        {
+            if (requests >= 16 || recovered >= 200 || session.Snapshot.ConnectionGeneration != generation)
+            {
+                break;
+            }
+
+            var reference = SelectHistoryReference(
+                session.ChathistorySupport,
+                boundary.ServerMessageId,
+                boundary.Timestamp,
+                boundary.TimestampSource);
+            if (reference is null)
+            {
+                continue;
+            }
+
+            var request = new ChathistoryRequest
+            {
+                NetworkId = entry.Workspace.Id,
+                ConnectionGeneration = generation,
+                Conversation = boundary.Conversation,
+                Target = boundary.Target,
+                Operation = ChathistoryOperation.Latest,
+                Reference = reference,
+                Limit = Math.Min(session.MaximumChathistoryRequestSize, 50),
+                Purpose = ChathistoryRequestPurpose.ReconnectGap
+            };
+            requests++;
+            try
+            {
+                var result = await session.RequestHistoryAsync(request).ConfigureAwait(false);
+                if (result.Succeeded)
+                {
+                    recovered += result.MessageCount;
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                break;
+            }
+        }
+
+        entry.ReconnectBoundaries.Clear();
+        if (recovered > 0 && session.Snapshot.ConnectionGeneration == generation)
+        {
+            Dispatch(() =>
+            {
+                if (!IsCurrentGeneration(entry, session, generation))
+                {
+                    return;
+                }
+
+                entry.Workspace.StatusView.Append(
+                    IrcEventPresentation.CreateLocalCommand($"Recovered {recovered} message{(recovered == 1 ? string.Empty : "s")} after reconnect."),
+                    markActivity: false,
+                    updateLastActivity: false);
+                NotifyNavigationChanged();
+            }, WorkspaceDispatchActionCategory.HistoryProjection);
+        }
     }
 
     private void OnSessionSemanticEvent(object? sender, SessionSemanticEvent item)
@@ -2413,7 +2666,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         var previousActivity = view.Activity;
-        var isResynchronization = IsResynchronizationEvent(view, semanticEvent, snapshot);
+        var isHistorical = semanticEvent.IsHistorical;
+        var isResynchronization = IsResynchronizationEvent(view, semanticEvent, snapshot) || isHistorical;
         var isOwnMessage = semanticEvent switch
         {
             IrcPrivmsgEvent message => IrcIdentity.Equals(message.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping),
@@ -2421,7 +2675,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             IrcCtcpEvent ctcp => IrcIdentity.Equals(ctcp.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping),
             _ => false
         };
-        var effectiveActivity = isResynchronization || isOwnMessage
+        var effectiveActivity = isResynchronization || isOwnMessage || isHistorical
             ? WorkspaceActivity.None
             : activity ?? HighlightPolicy.Classify(view, semanticEvent, snapshot);
         if (isResynchronization)
@@ -2436,8 +2690,17 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             entry = entry with { Metadata = "highlight" };
         }
 
-        entry = entry with { Sequence = NextActivitySequence(), Provenance = ConversationEntryProvenance.Live };
-        var inserted = entry.ServerMessageId is null
+        entry = entry with
+        {
+            Sequence = NextActivitySequence(),
+            Provenance = isHistorical ? ConversationEntryProvenance.ServerPlayback : ConversationEntryProvenance.Live
+        };
+        var inserted = isHistorical
+            ? view.AppendConversationCandidate(
+                ConversationEntryCandidate.FromServerPlayback(CreateConversationRecord(workspace, view, entry)),
+                entry,
+                updateLastActivity: false)
+            : entry.ServerMessageId is null
             && entry.TimestampSource == ConversationTimestampSource.LegacyOrLocalReceiveTime
             && entry.BatchId is null
             ? view.AppendConversationEntry(entry, updateLastActivity && !isResynchronization)
@@ -2449,16 +2712,16 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         {
             return;
         }
-        if (entry.IsHighlight && !isResynchronization)
+        if (entry.IsHighlight && !isResynchronization && !isHistorical)
         {
             view.MarkHighlight();
         }
 
-        if (!isResynchronization && view is ChannelView channel && semanticEvent is IrcJoinEvent)
+        if (!isResynchronization && !isHistorical && view is ChannelView channel && semanticEvent is IrcJoinEvent)
         {
             RecordRecent(workspace, DestinationKind.Channel, channel.Channel);
         }
-        else if (!isResynchronization && view is QueryView query && view.EntryCount == 1 && semanticEvent is (IrcQueryMessageEvent or IrcCtcpEvent))
+        else if (!isResynchronization && !isHistorical && view is QueryView query && view.EntryCount == 1 && semanticEvent is (IrcQueryMessageEvent or IrcCtcpEvent))
         {
             RecordRecent(workspace, DestinationKind.Query, query.Nickname);
         }
@@ -2482,7 +2745,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
         NotifyNavigationChanged();
 
-        if (isResynchronization || !publishNotification)
+        if (isResynchronization || isHistorical || !publishNotification)
         {
             return;
         }
@@ -2855,5 +3118,15 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         public HashSet<string> RecentSemanticEventIds { get; } = new(StringComparer.Ordinal);
 
         public ConcurrentQueue<string> RecentSemanticEventOrder { get; } = new();
+
+        public Dictionary<string, ReconnectHistoryBoundary> ReconnectBoundaries { get; } = new(StringComparer.Ordinal);
     }
+
+    private sealed record ReconnectHistoryBoundary(
+        string Conversation,
+        string Target,
+        string? ServerMessageId,
+        DateTimeOffset Timestamp,
+        ConversationTimestampSource TimestampSource,
+        bool IsChannel);
 }

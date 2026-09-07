@@ -159,11 +159,38 @@ internal sealed class SessionStateStore
         _nickname = nickname;
     }
 
-    public IReadOnlyList<IrcSemanticEvent> Apply(IrcMessage message, ServerFeatureSet features)
+    public IReadOnlyList<IrcSemanticEvent> Apply(
+        IrcMessage message,
+        ServerFeatureSet features,
+        bool historicalPlayback = false,
+        bool suppressBatchedState = false)
     {
         SetCaseMapping(features.CaseMapping);
         var events = new List<IrcSemanticEvent>();
         var command = message.Command;
+
+        // A chathistory batch is not a second live session. The session
+        // coordinator decides whether a batch belongs to the active request;
+        // unaccepted children are discarded before JOIN/PART/NICK/MODE/etc.
+        // can touch current presence state.
+        if (command != "BATCH"
+            && message.BatchId is { } batchId
+            && _batches.TryGetValue(batchId, out var activeBatch)
+            && string.Equals(activeBatch.Type, "chathistory", StringComparison.OrdinalIgnoreCase))
+        {
+            if (historicalPlayback && (command is "PRIVMSG" or "NOTICE"))
+            {
+                ApplyHistoricalMessage(message, features, events, command == "NOTICE");
+            }
+
+            return events;
+        }
+
+        if (suppressBatchedState && command != "BATCH")
+        {
+            return events;
+        }
+
         switch (command)
         {
             case "NICK":
@@ -440,13 +467,17 @@ internal sealed class SessionStateStore
         if (token[0] == '+')
         {
             var type = Parameter(message, 1);
-            if (string.IsNullOrWhiteSpace(type) || _batches.Count >= 32)
+            var parameters = message.Parameters.Skip(2).Take(16).ToArray();
+            if (string.IsNullOrWhiteSpace(type)
+                || type.Length > 64
+                || _batches.Count >= 32
+                || string.Equals(type, "chathistory", StringComparison.OrdinalIgnoreCase) && parameters.Length < 1)
             {
                 return;
             }
 
-            _batches[batchId] = new MutableBatch(type);
-            events.Add(new IrcBatchEvent(message, batchId, true, type, message.Parameters.Skip(2).Take(16).ToArray()));
+            _batches[batchId] = new MutableBatch(type, parameters);
+            events.Add(new IrcBatchEvent(message, batchId, true, type, parameters));
         }
         else if (_batches.Remove(batchId, out var batch))
         {
@@ -545,6 +576,36 @@ internal sealed class SessionStateStore
             {
                 events.Add(new IrcQueryMessageEvent(message, message.Prefix.Name, text, isNotice));
             }
+        }
+    }
+
+    private void ApplyHistoricalMessage(IrcMessage message, ServerFeatureSet features, List<IrcSemanticEvent> events, bool isNotice)
+    {
+        var target = Parameter(message, 0);
+        var text = message.HasTrailingParameter ? message.TrailingParameter ?? string.Empty : Parameter(message, 1) ?? string.Empty;
+        if (string.IsNullOrEmpty(target))
+        {
+            return;
+        }
+
+        if (TryParseCtcp(text, out var ctcpCommand, out var ctcpArguments))
+        {
+            events.Add(new IrcCtcpEvent(message, target, ctcpCommand, ctcpArguments, isNotice) { IsHistorical = true });
+        }
+        else
+        {
+            events.Add(new IrcPrivmsgEvent(message, target, text, isNotice) { IsHistorical = true });
+        }
+
+        if (!IsChannelTarget(target, features.ChannelTypes)
+            && !string.IsNullOrEmpty(message.Prefix?.Name))
+        {
+            if (TryParseCtcp(text, out _, out _))
+            {
+                return;
+            }
+
+            events.Add(new IrcQueryMessageEvent(message, message.Prefix!.Name, text, isNotice) { IsHistorical = true });
         }
     }
 
@@ -1122,9 +1183,25 @@ internal sealed class SessionStateStore
             ? DateTimeOffset.FromUnixTimeSeconds(seconds)
                 : null;
 
-    private sealed class MutableBatch(string type)
+    internal bool TryGetActiveBatch(string batchId, out string type, out IReadOnlyList<string> parameters)
+    {
+        if (_batches.TryGetValue(batchId, out var batch))
+        {
+            type = batch.Type;
+            parameters = batch.Parameters;
+            return true;
+        }
+
+        type = string.Empty;
+        parameters = Array.Empty<string>();
+        return false;
+    }
+
+    private sealed class MutableBatch(string type, IReadOnlyList<string> parameters)
     {
         public string Type { get; } = type;
+
+        public IReadOnlyList<string> Parameters { get; } = parameters;
     }
 
     private sealed class MutableQuery

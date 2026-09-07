@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using nexIRC.Core.Networking;
+using nexIRC.Core.Protocol;
 using nexIRC.Core.Session;
 using nexIRC.Core.State;
 
@@ -171,7 +172,11 @@ public sealed record NetworkConnectionOptions
 
     public IReadOnlyList<string> NicknameFallbacks { get; init; } = Array.Empty<string>();
 
-    public IReadOnlyList<string> RequestedCapabilities { get; init; } = IrcCapabilityCatalog.PreferredPhase1V;
+    public IReadOnlyList<string> RequestedCapabilities { get; init; } = IrcCapabilityCatalog.PreferredPhase1X;
+
+    public int MaximumChathistoryRequestSize { get; init; } = ChathistorySupport.DefaultClientMaximumRequestSize;
+
+    public TimeSpan ChathistoryRequestTimeout { get; init; } = TimeSpan.FromSeconds(5);
 
     public IReadOnlySet<string> DesiredChannels { get; init; } = new HashSet<string>(StringComparer.Ordinal);
 
@@ -193,8 +198,9 @@ public sealed record NetworkConnectionOptions
 
     public SaslAuthenticationPolicy SaslPolicy { get; init; } = SaslAuthenticationPolicy.Disabled;
 
-    public ServerSessionOptions ToSessionOptions() => new()
+    public ServerSessionOptions ToSessionOptions(Guid? networkId = null) => new()
     {
+        NetworkId = networkId,
         Endpoint = Endpoint,
         Nickname = Nickname,
         Username = Username,
@@ -202,6 +208,8 @@ public sealed record NetworkConnectionOptions
         AlternateNickname = AlternateNickname,
         NicknameFallbacks = NicknameFallbacks,
         RequestedCapabilities = RequestedCapabilities,
+        MaximumChathistoryRequestSize = MaximumChathistoryRequestSize,
+        ChathistoryRequestTimeout = ChathistoryRequestTimeout,
         DesiredChannels = DesiredChannels,
         Reconnect = Reconnect,
         Profiles = Profiles,

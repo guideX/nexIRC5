@@ -194,12 +194,12 @@ public partial class App : System.Windows.Application
             var nickname = $"nex5{Environment.ProcessId % 100_000:00000}";
             var network = viewModel.Sessions.Add(new NetworkConnectionOptions
             {
-                DisplayName = "Libera Phase 1V",
+                DisplayName = "Libera Phase 1X",
                 Endpoint = new IrcEndpoint("irc.libera.chat", 6697, true),
                 Nickname = nickname,
                 Username = nickname,
-                RealName = "nexIRC 5 Phase 1V live IRCv3 smoke",
-                RequestedCapabilities = IrcCapabilityCatalog.PreferredPhase1V,
+                RealName = "nexIRC 5 Phase 1X live IRCv3 smoke",
+                RequestedCapabilities = IrcCapabilityCatalog.PreferredPhase1X,
                 DesiredChannels = new HashSet<string>(new[] { "#libera" }, StringComparer.Ordinal),
                 Reconnect = new ReconnectPolicy(Enabled: false)
             });

@@ -73,6 +73,8 @@ public sealed record ReconnectPolicy(
 
 public sealed class ServerSessionOptions
 {
+    public Guid? NetworkId { get; init; }
+
     public required IrcEndpoint Endpoint { get; init; }
 
     public required string Nickname { get; init; }
@@ -96,6 +98,10 @@ public sealed class ServerSessionOptions
     public int MaximumInboundLineBytes { get; init; } = IrcLineFramer.DefaultMaximumLineBytes;
 
     public int MaximumOutboundLineBytes { get; init; } = IrcCommandBuilder.DefaultMaximumLineBytes;
+
+    public int MaximumChathistoryRequestSize { get; init; } = ChathistorySupport.DefaultClientMaximumRequestSize;
+
+    public TimeSpan ChathistoryRequestTimeout { get; init; } = TimeSpan.FromSeconds(5);
 
     public int ReadBufferBytes { get; init; } = 4096;
 
@@ -147,7 +153,15 @@ public sealed record IrcParseErrorEvent(
     string Error,
     int ConnectionGeneration);
 
-public abstract record IrcSemanticEvent(IrcMessage Message);
+public abstract record IrcSemanticEvent(IrcMessage Message)
+{
+    /// <summary>
+    /// True only for content accepted from a validated server history batch.
+    /// Historical messages can share the normal typed message events while
+    /// remaining outside the live participant/activity state machine.
+    /// </summary>
+    public bool IsHistorical { get; init; }
+}
 
 public sealed record IrcWelcomeEvent(IrcMessage Message, string? NetworkName) : IrcSemanticEvent(Message);
 
@@ -212,6 +226,19 @@ public sealed record IrcBatchEvent(
     bool IsStart,
     string? Type,
     IReadOnlyList<string> Parameters) : IrcSemanticEvent(Message);
+
+public enum IrcStandardReplyKind
+{
+    Fail,
+    Warn,
+    Note
+}
+
+public sealed record IrcStandardReplyEvent(
+    IrcMessage Message,
+    IrcStandardReplyKind Kind,
+    string Code,
+    string Text) : IrcSemanticEvent(Message);
 
 public sealed record IrcPartEvent(IrcMessage Message, string Channel, string Nickname) : IrcSemanticEvent(Message);
 

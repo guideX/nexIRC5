@@ -28,6 +28,7 @@ internal static class UiSmokeHarness
         "burst-fairness",
         "query-nick",
         "ircv3-metadata",
+        "chathistory",
         "contextual-actions",
         "sustained-interactivity",
         "close-idle",
@@ -99,6 +100,9 @@ internal static class UiSmokeHarness
                 break;
             case "ircv3-metadata":
                 await Ircv3MetadataAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "chathistory":
+                await ChathistoryAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
             case "contextual-actions":
                 await ContextualActionsAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -238,6 +242,35 @@ internal static class UiSmokeHarness
             && participant.DetailsText.Contains("away: at lunch", StringComparison.Ordinal),
             "IRCv3 participant details did not expose current account and away state");
         Console.WriteLine($"IRCV3_UI_TRACE account={participant.Account} away={participant.IsAway} prefixes={participant.PrefixModes} server_time={serverTime}");
+    }
+
+    private static async Task ChathistoryAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var channel = RequiredChannel(network);
+        var beforeMembers = channel.Members.Count;
+        demo.AlphaTransport.EnqueueInboundLine("@msgid=live-boundary;time=2026-09-07T12:00:00.000Z :Alex!u@alpha PRIVMSG #general :live boundary");
+        await WaitForAsync(window.ViewModel.Sessions, () => channel.EntriesSnapshot.Any(entry => entry.ServerMessageId == "live-boundary"), "CHATHISTORY smoke boundary did not arrive").ConfigureAwait(true);
+        var beforeUnread = channel.UnreadCount;
+
+        var descriptor = window.ViewModel.Actions.BuildChannelActions(network, channel)
+            .Single(item => item.Action == WorkspaceActionId.LoadOlderMessages);
+        Require(descriptor.IsEnabled, "CHATHISTORY older-history action was not enabled");
+        var request = window.ViewModel.Actions.ExecuteChannelAsync(network, channel, WorkspaceActionId.LoadOlderMessages).AsTask();
+        await WaitForPollingAsync(() => demo.AlphaTransport.OutboundLines.Any(line => line.StartsWith("CHATHISTORY BEFORE #general", StringComparison.Ordinal)), "CHATHISTORY command was not sent").ConfigureAwait(true);
+        demo.AlphaTransport.EnqueueInboundLine(":alpha.server BATCH +history chathistory #general");
+        demo.AlphaTransport.EnqueueInboundLine("@batch=history;msgid=live-boundary;time=2026-09-07T12:00:00.000Z :Alex!u@alpha PRIVMSG #general :live boundary");
+        demo.AlphaTransport.EnqueueInboundLine("@batch=history :Alex!u@alpha PRIVMSG #general :legitimate repeat");
+        demo.AlphaTransport.EnqueueInboundLine("@batch=history :Alex!u@alpha PRIVMSG #general :legitimate repeat");
+        demo.AlphaTransport.EnqueueInboundLine(":alpha.server BATCH -history");
+
+        var result = await request.ConfigureAwait(true);
+        await window.ViewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+        Require(result.Succeeded && result.Message.Contains("2 older", StringComparison.Ordinal), "CHATHISTORY playback feedback did not report the bounded merge");
+        Require(channel.UnreadCount == beforeUnread, "CHATHISTORY playback changed unread state");
+        Require(channel.Members.Count == beforeMembers, "CHATHISTORY playback changed current members");
+        Require(channel.EntriesSnapshot.Count(entry => entry.Text == "legitimate repeat") == 2, "CHATHISTORY no-ID repeats were not retained");
+        Require(channel.EntriesSnapshot.Count(entry => entry.ServerMessageId == "live-boundary") == 1, "CHATHISTORY authoritative overlap was not deduplicated");
+        Console.WriteLine($"CHATHISTORY_UI_TRACE entries={channel.EntryCount} unread={channel.UnreadCount} members={channel.Members.Count}");
     }
 
     private static async Task ModerationAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
@@ -1016,6 +1049,20 @@ internal static class UiSmokeHarness
         {
             sessions.NavigationChanged -= Signal;
             sessions.OperationFeedback.PropertyChanged -= Signal;
+        }
+    }
+
+    private static async Task WaitForPollingAsync(Func<bool> condition, string failure, int timeoutMilliseconds = 4_000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
+        while (!condition())
+        {
+            if (DateTime.UtcNow >= deadline)
+            {
+                throw new TimeoutException(failure);
+            }
+
+            await Task.Delay(10).ConfigureAwait(true);
         }
     }
 

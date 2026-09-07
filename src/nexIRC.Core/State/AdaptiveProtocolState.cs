@@ -110,7 +110,9 @@ public enum CapabilityNegotiationStatus
 public static class IrcCapabilityCatalog
 {
     public const string MessageTags = "message-tags";
+    public const string Batch = "batch";
     public const string ServerTime = "server-time";
+    public const string Chathistory = "draft/chathistory";
     public const string AwayNotify = "away-notify";
     public const string ExtendedJoin = "extended-join";
     public const string MultiPrefix = "multi-prefix";
@@ -122,8 +124,16 @@ public static class IrcCapabilityCatalog
     public static IReadOnlyList<string> PreferredPhase1V { get; } =
     [MessageTags, ServerTime, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
 
+    /// <summary>
+    /// Phase 1X's history path is opt-in as a group: a server must ACK the
+    /// draft capability and the safe message/batch/timestamp substrate before
+    /// the application can issue a history request.
+    /// </summary>
+    public static IReadOnlyList<string> PreferredPhase1X { get; } =
+    [MessageTags, ServerTime, Batch, Chathistory, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
+
     public static IReadOnlySet<string> Known { get; } =
-        new HashSet<string>(PreferredPhase1V.Concat([AccountTag, Sasl]), StringComparer.Ordinal);
+        new HashSet<string>(PreferredPhase1X.Concat([AccountTag, Sasl]), StringComparer.Ordinal);
 }
 
 public enum CapNegotiationState
@@ -486,7 +496,9 @@ public sealed class ISupportSnapshot
         int? lineLength,
         IReadOnlyDictionary<char, int> maxList,
         IReadOnlyDictionary<string, int?> targetMax,
-        bool utf8Only)
+        bool utf8Only,
+        int? chathistoryLimit,
+        IReadOnlyList<ChathistoryReferenceType> messageReferenceTypes)
     {
         RawTokens = rawTokens;
         Tokens = tokens;
@@ -505,6 +517,8 @@ public sealed class ISupportSnapshot
         MaxList = maxList;
         TargetMax = targetMax;
         Utf8Only = utf8Only;
+        ChathistoryLimit = chathistoryLimit;
+        MessageReferenceTypes = messageReferenceTypes;
     }
 
     public IReadOnlyList<IrcISupportToken> RawTokens { get; }
@@ -541,6 +555,18 @@ public sealed class ISupportSnapshot
 
     public bool Utf8Only { get; }
 
+    /// <summary>
+    /// The numeric CHATHISTORY ISUPPORT limit. A value of zero is retained as
+    /// the protocol's unlimited marker; callers must still apply a client
+    /// maximum before constructing a request.
+    /// </summary>
+    public int? ChathistoryLimit { get; }
+
+    public bool HasChathistory => Contains("CHATHISTORY");
+
+    /// <summary>Known MSGREFTYPES in the server's advertised preference order.</summary>
+    public IReadOnlyList<ChathistoryReferenceType> MessageReferenceTypes { get; }
+
     public int? Modes { get; init; }
 
     public int? NickLength { get; init; }
@@ -574,7 +600,9 @@ public sealed class ISupportSnapshot
         null,
         new Dictionary<char, int>(),
         new Dictionary<string, int?>(StringComparer.Ordinal),
-        false);
+        false,
+        null,
+        Array.Empty<ChathistoryReferenceType>());
 }
 
 public enum IrcCaseMapping
@@ -756,7 +784,9 @@ public sealed class ISupportState
             ParseInt(PositiveValue("LINELEN")),
             ParseMaxList(PositiveValue("MAXLIST")),
             ParseTargetMax(PositiveValue("TARGMAX")),
-            HasPositive("UTF8ONLY"))
+            HasPositive("UTF8ONLY"),
+            ParseChathistoryLimit(PositiveValue("CHATHISTORY")),
+            ParseMessageReferenceTypes(PositiveValue("MSGREFTYPES")))
         {
             Modes = ParseInt(PositiveValue("MODES")),
             NickLength = ParseInt(PositiveValue("NICKLEN")),
@@ -779,6 +809,44 @@ public sealed class ISupportState
     private bool HasPositive(string name) => _tokens.ContainsKey(name) && !_removedTokens.Contains(name);
 
     private static int? ParseInt(string? value) => int.TryParse(value, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var result) ? result : null;
+
+    private static int? ParseChathistoryLimit(string? value)
+    {
+        if (value is null)
+        {
+            return null;
+        }
+
+        return int.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var limit)
+            && limit >= 0
+            ? limit
+            : null;
+    }
+
+    private static IReadOnlyList<ChathistoryReferenceType> ParseMessageReferenceTypes(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return Array.Empty<ChathistoryReferenceType>();
+        }
+
+        var result = new List<ChathistoryReferenceType>();
+        foreach (var token in value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var type = token.ToLowerInvariant() switch
+            {
+                "msgid" => ChathistoryReferenceType.MessageId,
+                "timestamp" => ChathistoryReferenceType.Timestamp,
+                _ => (ChathistoryReferenceType?)null
+            };
+            if (type.HasValue && !result.Contains(type.Value))
+            {
+                result.Add(type.Value);
+            }
+        }
+
+        return result;
+    }
 
     private static IrcPrefixGrammar? ParsePrefix(string? value)
     {
@@ -937,12 +1005,14 @@ public sealed class ServerFeatureSet
         CapabilitySnapshot capabilities,
         ISupportSnapshot runtimeISupport,
         ServerProfileSet? profiles,
-        ServerIdentity identity)
+        ServerIdentity identity,
+        int clientMaximumChathistoryRequestSize)
     {
         Capabilities = capabilities;
         RuntimeISupport = runtimeISupport;
         Profiles = profiles;
         Identity = identity;
+        Chathistory = ChathistorySupport.From(capabilities, runtimeISupport, clientMaximumChathistoryRequestSize);
         NetworkName = runtimeISupport.NetworkName ?? profiles?.Network?.Name ?? identity.NetworkName;
         CaseMapping = runtimeISupport.HasCaseMapping ? runtimeISupport.CaseMapping : IrcCaseMapping.Rfc1459;
         ChannelTypes = runtimeISupport.HasChannelTypes
@@ -961,6 +1031,11 @@ public sealed class ServerFeatureSet
 
     public ServerIdentity Identity { get; }
 
+    public ChathistorySupport Chathistory { get; }
+
+    /// <summary>Compatibility alias for callers that use the shorter history name.</summary>
+    public ChathistorySupport History => Chathistory;
+
     public string? NetworkName { get; }
 
     public IrcCaseMapping CaseMapping { get; }
@@ -973,8 +1048,13 @@ public sealed class ServerFeatureSet
 
     public int LineLength { get; }
 
-    public static ServerFeatureSet Build(CapabilitySnapshot capabilities, ISupportSnapshot runtimeISupport, ServerProfileSet? profiles, ServerIdentity identity) =>
-        new(capabilities, runtimeISupport, profiles, identity);
+    public static ServerFeatureSet Build(
+        CapabilitySnapshot capabilities,
+        ISupportSnapshot runtimeISupport,
+        ServerProfileSet? profiles,
+        ServerIdentity identity,
+        int clientMaximumChathistoryRequestSize = ChathistorySupport.DefaultClientMaximumRequestSize) =>
+        new(capabilities, runtimeISupport, profiles, identity, clientMaximumChathistoryRequestSize);
 }
 
 public enum ServerIdentityEvidenceType

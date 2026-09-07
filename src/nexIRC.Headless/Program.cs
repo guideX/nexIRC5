@@ -37,7 +37,7 @@ internal static class Program
             Nickname = arguments.Nickname,
             Username = arguments.Nickname,
             RealName = "nexIRC 5 headless diagnostic harness",
-            RequestedCapabilities = IrcCapabilityCatalog.PreferredPhase1V,
+            RequestedCapabilities = IrcCapabilityCatalog.PreferredPhase1X,
             Reconnect = new ReconnectPolicy(Enabled: false)
         };
         await using var session = new ServerSession(options, new TcpTlsIrcTransportFactory());

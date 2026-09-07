@@ -24,7 +24,7 @@ public sealed class ServerSession : IAsyncDisposable
     private static readonly HashSet<string> KnownCommands =
     [
         "CAP", "PING", "PONG", "PASS", "NICK", "USER", "JOIN", "PART", "QUIT", "PRIVMSG", "NOTICE",
-        "TOPIC", "ERROR", "MODE", "KICK", "INVITE", "AWAY", "ACCOUNT", "BATCH", "WALLOPS", "AUTHENTICATE"
+        "TOPIC", "ERROR", "MODE", "KICK", "INVITE", "AWAY", "ACCOUNT", "BATCH", "WALLOPS", "AUTHENTICATE", "FAIL", "WARN", "NOTE"
     ];
 
     private readonly ServerSessionOptions _options;
@@ -64,6 +64,10 @@ public sealed class ServerSession : IAsyncDisposable
     private Task? _disposeTask;
     private int _quitSent;
     private readonly TaskCompletionSource _quitWritten = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private long _historyRequestSequence;
+    private PendingChathistoryRequest? _activeHistoryRequest;
+    private readonly HashSet<string> _acceptedHistoryBatches = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ChathistoryConversationState> _historyStates = new(StringComparer.Ordinal);
 
     public ServerSession(ServerSessionOptions options, IIrcTransportFactory transportFactory)
     {
@@ -83,12 +87,23 @@ public sealed class ServerSession : IAsyncDisposable
             requestedCapabilityList.Add(IrcCapabilityCatalog.Sasl);
         }
 
+        if (requestedCapabilityList.Any(capability => string.Equals(capability, IrcCapabilityCatalog.Chathistory, StringComparison.OrdinalIgnoreCase)))
+        {
+            foreach (var requiredCapability in new[] { IrcCapabilityCatalog.Batch, IrcCapabilityCatalog.ServerTime, IrcCapabilityCatalog.MessageTags })
+            {
+                if (!requestedCapabilityList.Contains(requiredCapability, StringComparer.OrdinalIgnoreCase))
+                {
+                    requestedCapabilityList.Add(requiredCapability);
+                }
+            }
+        }
+
         var requestedCapabilities = requestedCapabilityList.ToArray();
         _capabilities = new IrcCapabilityNegotiator(
             requestedCapabilities,
             options.MaximumOutboundLineBytes,
             options.SaslPolicy == SaslAuthenticationPolicy.Disabled ? Array.Empty<string>() : [IrcCapabilityCatalog.Sasl]);
-        _features = ServerFeatureSet.Build(CapabilitySnapshot.Empty, ISupportSnapshot.Empty, options.Profiles, ServerIdentity.Unknown);
+        _features = ServerFeatureSet.Build(CapabilitySnapshot.Empty, ISupportSnapshot.Empty, options.Profiles, ServerIdentity.Unknown, options.MaximumChathistoryRequestSize);
         _authenticationState = options.SaslPolicy == SaslAuthenticationPolicy.Disabled
             ? SaslAuthenticationState.Disabled
             : SaslAuthenticationState.WaitingForCapability;
@@ -128,6 +143,127 @@ public sealed class ServerSession : IAsyncDisposable
     public static int LiveInstanceCount => Volatile.Read(ref _liveInstanceCount);
 
     public int MaximumOutboundLineBytes => _options.MaximumOutboundLineBytes;
+
+    public int MaximumChathistoryRequestSize => Math.Clamp(_options.MaximumChathistoryRequestSize, 1, 10000);
+
+    public ChathistorySupport ChathistorySupport => Snapshot.Features.Chathistory;
+
+    public ChathistoryConversationState GetChathistoryState(string conversation)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversation);
+        lock (_gate)
+        {
+            var key = NormalizeHistoryConversation(conversation);
+            return _historyStates.TryGetValue(key, out var state)
+                ? state
+                : ChathistoryConversationState.Empty(conversation, _connectionGeneration);
+        }
+    }
+
+    public bool CanLoadOlderHistory(string conversation)
+    {
+        var state = GetChathistoryState(conversation);
+        return ChathistorySupport.IsUsable
+            && !state.RequestActive
+            && !state.BeginningReached
+            && state.ConnectionGeneration == Snapshot.ConnectionGeneration;
+    }
+
+    public bool CancelHistoryRequest(string conversation)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversation);
+        lock (_gate)
+        {
+            if (_activeHistoryRequest is null
+                || !string.Equals(
+                    NormalizeHistoryConversation(_activeHistoryRequest.Request.Conversation),
+                    NormalizeHistoryConversation(conversation),
+                    StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        CompleteHistoryRequest(ChathistoryRequestCompletion.Cancelled, "The history conversation was closed.");
+        return true;
+    }
+
+    /// <summary>
+    /// Sends one bounded, correlated server-history request. A single active
+    /// request is allowed per session; application code supplies the logical
+    /// conversation identity so playback can never be routed by raw protocol
+    /// state alone.
+    /// </summary>
+    public async ValueTask<ChathistoryResult> RequestHistoryAsync(
+        ChathistoryRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        PendingChathistoryRequest pending;
+        ConnectionEpoch epoch;
+        ChathistoryRequestBuildResult built;
+        lock (_gate)
+        {
+            if (_activeHistoryRequest is not null)
+            {
+                throw new InvalidOperationException("A CHATHISTORY request is already active for this session.");
+            }
+
+            if (_registration != RegistrationState.Registered || _activeEpoch is not { IsActive: true } currentEpoch)
+            {
+                throw new InvalidOperationException("The IRC session is not registered.");
+            }
+
+            if (request.ConnectionGeneration != currentEpoch.Generation)
+            {
+                throw new InvalidOperationException("The CHATHISTORY request belongs to a stale connection generation.");
+            }
+
+            if (_options.NetworkId is Guid networkId && request.NetworkId != networkId)
+            {
+                throw new InvalidOperationException("The CHATHISTORY request belongs to another network session.");
+            }
+
+            built = ChathistoryCommandBuilder.BuildValidated(
+                request,
+                _features.Chathistory,
+                _options.MaximumOutboundLineBytes);
+            epoch = currentEpoch;
+            pending = new PendingChathistoryRequest(
+                Interlocked.Increment(ref _historyRequestSequence),
+                built.Request,
+                currentEpoch.Generation);
+            _activeHistoryRequest = pending;
+            SetHistoryStateUnsafe(pending.Request.Conversation, requestActive: true, beginningReached: false, failed: false, failure: null);
+        }
+
+        try
+        {
+            await QueueOutboundAsync(built.Command, cancellationToken, epoch).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or OperationCanceledException)
+        {
+            CompleteHistoryRequest(ChathistoryRequestCompletion.Cancelled, exception.Message);
+        }
+
+        using var timeout = new CancellationTokenSource(_options.ChathistoryRequestTimeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token, _disposeCts.Token);
+        try
+        {
+            return await pending.Completion.Task.WaitAsync(linked.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            CompleteHistoryRequest(
+                timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested
+                    ? ChathistoryRequestCompletion.TimedOut
+                    : ChathistoryRequestCompletion.Cancelled,
+                timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested
+                    ? "The CHATHISTORY request timed out."
+                    : "The CHATHISTORY request was cancelled.");
+            return await pending.Completion.Task.ConfigureAwait(false);
+        }
+    }
 
     public IAsyncEnumerable<RawIrcLineEvent> ReadRawEventsAsync(CancellationToken cancellationToken = default) => _rawEvents.Reader.ReadAllAsync(cancellationToken);
 
@@ -758,7 +894,7 @@ public sealed class ServerSession : IAsyncDisposable
             lock (_gate)
             {
                 _identityDetector.ObserveCapabilities(capResult.Snapshot);
-                _features = ServerFeatureSet.Build(capResult.Snapshot, _isupport.Snapshot, _options.Profiles, _identityDetector.Snapshot);
+                _features = ServerFeatureSet.Build(capResult.Snapshot, _isupport.Snapshot, _options.Profiles, _identityDetector.Snapshot, _options.MaximumChathistoryRequestSize);
             }
 
             await PublishCapabilityChangesAsync(message, capabilitiesBefore, capResult.Snapshot, epoch, receivedAt).ConfigureAwait(false);
@@ -771,7 +907,7 @@ public sealed class ServerSession : IAsyncDisposable
             {
                 _isupport.Apply(message);
                 _identityDetector.ObserveISupport(_isupport.Snapshot);
-                _features = ServerFeatureSet.Build(_capabilities.Snapshot, _isupport.Snapshot, _options.Profiles, _identityDetector.Snapshot);
+                _features = ServerFeatureSet.Build(_capabilities.Snapshot, _isupport.Snapshot, _options.Profiles, _identityDetector.Snapshot, _options.MaximumChathistoryRequestSize);
                 _stateStore.SetCaseMapping(_features.CaseMapping);
             }
         }
@@ -819,7 +955,7 @@ public sealed class ServerSession : IAsyncDisposable
             lock (_gate)
             {
                 _identityDetector.ObserveMyInfo(message);
-                _features = ServerFeatureSet.Build(_capabilities.Snapshot, _isupport.Snapshot, _options.Profiles, _identityDetector.Snapshot);
+                _features = ServerFeatureSet.Build(_capabilities.Snapshot, _isupport.Snapshot, _options.Profiles, _identityDetector.Snapshot, _options.MaximumChathistoryRequestSize);
             }
         }
 
@@ -884,20 +1020,81 @@ public sealed class ServerSession : IAsyncDisposable
         }
 
         IReadOnlyList<IrcSemanticEvent> stateEvents;
+        var historicalPlayback = false;
+        var suppressBatchedState = false;
+        var historyLimitExceeded = false;
         lock (_gate)
         {
-            stateEvents = _stateStore.Apply(message, _features);
+            if (message.BatchId is { } batchId
+                && _stateStore.TryGetActiveBatch(batchId, out var batchType, out _)
+                && string.Equals(batchType, "chathistory", StringComparison.OrdinalIgnoreCase))
+            {
+                historicalPlayback = _acceptedHistoryBatches.Contains(batchId)
+                    && _activeHistoryRequest is { ConnectionGeneration: var generation }
+                    && generation == epoch.Generation;
+                suppressBatchedState = !historicalPlayback;
+                if (historicalPlayback
+                    && message.Command is "PRIVMSG" or "NOTICE"
+                    && _activeHistoryRequest!.Messages.Count >= _activeHistoryRequest.Request.Limit)
+                {
+                    historyLimitExceeded = true;
+                    historicalPlayback = false;
+                    suppressBatchedState = true;
+                }
+            }
+
+            stateEvents = _stateStore.Apply(message, _features, historicalPlayback, suppressBatchedState);
+        }
+
+        if (historyLimitExceeded)
+        {
+            CompleteHistoryRequest(ChathistoryRequestCompletion.Failed, "The history batch exceeded the bounded request limit.");
         }
 
         foreach (var semanticEvent in stateEvents)
         {
             await PublishSemanticAsync(semanticEvent, epoch, receivedAt).ConfigureAwait(false);
 
+            if (semanticEvent.IsHistorical)
+            {
+                lock (_gate)
+                {
+                    if (_activeHistoryRequest is { ConnectionGeneration: var generation } pending
+                        && generation == epoch.Generation)
+                    {
+                        pending.Messages.Add(semanticEvent);
+                    }
+                }
+            }
+
             if (semanticEvent is IrcJoinEvent join && NamesEqual(join.Nickname, _stateStore.Nickname, _features.CaseMapping))
             {
                 await QueueChannelResynchronizationAsync(join.Channel, epoch, connectionCts.Token).ConfigureAwait(false);
                 await PublishSemanticAsync(new IrcChannelSynchronizationEvent(message, join.Channel, ChannelSynchronizationState.Synchronizing), epoch, receivedAt).ConfigureAwait(false);
             }
+        }
+
+        if (message.Command == "BATCH")
+        {
+            ObserveHistoryBatch(message, epoch);
+        }
+
+        if (message.Command is "FAIL" or "WARN" or "NOTE"
+            || message.NumericCommand is 400 or 401 or 402 or 403 or 404 or 405 or 407 or 409 or 411 or 412 or 421 or 461)
+        {
+            ObserveHistoryError(message, epoch);
+        }
+
+        if (message.Command is "FAIL" or "WARN" or "NOTE")
+        {
+            var standardKind = message.Command switch
+            {
+                "FAIL" => IrcStandardReplyKind.Fail,
+                "WARN" => IrcStandardReplyKind.Warn,
+                _ => IrcStandardReplyKind.Note
+            };
+            var code = message.Parameters.Skip(1).FirstOrDefault() ?? string.Empty;
+            await PublishSemanticAsync(new IrcStandardReplyEvent(message, standardKind, code, MessageText(message)), epoch, receivedAt).ConfigureAwait(false);
         }
 
         if (EventDispatcher.TryDispatch(message, out var extensionEvent))
@@ -1328,6 +1525,7 @@ public sealed class ServerSession : IAsyncDisposable
 
     private void InvalidateConnectionState(ConnectionEpoch epoch)
     {
+        CompleteHistoryRequest(ChathistoryRequestCompletion.Disconnected, "The IRC connection ended before the history batch completed.");
         lock (_gate)
         {
             if (!ReferenceEquals(_activeEpoch, epoch))
@@ -1339,6 +1537,7 @@ public sealed class ServerSession : IAsyncDisposable
             _activeEpoch = null;
             _stateStore.SetGeneration(_connectionGeneration);
             _resynchronizationRequested.Clear();
+            _historyStates.Clear();
             _capabilities.Reset();
             _isupport.Reset();
             _identityDetector.Reset();
@@ -1347,7 +1546,7 @@ public sealed class ServerSession : IAsyncDisposable
                 _identityDetector.SetManualOverride(_options.ManualNetworkName, _options.ManualIrcd);
             }
 
-            _features = ServerFeatureSet.Build(CapabilitySnapshot.Empty, ISupportSnapshot.Empty, _options.Profiles, _identityDetector.Snapshot);
+            _features = ServerFeatureSet.Build(CapabilitySnapshot.Empty, ISupportSnapshot.Empty, _options.Profiles, _identityDetector.Snapshot, _options.MaximumChathistoryRequestSize);
             var preserveTerminalFailure = _state == ServerSessionState.Failed || _registration == RegistrationState.Failed;
             var preserveAuthenticationFailure = _authenticationState == SaslAuthenticationState.Failed;
             if (!preserveTerminalFailure)
@@ -1436,6 +1635,200 @@ public sealed class ServerSession : IAsyncDisposable
         await QueueOutboundAsync(builder.Build("WHO", [channel]), cancellationToken, epoch).ConfigureAwait(false);
     }
 
+    private void ObserveHistoryBatch(IrcMessage message, ConnectionEpoch epoch)
+    {
+        var token = message.Parameters.Count == 0 ? null : message.Parameters[0];
+        if (string.IsNullOrWhiteSpace(token) || token.Length < 2)
+        {
+            return;
+        }
+
+        var batchId = token[1..];
+        if (batchId.Length == 0)
+        {
+            return;
+        }
+
+        if (token[0] == '+')
+        {
+            string type;
+            IReadOnlyList<string> parameters;
+            lock (_gate)
+            {
+                if (!_stateStore.TryGetActiveBatch(batchId, out type, out parameters))
+                {
+                    return;
+                }
+            }
+
+            if (!IsHistoryBatchType(type))
+            {
+                return;
+            }
+
+            var target = parameters.Count == 0 ? null : parameters[0];
+            lock (_gate)
+            {
+                if (_activeHistoryRequest is not { ConnectionGeneration: var generation } pending
+                    || generation != epoch.Generation)
+                {
+                    return;
+                }
+
+                if (!string.Equals(type, "chathistory", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (HistoryTargetMatches(pending.Request.Target, target))
+                    {
+                        pending.EndMarker = true;
+                        pending.BatchId = batchId;
+                        _acceptedHistoryBatches.Add(batchId);
+                    }
+
+                    return;
+                }
+
+                if (!HistoryTargetMatches(pending.Request.Target, target))
+                {
+                    // A session may receive an unrelated unsolicited
+                    // chathistory batch while one request is active. Without
+                    // a label it cannot complete or fail our request; its
+                    // children remain fenced and the owned request times out
+                    // if the matching batch never arrives.
+                    return;
+                }
+                else
+                {
+                    pending.BatchId = batchId;
+                    _acceptedHistoryBatches.Add(batchId);
+                }
+            }
+
+            return;
+        }
+
+        if (token[0] == '-')
+        {
+            var shouldComplete = false;
+            var exhausted = false;
+            lock (_gate)
+            {
+                if (_acceptedHistoryBatches.Remove(batchId)
+                    && _activeHistoryRequest is { ConnectionGeneration: var generation } pending
+                    && generation == epoch.Generation
+                    && string.Equals(pending.BatchId, batchId, StringComparison.Ordinal))
+                {
+                    shouldComplete = true;
+                    exhausted = pending.EndMarker;
+                }
+            }
+
+            if (shouldComplete)
+            {
+                CompleteHistoryRequest(ChathistoryRequestCompletion.Succeeded, null, exhausted);
+            }
+        }
+    }
+
+    private void ObserveHistoryError(IrcMessage message, ConnectionEpoch epoch)
+    {
+        if (message.Command is "FAIL"
+            && !message.Parameters.Any(static parameter => parameter.Equals("CHATHISTORY", StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
+        }
+
+        if (message.Command is not "FAIL"
+            && message.NumericCommand is not (400 or 401 or 402 or 403 or 404 or 405 or 407 or 409 or 411 or 412 or 421 or 461))
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_activeHistoryRequest is null || _activeHistoryRequest.ConnectionGeneration != epoch.Generation)
+            {
+                return;
+            }
+        }
+
+        CompleteHistoryRequest(ChathistoryRequestCompletion.Failed, MessageText(message));
+    }
+
+    private bool HistoryTargetMatches(string requested, string? returned)
+    {
+        return !string.IsNullOrWhiteSpace(returned)
+            && IrcCaseMappingComparer.Equals(requested, returned, _features.CaseMapping);
+    }
+
+    private static bool IsHistoryBatchType(string type) =>
+        string.Equals(type, "chathistory", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(type, "draft/chathistory-end", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(type, "chathistory-end", StringComparison.OrdinalIgnoreCase);
+
+    private string NormalizeHistoryConversation(string conversation) =>
+        IrcCaseMappingComparer.Fold(conversation, _features.CaseMapping);
+
+    private ChathistoryConversationState GetHistoryStateUnsafe(string conversation)
+    {
+        var key = NormalizeHistoryConversation(conversation);
+        return _historyStates.TryGetValue(key, out var state)
+            ? state
+            : ChathistoryConversationState.Empty(conversation, _connectionGeneration);
+    }
+
+    private void SetHistoryStateUnsafe(
+        string conversation,
+        bool requestActive,
+        bool beginningReached,
+        bool failed,
+        string? failure)
+    {
+        var previous = GetHistoryStateUnsafe(conversation);
+        _historyStates[NormalizeHistoryConversation(conversation)] = new ChathistoryConversationState(
+            conversation,
+            _connectionGeneration,
+            requestActive,
+            beginningReached,
+            failed,
+            failure ?? (requestActive ? null : previous.LastFailure));
+    }
+
+    private void CompleteHistoryRequest(
+        ChathistoryRequestCompletion completion,
+        string? failure,
+        bool exhausted = false)
+    {
+        PendingChathistoryRequest? pending;
+        lock (_gate)
+        {
+            pending = _activeHistoryRequest;
+            if (pending is null)
+            {
+                return;
+            }
+
+            _activeHistoryRequest = null;
+            _acceptedHistoryBatches.Clear();
+            var reachedBeginning = completion == ChathistoryRequestCompletion.Succeeded
+                && (exhausted || pending.Messages.Count == 0);
+            var previous = GetHistoryStateUnsafe(pending.Request.Conversation);
+            SetHistoryStateUnsafe(
+                pending.Request.Conversation,
+                requestActive: false,
+                beginningReached: reachedBeginning || previous.BeginningReached,
+                failed: completion is not ChathistoryRequestCompletion.Succeeded,
+                failure: failure);
+        }
+
+        pending.Completion.TrySetResult(new ChathistoryResult(
+            pending.RequestId,
+            pending.Request,
+            completion,
+            pending.Messages.ToArray(),
+            failure,
+            exhausted));
+    }
+
     private async ValueTask QueueOutboundAsync(IrcOutboundMessage command, CancellationToken cancellationToken, ConnectionEpoch? epoch = null)
     {
         ChannelWriter<IrcOutboundMessage>? writer;
@@ -1482,7 +1875,8 @@ public sealed class ServerSession : IAsyncDisposable
 
             _stateStore.SetGeneration(_connectionGeneration);
             _resynchronizationRequested.Clear();
-            _features = ServerFeatureSet.Build(CapabilitySnapshot.Empty, ISupportSnapshot.Empty, _options.Profiles, _identityDetector.Snapshot);
+            _historyStates.Clear();
+            _features = ServerFeatureSet.Build(CapabilitySnapshot.Empty, ISupportSnapshot.Empty, _options.Profiles, _identityDetector.Snapshot, _options.MaximumChathistoryRequestSize);
             _authenticationState = _options.SaslPolicy == SaslAuthenticationPolicy.Disabled
                 ? SaslAuthenticationState.Disabled
                 : SaslAuthenticationState.WaitingForCapability;
@@ -1615,6 +2009,10 @@ public sealed class ServerSession : IAsyncDisposable
 
     private static string NormalizeName(string value, IrcCaseMapping mapping) => IrcCaseMappingComparer.Fold(value, mapping);
 
+    private static string MessageText(IrcMessage message) => message.HasTrailingParameter
+        ? message.TrailingParameter ?? string.Empty
+        : string.Join(' ', message.Parameters);
+
     private static string[] BuildNicknameCandidates(ServerSessionOptions options)
     {
         var candidates = new[] { options.Nickname }
@@ -1631,6 +2029,23 @@ public sealed class ServerSession : IAsyncDisposable
         public int Generation { get; } = generation;
 
         public bool IsActive { get; set; } = true;
+    }
+
+    private sealed class PendingChathistoryRequest(long requestId, ChathistoryRequest request, int connectionGeneration)
+    {
+        public long RequestId { get; } = requestId;
+
+        public ChathistoryRequest Request { get; } = request;
+
+        public int ConnectionGeneration { get; } = connectionGeneration;
+
+        public TaskCompletionSource<ChathistoryResult> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public List<IrcSemanticEvent> Messages { get; } = [];
+
+        public string? BatchId { get; set; }
+
+        public bool EndMarker { get; set; }
     }
 
     private static void ValidateOptions(ServerSessionOptions options)
@@ -1653,6 +2068,16 @@ public sealed class ServerSession : IAsyncDisposable
         if (options.CapabilityNegotiationTimeout <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(options.CapabilityNegotiationTimeout));
+        }
+
+        if (options.MaximumChathistoryRequestSize < 1 || options.MaximumChathistoryRequestSize > 10000)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options.MaximumChathistoryRequestSize));
+        }
+
+        if (options.ChathistoryRequestTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options.ChathistoryRequestTimeout));
         }
 
         if (options.Reconnect.MaximumAttempts < 1)

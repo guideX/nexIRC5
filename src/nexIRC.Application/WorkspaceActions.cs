@@ -17,7 +17,8 @@ public enum WorkspaceActionId
     RequestTopic,
     EditTopic,
     RequestModes,
-    RefreshNames
+    RefreshNames,
+    LoadOlderMessages
 }
 
 public enum WorkspaceActionTargetKind
@@ -100,6 +101,7 @@ public sealed class WorkspaceActionRouter
         var joined = registered && logicallyJoined;
         var authority = consistent ? ChannelAuthority.Evaluate(network, channel) : null;
         var target = new WorkspaceActionTarget(network.Id, channel.Id, channel.Channel);
+        var canLoadOlder = joined && _sessions.CanLoadOlderHistory(network, channel);
         return
         [
             new(WorkspaceActionId.OpenChannel, "Open channel", WorkspaceActionTargetKind.Channel, target, consistent),
@@ -116,7 +118,24 @@ public sealed class WorkspaceActionRouter
             new(WorkspaceActionId.RequestModes, "Request channel modes", WorkspaceActionTargetKind.Channel, target, joined,
                 joined ? null : "Join the channel first."),
             new(WorkspaceActionId.RefreshNames, "Refresh member list", WorkspaceActionTargetKind.Channel, target, joined,
-                joined ? null : "Join the channel first.")
+                joined ? null : "Join the channel first."),
+            new(WorkspaceActionId.LoadOlderMessages, "Load older messages", WorkspaceActionTargetKind.Channel, target, canLoadOlder,
+                canLoadOlder ? null : !joined ? "Join the channel first." : "Server history is unavailable or already exhausted.")
+        ];
+    }
+
+    public IReadOnlyList<WorkspaceActionDescriptor> BuildQueryActions(NetworkWorkspace network, QueryView query)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(query);
+        var consistent = network.Id == query.NetworkId;
+        var registered = consistent && IsRegistered(network);
+        var target = new WorkspaceActionTarget(network.Id, query.Id, query.Nickname, query.Nickname);
+        var canLoadOlder = registered && _sessions.CanLoadOlderHistory(network, query);
+        return
+        [
+            new(WorkspaceActionId.LoadOlderMessages, "Load older messages", WorkspaceActionTargetKind.Query, target, canLoadOlder,
+                canLoadOlder ? null : !registered ? "The network is not registered." : "Server history is unavailable or already exhausted.")
         ];
     }
 
@@ -198,9 +217,33 @@ public sealed class WorkspaceActionRouter
             case WorkspaceActionId.RefreshNames:
                 await network.Session.RequestNamesAsync(channel.Channel, cancellationToken).ConfigureAwait(false);
                 return CommandDispatchResult.Success($"Refreshing members for {channel.Channel}.", channel);
+            case WorkspaceActionId.LoadOlderMessages:
+                return await _sessions.LoadOlderMessagesAsync(network, channel, cancellationToken).ConfigureAwait(false);
             default:
                 return CommandDispatchResult.Failure("The channel action is not supported.", channel);
         }
+    }
+
+    public async ValueTask<CommandDispatchResult> ExecuteQueryAsync(
+        NetworkWorkspace network,
+        QueryView query,
+        WorkspaceActionId action,
+        CancellationToken cancellationToken = default)
+    {
+        var descriptor = BuildQueryActions(network, query).FirstOrDefault(item => item.Action == action);
+        if (descriptor is null)
+        {
+            return CommandDispatchResult.Failure("The query action is not supported.", query);
+        }
+
+        if (!descriptor.IsEnabled)
+        {
+            return CommandDispatchResult.Failure(descriptor.DisabledReason ?? "The query action is unavailable.", query);
+        }
+
+        return action == WorkspaceActionId.LoadOlderMessages
+            ? await _sessions.LoadOlderMessagesAsync(network, query, cancellationToken).ConfigureAwait(false)
+            : CommandDispatchResult.Failure("The query action is not supported.", query);
     }
 
     public async ValueTask<CommandDispatchResult> PartChannelAsync(

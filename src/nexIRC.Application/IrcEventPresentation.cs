@@ -67,7 +67,9 @@ public static class IrcEventPresentation
             : entry with
             {
                 ServerMessageId = semanticEvent.Message.ServerMessageId,
-                Provenance = ConversationEntryProvenance.Live,
+                Provenance = semanticEvent.IsHistorical
+                    ? ConversationEntryProvenance.ServerPlayback
+                    : ConversationEntryProvenance.Live,
                 TimestampSource = semanticEvent.Message.ServerTimestamp.HasValue
                     ? ConversationTimestampSource.ServerTime
                     : ConversationTimestampSource.LegacyOrLocalReceiveTime,
