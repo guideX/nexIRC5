@@ -30,6 +30,8 @@ internal static class UiSmokeHarness
         "ircv3-metadata",
         "chathistory",
         "history-pagination",
+        "forward-pagination",
+        "history-navigation",
         "history-gap-repair",
         "history-discovery",
         "history-identity",
@@ -110,6 +112,12 @@ internal static class UiSmokeHarness
                 break;
             case "history-pagination":
                 await HistoryPaginationAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "forward-pagination":
+                await ForwardPaginationAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "history-navigation":
+                await HistoryNavigationAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
             case "history-gap-repair":
                 await HistoryGapRepairAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -375,6 +383,184 @@ internal static class UiSmokeHarness
         await sessions.LoadOlderMessagesAsync(network, view).ConfigureAwait(true);
         Require(demo.AlphaTransport.OutboundLines.Count(line => line.StartsWith($"CHATHISTORY BEFORE {conversationName}", StringComparison.Ordinal)) == requestsAfterEnd, "remote exhaustion did not suppress a repeated BEFORE request");
         Console.WriteLine($"HISTORY_PAGINATION_UI_TRACE local_pages=6 local_rows=300 remote_pages=1 coalesced_requests=10 end_reached=true repeated_before_suppressed=true");
+    }
+
+    private static async Task ForwardPaginationAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var sessions = window.ViewModel.Sessions;
+        var logs = sessions.LogStore ?? throw new InvalidOperationException("The forward-pagination smoke requires the durable log store.");
+        const string conversationName = "#phase22-forward";
+        var conversationKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, conversationName);
+        var scope = network.ProfileId ?? network.Id;
+        var baseTime = new DateTimeOffset(2026, 9, 2, 12, 0, 0, TimeSpan.Zero);
+        for (var index = 1; index <= 500; index++)
+        {
+            await logs.AppendAsync(new ConversationLogRecord
+            {
+                Timestamp = baseTime.AddMinutes(index),
+                NetworkId = network.Id,
+                ScopeId = scope,
+                ProfileId = network.ProfileId,
+                ConversationKind = LogConversationKind.Channel,
+                ConversationName = conversationName,
+                ConversationKey = conversationKey,
+                Sender = "alice",
+                MessageKind = LogMessageKind.Message,
+                Direction = LogDirection.Incoming,
+                Text = $"forward-{index:000}",
+                ServerMessageId = $"forward-{index:000}",
+                TimestampSource = ConversationTimestampSource.ServerTime
+            }).ConfigureAwait(true);
+        }
+
+        await logs.FlushAsync().ConfigureAwait(true);
+        var view = (ChannelView)sessions.OpenHistoricalConversation(network.Id, DestinationKind.Channel, conversationName);
+        await WaitForPollingAsync(() => view.EntryCount == ConfigurationLimits.HistoryLocalProjectionPageSize, "forward-pagination initial local page did not project").ConfigureAwait(true);
+        Require(view.EntriesSnapshot[^1].ServerMessageId == "forward-500", "forward-pagination did not open the newest local edge");
+
+        await sessions.JumpToHistoryMessageAsync(network, view, "forward-125").ConfigureAwait(true);
+        var localTraffic = demo.AlphaTransport.OutboundLines.Count(line => line.StartsWith("CHATHISTORY", StringComparison.Ordinal));
+        var localPages = 0;
+        while (view.EntriesSnapshot[^1].ServerMessageId != "forward-500")
+        {
+            var result = await sessions.LoadNewerMessagesAsync(network, view).ConfigureAwait(true);
+            Require(result.Succeeded, "forward-pagination local newer page failed");
+            localPages++;
+            Require(localPages <= 10, "forward-pagination local newer pages did not converge");
+        }
+
+        Require(demo.AlphaTransport.OutboundLines.Count(line => line.StartsWith("CHATHISTORY", StringComparison.Ordinal)) == localTraffic, "forward-pagination local pages contacted IRC");
+
+        var firstRemote = sessions.LoadNewerMessagesAsync(network, view).AsTask();
+        await WaitForPollingAsync(() => demo.AlphaTransport.OutboundLines.Any(line => line.StartsWith($"CHATHISTORY AFTER {conversationName} msgid=forward-500", StringComparison.Ordinal)), "forward-pagination first AFTER request was not sent").ConfigureAwait(true);
+        demo.AlphaTransport.EnqueueInboundLine($":alpha.server BATCH +forward-one chathistory {conversationName}");
+        for (var index = 501; index <= 525; index++)
+        {
+            demo.AlphaTransport.EnqueueInboundLine($"@batch=forward-one;msgid=forward-{index:000};time={baseTime.AddMinutes(index):O} :Alex!u@alpha PRIVMSG {conversationName} :forward-{index:000}");
+        }
+
+        demo.AlphaTransport.EnqueueInboundLine(":alpha.server BATCH -forward-one");
+        var firstResult = await firstRemote.ConfigureAwait(true);
+        Require(firstResult.Succeeded && view.EntriesSnapshot[^1].ServerMessageId == "forward-525", "forward-pagination first AFTER page did not advance the projected frontier");
+
+        await logs.FlushAsync().ConfigureAwait(true);
+        var secondRemote = sessions.LoadNewerMessagesAsync(network, view).AsTask();
+        await WaitForPollingAsync(() => demo.AlphaTransport.OutboundLines.Any(line => line.StartsWith($"CHATHISTORY AFTER {conversationName} msgid=forward-525", StringComparison.Ordinal)), "forward-pagination second AFTER request did not advance its selector").ConfigureAwait(true);
+        demo.AlphaTransport.EnqueueInboundLine($"@draft/chathistory-end :alpha.server BATCH +forward-two chathistory {conversationName}");
+        for (var index = 526; index <= 550; index++)
+        {
+            demo.AlphaTransport.EnqueueInboundLine($"@batch=forward-two;msgid=forward-{index:000};time={baseTime.AddMinutes(index):O} :Alex!u@alpha PRIVMSG {conversationName} :forward-{index:000}");
+        }
+
+        demo.AlphaTransport.EnqueueInboundLine(":alpha.server BATCH -forward-two");
+        var secondResult = await secondRemote.ConfigureAwait(true);
+        Require(secondResult.Succeeded && view.EntriesSnapshot[^1].ServerMessageId == "forward-550", "forward-pagination terminal AFTER page did not reach the live edge");
+        var afterRequests = demo.AlphaTransport.OutboundLines.Count(line => line.StartsWith($"CHATHISTORY AFTER {conversationName}", StringComparison.Ordinal));
+        var repeated = await sessions.LoadNewerMessagesAsync(network, view).ConfigureAwait(true);
+        Require(repeated.Succeeded && afterRequests == demo.AlphaTransport.OutboundLines.Count(line => line.StartsWith($"CHATHISTORY AFTER {conversationName}", StringComparison.Ordinal)), "forward-pagination repeated AFTER request ignored directional exhaustion");
+        Require(sessions.GetHistoryCoverage(network.Id, conversationKey).RemoteForwardExhausted, "forward-pagination end marker did not establish forward exhaustion");
+        Console.WriteLine($"FORWARD_PAGINATION_UI_TRACE local_pages={localPages} local_traffic=0 remote_after_requests={afterRequests} frontier_advanced=true end_reached=true repeated_after_suppressed=true");
+    }
+
+    private static async Task HistoryNavigationAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var sessions = window.ViewModel.Sessions;
+        var logs = sessions.LogStore ?? throw new InvalidOperationException("The history-navigation smoke requires the durable log store.");
+        const string conversationName = "#phase22-navigation";
+        var conversationKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, conversationName);
+        var scope = network.ProfileId ?? network.Id;
+        var baseTime = new DateTimeOffset(2026, 9, 1, 12, 0, 0, TimeSpan.Zero);
+
+        ConversationLogRecord Record(int index, string? text = null, string? messageId = null, DateTimeOffset? timestamp = null) => new()
+        {
+            Timestamp = timestamp ?? baseTime.AddMinutes(index),
+            NetworkId = network.Id,
+            ScopeId = scope,
+            ProfileId = network.ProfileId,
+            ConversationKind = LogConversationKind.Channel,
+            ConversationName = conversationName,
+            ConversationKey = conversationKey,
+            Sender = "alice",
+            MessageKind = LogMessageKind.Message,
+            Direction = LogDirection.Incoming,
+            Text = text ?? $"nav-{index:0000}",
+            ServerMessageId = messageId ?? $"nav-{index:0000}",
+            TimestampSource = ConversationTimestampSource.ServerTime,
+            Provenance = ConversationEntryProvenance.Live
+        };
+
+        for (var index = 1; index <= 1_000; index++)
+        {
+            await logs.AppendAsync(Record(index)).ConfigureAwait(true);
+        }
+
+        await logs.FlushAsync().ConfigureAwait(true);
+        var view = (ChannelView)sessions.OpenHistoricalConversation(network.Id, DestinationKind.Channel, conversationName);
+        await WaitForPollingAsync(() => view.EntryCount == ConfigurationLimits.HistoryLocalProjectionPageSize, "history-navigation newest local window did not project").ConfigureAwait(true);
+        Require(view.EntriesSnapshot[0].ServerMessageId == "nav-0951" && view.EntriesSnapshot[^1].ServerMessageId == "nav-1000", "history-navigation did not open the newest 50 canonical rows");
+
+        var trafficBeforeJump = demo.AlphaTransport.OutboundLines.Count;
+        var localMessage = await sessions.JumpToHistoryMessageAsync(network, view, "nav-0425").ConfigureAwait(true);
+        Require(localMessage.Outcome == HistoryNavigationOutcome.ExactLocalMatch && localMessage.IsExact, "local msgid navigation did not resolve exactly");
+        Require(demo.AlphaTransport.OutboundLines.Count == trafficBeforeJump, "local msgid navigation issued IRC traffic");
+        Require(view.EntriesSnapshot[0].ServerMessageId == "nav-0375" && view.EntriesSnapshot[^1].ServerMessageId == "nav-0475", "local msgid navigation did not project a bounded context window");
+        Require(view.EntriesSnapshot.Count(entry => entry.IsNavigationAnchor) == 1 && view.NavigationAnchor?.ServerMessageId == "nav-0425", "local msgid navigation did not mark its anchor");
+
+        var localTime = await sessions.JumpToHistoryTimestampAsync(network, view, baseTime.AddMinutes(700).AddSeconds(30)).ConfigureAwait(true);
+        Require(localTime.Outcome == HistoryNavigationOutcome.NearestLocalMatch && localTime.Anchor.Anchor?.Record.ServerMessageId == "nav-0700", "timestamp navigation did not use the deterministic earlier tie-break");
+        Require(demo.AlphaTransport.OutboundLines.Count == trafficBeforeJump, "local timestamp navigation issued IRC traffic");
+
+        var localTrafficBeforePaging = demo.AlphaTransport.OutboundLines.Count;
+        var localPages = 0;
+        while (view.EntriesSnapshot[^1].ServerMessageId != "nav-1000")
+        {
+            var result = await sessions.LoadNewerMessagesAsync(network, view).ConfigureAwait(true);
+            Require(result.Succeeded, "local newer navigation failed");
+            localPages++;
+            Require(localPages <= 10, "local newer navigation did not converge within the bounded fixture");
+        }
+
+        Require(demo.AlphaTransport.OutboundLines.Count == localTrafficBeforePaging, "local newer navigation contacted the server");
+        await sessions.JumpToHistoryTimestampAsync(network, view, baseTime.AddMinutes(700).AddSeconds(30)).ConfigureAwait(true);
+        var membersBeforeLive = channelState(view);
+        var unreadBeforeLive = view.UnreadCount;
+
+        for (var index = 1; index <= 5; index++)
+        {
+            demo.AlphaTransport.EnqueueInboundLine($"@msgid=nav-live-{index:000};time={baseTime.AddMinutes(1000 + index):O} :Alex!u@alpha PRIVMSG {conversationName} :live-{index:000}");
+        }
+
+        await WaitForAsync(sessions, () => view.EntriesSnapshot.Count(entry => entry.ServerMessageId is not null && entry.ServerMessageId.StartsWith("nav-live-", StringComparison.Ordinal)) == 5, "live messages did not reach the history view").ConfigureAwait(true);
+        Require(view.IsViewingHistory && !view.IsFollowingLive && view.HasNewerLiveMessages, "live traffic pulled the viewport away from the historical position");
+        Require(view.UnreadCount == unreadBeforeLive, "historical navigation changed unread state while live traffic arrived");
+        Require(channelState(view) == membersBeforeLive, "historical navigation changed current channel state");
+
+        await logs.FlushAsync().ConfigureAwait(true);
+        var returned = await sessions.ReturnToLatestAsync(network, view).ConfigureAwait(true);
+        Require(returned.Outcome == HistoryNavigationOutcome.LocalEndReached && view.IsFollowingLive && !view.IsViewingHistory, "return-to-latest did not restore live-follow mode");
+        Require(view.NavigationAnchor is null && view.EntriesSnapshot[^1].ServerMessageId == "nav-live-005", "return-to-latest did not project the current canonical edge");
+        Require(view.UnreadCount == unreadBeforeLive, "return-to-latest changed unread state");
+
+        var trafficBeforeRemote = demo.AlphaTransport.OutboundLines.Count;
+        var remoteJump = sessions.JumpToHistoryMessageAsync(network, view, "nav-remote-0404").AsTask();
+        await WaitForPollingAsync(() => demo.AlphaTransport.OutboundLines.Any(line => line.StartsWith($"CHATHISTORY AROUND {conversationName} msgid=nav-remote-0404", StringComparison.Ordinal)), "remote AROUND navigation request was not sent").ConfigureAwait(true);
+        demo.AlphaTransport.EnqueueInboundLine($":alpha.server BATCH +phase22-around chathistory {conversationName}");
+        demo.AlphaTransport.EnqueueInboundLine($"@batch=phase22-around;msgid=nav-remote-0405;time={baseTime.AddMinutes(2000):O} :Alex!u@alpha PRIVMSG {conversationName} :remote-405");
+        demo.AlphaTransport.EnqueueInboundLine($"@batch=phase22-around;draft/chathistory-context=1;msgid=nav-remote-0403;time={baseTime.AddMinutes(1999):O} :Alex!u@alpha PRIVMSG {conversationName} :remote-403 context");
+        demo.AlphaTransport.EnqueueInboundLine($"@batch=phase22-around;msgid=nav-remote-0404;time={baseTime.AddMinutes(2000):O} :Alex!u@alpha PRIVMSG {conversationName} :remote-404");
+        demo.AlphaTransport.EnqueueInboundLine(":alpha.server BATCH -phase22-around");
+        var remoteResult = await remoteJump.ConfigureAwait(true);
+        Require(remoteResult.Outcome == HistoryNavigationOutcome.RemotelyRetrievedExactMatch && remoteResult.IsExact, "remote AROUND navigation did not establish the returned exact anchor");
+        Require(view.NavigationAnchor?.ServerMessageId == "nav-remote-0404", "remote AROUND navigation did not position the returned anchor");
+        var trafficAfterRemote = demo.AlphaTransport.OutboundLines.Count;
+        var repeatedRemoteJump = await sessions.JumpToHistoryMessageAsync(network, view, "nav-remote-0404").ConfigureAwait(true);
+        Require(repeatedRemoteJump.Outcome == HistoryNavigationOutcome.ExactLocalMatch && demo.AlphaTransport.OutboundLines.Count == trafficAfterRemote, "a retrieved remote anchor was not local-only on repeat");
+        Require(trafficAfterRemote == trafficBeforeRemote + 1, "remote AROUND navigation issued more than one request");
+        Console.WriteLine($"HISTORY_NAVIGATION_UI_TRACE local_msgid_exact=true local_timestamp_tie=earlier local_newer_pages={localPages} remote_around_requests=1 repeat_local=true live_follow_restored=true unread_unchanged=true current_state_unchanged=true");
+
+        static string channelState(ChannelView channel) =>
+            string.Join("|", channel.MembersSnapshot.Select(member => $"{member.Nickname}:{string.Join(',', member.PrefixModes.OrderBy(value => value))}").OrderBy(value => value, StringComparer.Ordinal))
+            + $";topic={channel.Topic};modes={string.Concat(channel.Modes.OrderBy(value => value))};sync={channel.Synchronization}";
     }
 
     private static async Task HistoryGapRepairAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)

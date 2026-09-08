@@ -20,6 +20,7 @@ public partial class MainWindow : Window
     private bool _closing;
     private bool _shutdownComplete;
     private bool _renderingSubscribed;
+    private bool _viewportRestoreQueued;
     private readonly PresentationTimingProbe _presentationTiming = new();
     private readonly TaskCompletionSource _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly HashSet<ListBox> _historyScrollArmed = [];
@@ -48,6 +49,7 @@ public partial class MainWindow : Window
             Activate();
             Focus();
         };
+        ViewModel.Sessions.NavigationChanged += OnConversationNavigationChanged;
         AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(OnPreviewRightClick), true);
         Closed += OnClosed;
     }
@@ -98,6 +100,7 @@ public partial class MainWindow : Window
         if (sender is ListBox list && e.Delta > 0)
         {
             _historyScrollArmed.Add(list);
+            (list.DataContext as WorkspaceView)?.EnterHistoryView();
         }
     }
 
@@ -106,12 +109,19 @@ public partial class MainWindow : Window
         if (sender is ListBox list && e.Key is Key.Up or Key.PageUp or Key.Home)
         {
             _historyScrollArmed.Add(list);
+            (list.DataContext as WorkspaceView)?.EnterHistoryView();
         }
     }
 
     private async void OnConversationScrollChanged(object sender, ScrollChangedEventArgs e)
     {
         var list = sender as ListBox ?? FindAncestor<ListBox>(e.OriginalSource as DependencyObject);
+        if (list?.DataContext is WorkspaceView stateView
+            && !_historyScrollLoading.Contains(list)
+            && e.ExtentHeight > e.ViewportHeight)
+        {
+            stateView.SetLiveFollow(e.VerticalOffset + e.ViewportHeight >= e.ExtentHeight - 1);
+        }
         if (list is null
             || e.VerticalOffset > 1
             || !_historyScrollArmed.Contains(list)
@@ -133,7 +143,7 @@ public partial class MainWindow : Window
         _historyScrollPositions[list] = (scroll.VerticalOffset, scroll.ExtentHeight);
         try
         {
-            await ViewModel.Sessions.LoadOlderMessagesAsync(network, view).ConfigureAwait(true);
+            await ExecuteHistoryActionAsync(network, view, WorkspaceActionId.LoadOlderMessages).ConfigureAwait(true);
             await ViewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
             await Dispatcher.InvokeAsync(
                 () =>
@@ -162,8 +172,99 @@ public partial class MainWindow : Window
             return;
         }
 
-        var result = await ViewModel.Sessions.LoadOlderMessagesAsync(network, view).ConfigureAwait(true);
+        var result = await ExecuteHistoryActionAsync(network, view, WorkspaceActionId.LoadOlderMessages).ConfigureAwait(true);
         ViewModel.StatusText = result.Message;
+    }
+
+    private async void OnLoadNewerMessagesClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not System.Windows.Controls.Button { DataContext: WorkspaceView view }
+            || !ViewModel.Sessions.TryGet(view.NetworkId, out var network)
+            || network is null)
+        {
+            return;
+        }
+
+        var result = await ExecuteHistoryActionAsync(network, view, WorkspaceActionId.LoadNewerMessages).ConfigureAwait(true);
+        ViewModel.StatusText = result.Message;
+    }
+
+    private async void OnReturnToLatestClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not System.Windows.Controls.Button { DataContext: WorkspaceView view }
+            || !ViewModel.Sessions.TryGet(view.NetworkId, out var network)
+            || network is null)
+        {
+            return;
+        }
+
+        var result = await ExecuteHistoryActionAsync(network, view, WorkspaceActionId.ReturnToLatest).ConfigureAwait(true);
+        ViewModel.StatusText = result.Message;
+        RestoreConversationViewport();
+    }
+
+    private ValueTask<CommandDispatchResult> ExecuteHistoryActionAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        WorkspaceActionId action) => view switch
+        {
+            ChannelView channel => ViewModel.Actions.ExecuteChannelAsync(network, channel, action),
+            QueryView query => ViewModel.Actions.ExecuteQueryAsync(network, query, action),
+            _ => ValueTask.FromResult(CommandDispatchResult.Failure("History navigation is available only for channels and queries.", view))
+        };
+
+    private void OnConversationNavigationChanged(object? sender, EventArgs e)
+    {
+        if (ViewModel.ActiveView is not { IsViewingHistory: true })
+        {
+            return;
+        }
+
+        if (_viewportRestoreQueued)
+        {
+            return;
+        }
+
+        _viewportRestoreQueued = true;
+        Dispatcher.BeginInvoke(
+            () =>
+            {
+                _viewportRestoreQueued = false;
+                RestoreConversationViewport();
+            },
+            System.Windows.Threading.DispatcherPriority.Loaded);
+    }
+
+    private void RestoreConversationViewport()
+    {
+        if (ViewModel.ActiveView is not { } view)
+        {
+            return;
+        }
+
+        var list = EnumerateDescendants<ListBox>(this)
+            .FirstOrDefault(candidate => ReferenceEquals(candidate.ItemsSource, view.Entries));
+        if (list is null)
+        {
+            return;
+        }
+
+        if (view.NavigationAnchor is { } anchor)
+        {
+            var item = list.Items.Cast<object>().FirstOrDefault(candidate => candidate is TranscriptEntry entry
+                && (entry.ServerMessageId is not null
+                    ? string.Equals(entry.ServerMessageId, anchor.ServerMessageId, StringComparison.Ordinal)
+                    : entry.Timestamp == anchor.Timestamp && entry.Sequence == anchor.Sequence));
+            if (item is not null)
+            {
+                list.SelectedItem = item;
+                list.ScrollIntoView(item);
+            }
+        }
+        else if (view.IsFollowingLive)
+        {
+            FindDescendant<ScrollViewer>(list)?.ScrollToEnd();
+        }
     }
 
     private void OnRendering(object? sender, EventArgs e) => _presentationTiming.RecordRendering(Stopwatch.GetTimestamp());
@@ -854,6 +955,24 @@ public partial class MainWindow : Window
         }
 
         return null;
+    }
+
+    private static IEnumerable<T> EnumerateDescendants<T>(DependencyObject source)
+        where T : DependencyObject
+    {
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(source); index++)
+        {
+            var child = VisualTreeHelper.GetChild(source, index);
+            if (child is T match)
+            {
+                yield return match;
+            }
+
+            foreach (var descendant in EnumerateDescendants<T>(child))
+            {
+                yield return descendant;
+            }
+        }
     }
 
     private void OnAboutClick(object sender, RoutedEventArgs e) =>

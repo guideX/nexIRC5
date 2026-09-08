@@ -50,6 +50,11 @@
                                     <Setter Property="Background" Value="#FEF3C7" />
                                     <Setter Property="Foreground" Value="#92400E" />
                                 </DataTrigger>
+                                <DataTrigger Binding="{Binding IsNavigationAnchor}" Value="True">
+                                    <Setter Property="Background" Value="#DBEAFE" />
+                                    <Setter Property="Foreground" Value="#1D4ED8" />
+                                    <Setter Property="FontWeight" Value="SemiBold" />
+                                </DataTrigger>
                                 <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.Capability}">
                                     <Setter Property="Foreground" Value="#047857" />
                                 </DataTrigger>
@@ -158,7 +163,11 @@
                                 <ListBox ItemsSource="{Binding HistoryContext}" ItemTemplate="{StaticResource HistoryContextEntryTemplate}" BorderThickness="0" FontFamily="Cascadia Mono" />
                             </DockPanel>
                         </Expander>
-                        <Button Grid.Row="2" Content="{Binding OlderHistoryStatus}" Click="OnLoadOlderMessagesClick" HorizontalAlignment="Left" Padding="10,3" Margin="0,8,0,0" AutomationProperties.AutomationId="LoadOlderMessages" />
+                        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,8,0,0">
+                            <Button Content="{Binding OlderHistoryStatus}" Click="OnLoadOlderMessagesClick" Padding="10,3" Margin="0,0,6,0" AutomationProperties.AutomationId="LoadOlderMessages" />
+                            <Button Content="{Binding NewerHistoryStatus}" Click="OnLoadNewerMessagesClick" Padding="10,3" Margin="0,0,6,0" AutomationProperties.AutomationId="LoadNewerMessages" />
+                            <Button Content="Return to latest" Click="OnReturnToLatestClick" Padding="10,3" AutomationProperties.AutomationId="ReturnToLatest" />
+                        </StackPanel>
                     </Grid>
                     <Border Grid.Column="1" Width="205" Margin="10,0,0,0" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="1" Visibility="{Binding DataContext.IsMemberListVisible, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource BooleanToVisibility}}">
                         <DockPanel>
@@ -202,7 +211,11 @@
                             <ListBox ItemsSource="{Binding HistoryContext}" ItemTemplate="{StaticResource HistoryContextEntryTemplate}" BorderThickness="0" FontFamily="Cascadia Mono" />
                         </DockPanel>
                     </Expander>
-                    <Button Grid.Row="2" Content="{Binding OlderHistoryStatus}" Click="OnLoadOlderMessagesClick" HorizontalAlignment="Left" Padding="10,3" Margin="0,8,0,0" AutomationProperties.AutomationId="LoadOlderMessages" />
+                    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,8,0,0">
+                        <Button Content="{Binding OlderHistoryStatus}" Click="OnLoadOlderMessagesClick" Padding="10,3" Margin="0,0,6,0" AutomationProperties.AutomationId="LoadOlderMessages" />
+                        <Button Content="{Binding NewerHistoryStatus}" Click="OnLoadNewerMessagesClick" Padding="10,3" Margin="0,0,6,0" AutomationProperties.AutomationId="LoadNewerMessages" />
+                        <Button Content="Return to latest" Click="OnReturnToLatestClick" Padding="10,3" AutomationProperties.AutomationId="ReturnToLatest" />
+                    </StackPanel>
                 </Grid>
             </Grid>
         </DataTemplate>

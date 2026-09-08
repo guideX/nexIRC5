@@ -19,8 +19,11 @@ public enum ChathistoryRequestPurpose
     InitialContext,
     ReconnectGap,
     LoadOlder,
+    LoadNewer,
     ReconnectDiscovery,
     LoadContext,
+    NavigateToMessage,
+    NavigateToTimestamp,
     ExactGapRepair
 }
 
@@ -188,6 +191,25 @@ public sealed record ChathistoryRequest
             Operation = ChathistoryOperation.Between,
             Reference = older,
             SecondaryReference = newer,
+            Limit = limit,
+            Purpose = purpose
+        };
+
+    public static ChathistoryRequest ForAfter(
+        Guid networkId,
+        int connectionGeneration,
+        string conversation,
+        string target,
+        ChathistoryReference frontier,
+        int limit,
+        ChathistoryRequestPurpose purpose = ChathistoryRequestPurpose.LoadNewer) => new()
+        {
+            NetworkId = networkId,
+            ConnectionGeneration = connectionGeneration,
+            Conversation = conversation,
+            Target = target,
+            Operation = ChathistoryOperation.After,
+            Reference = frontier,
             Limit = limit,
             Purpose = purpose
         };
@@ -458,11 +480,27 @@ public sealed record ChathistoryResult(
             var unique = new HashSet<IrcMessage>();
             foreach (var message in Messages)
             {
-                unique.Add(message.Message);
+                if (!ChathistoryContext.IsContextRow(message.Message))
+                {
+                    unique.Add(message.Message);
+                }
             }
 
             return unique.Count;
         }
+    }
+
+    public int ContextMessageCount => Messages.Count(message => ChathistoryContext.IsContextRow(message.Message));
+}
+
+public static class ChathistoryContext
+{
+    public const string TagName = "draft/chathistory-context";
+
+    public static bool IsContextRow(IrcMessage message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        return message.TagValues.Keys.Any(key => string.Equals(key, TagName, StringComparison.OrdinalIgnoreCase));
     }
 }
 
@@ -474,6 +512,10 @@ public sealed record ChathistoryConversationState(
     bool LastRequestFailed,
     string? LastFailure)
 {
+    public bool LatestReached { get; init; }
+
+    public ChathistoryOperation? LastRequestOperation { get; init; }
+
     public static ChathistoryConversationState Empty(string conversation, int generation) =>
         new(conversation, generation, false, false, false, null);
 }

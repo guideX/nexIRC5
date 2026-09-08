@@ -170,6 +170,14 @@ public sealed class ServerSession : IAsyncDisposable
             && state.ConnectionGeneration == Snapshot.ConnectionGeneration;
     }
 
+    public bool CanLoadNewerHistory(string conversation)
+    {
+        var state = GetChathistoryState(conversation);
+        return ChathistorySupport.IsUsable
+            && !state.RequestActive
+            && state.ConnectionGeneration == Snapshot.ConnectionGeneration;
+    }
+
     public bool CancelHistoryRequest(string conversation)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(conversation);
@@ -1040,7 +1048,8 @@ public sealed class ServerSession : IAsyncDisposable
                 suppressBatchedState = !historicalPlayback;
                 if (historicalPlayback
                     && message.Command is "PRIVMSG" or "NOTICE"
-                    && _activeHistoryRequest!.Messages.Count >= _activeHistoryRequest.Request.Limit)
+                    && !ChathistoryContext.IsContextRow(message)
+                    && _activeHistoryRequest!.Messages.Count(item => !ChathistoryContext.IsContextRow(item.Message)) >= _activeHistoryRequest.Request.Limit)
                 {
                     historyLimitExceeded = true;
                     historicalPlayback = false;
@@ -1826,7 +1835,9 @@ public sealed class ServerSession : IAsyncDisposable
         bool requestActive,
         bool beginningReached,
         bool failed,
-        string? failure)
+        string? failure,
+        bool? latestReached = null,
+        ChathistoryOperation? lastRequestOperation = null)
     {
         var previous = GetHistoryStateUnsafe(conversation);
         _historyStates[NormalizeHistoryConversation(conversation)] = new ChathistoryConversationState(
@@ -1835,7 +1846,11 @@ public sealed class ServerSession : IAsyncDisposable
             requestActive,
             beginningReached,
             failed,
-            failure ?? (requestActive ? null : previous.LastFailure));
+            failure ?? (requestActive ? null : previous.LastFailure))
+        {
+            LatestReached = latestReached ?? previous.LatestReached,
+            LastRequestOperation = lastRequestOperation ?? previous.LastRequestOperation
+        };
     }
 
     private void CompleteHistoryRequest(
@@ -1854,8 +1869,12 @@ public sealed class ServerSession : IAsyncDisposable
 
             _activeHistoryRequest = null;
             _acceptedHistoryBatches.Clear();
-            var reachedBeginning = completion == ChathistoryRequestCompletion.Succeeded
+            var reachedBeginning = pending.Request.Operation == ChathistoryOperation.Before
+                && completion == ChathistoryRequestCompletion.Succeeded
                 && (exhausted || pending.Messages.Count == 0);
+            var reachedLatest = pending.Request.Operation == ChathistoryOperation.After
+                && completion == ChathistoryRequestCompletion.Succeeded
+                && exhausted;
             if (pending.Request.Conversation is { Length: > 0 } conversation)
             {
                 var previous = GetHistoryStateUnsafe(conversation);
@@ -1864,7 +1883,9 @@ public sealed class ServerSession : IAsyncDisposable
                     requestActive: false,
                     beginningReached: reachedBeginning || previous.BeginningReached,
                     failed: completion is not ChathistoryRequestCompletion.Succeeded,
-                    failure: failure);
+                    failure: failure,
+                    latestReached: reachedLatest || previous.LatestReached,
+                    lastRequestOperation: pending.Request.Operation);
             }
         }
 

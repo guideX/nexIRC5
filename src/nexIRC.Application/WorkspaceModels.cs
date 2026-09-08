@@ -120,6 +120,9 @@ public sealed record TranscriptEntry(
 
     public string? BatchId { get; init; }
 
+    /// <summary>Temporary presentation marker used by explicit history jumps.</summary>
+    public bool IsNavigationAnchor { get; init; }
+
     public string DisplayTime => Timestamp.ToLocalTime().ToString("HH:mm:ss", System.Globalization.CultureInfo.CurrentCulture);
 
     public bool IsOutgoing => Kind is TranscriptEntryKind.OutgoingMessage
@@ -256,6 +259,11 @@ public abstract class WorkspaceView : ObservableObject
     private bool _isActive;
     private bool _isViewOpen = true;
     private bool _isLoadingOlderHistory;
+    private bool _isLoadingNewerHistory;
+    private bool _isViewingHistory;
+    private bool _isFollowingLive = true;
+    private bool _hasNewerLiveMessages;
+    private TranscriptEntry? _navigationAnchor;
     private HistoryCoverageSnapshot? _historyCoverage;
     private ConversationLifecycleState _lifecycleState = ConversationLifecycleState.HistoricalOnly;
     private DateTimeOffset _lastActivity;
@@ -369,6 +377,56 @@ public abstract class WorkspaceView : ObservableObject
         }
     }
 
+    public bool IsLoadingNewerHistory
+    {
+        get => _isLoadingNewerHistory;
+        internal set
+        {
+            if (SetProperty(ref _isLoadingNewerHistory, value))
+            {
+                OnPropertyChanged(nameof(NewerHistoryStatus));
+            }
+        }
+    }
+
+    public bool IsViewingHistory
+    {
+        get => _isViewingHistory;
+        private set
+        {
+            if (SetProperty(ref _isViewingHistory, value))
+            {
+                OnPropertyChanged(nameof(NavigationStatus));
+            }
+        }
+    }
+
+    public bool IsFollowingLive
+    {
+        get => _isFollowingLive;
+        private set => SetProperty(ref _isFollowingLive, value);
+    }
+
+    public bool HasNewerLiveMessages
+    {
+        get => _hasNewerLiveMessages;
+        private set => SetProperty(ref _hasNewerLiveMessages, value);
+    }
+
+    public TranscriptEntry? NavigationAnchor
+    {
+        get => _navigationAnchor;
+        private set
+        {
+            if (SetProperty(ref _navigationAnchor, value))
+            {
+                OnPropertyChanged(nameof(NavigationAnchorIdentity));
+            }
+        }
+    }
+
+    public string? NavigationAnchorIdentity => NavigationAnchor?.ServerMessageId;
+
     public HistoryCoverageSnapshot? HistoryCoverage => _historyCoverage;
 
     public string OlderHistoryStatus => IsLoadingOlderHistory
@@ -381,6 +439,16 @@ public abstract class WorkspaceView : ObservableObject
             HistoryCoverageState.LocalBeginningReached => "Local history exhausted",
             _ => "Load older messages"
         };
+
+    public string NewerHistoryStatus => IsLoadingNewerHistory
+        ? "Loading newer history…"
+        : HistoryCoverage?.RemoteForwardExhausted == true
+            ? "Latest server history reached"
+            : "Load newer messages";
+
+    public string NavigationStatus => IsViewingHistory
+        ? HasNewerLiveMessages ? "Viewing history · newer live messages available" : "Viewing history"
+        : "Following latest";
 
     public ConversationLifecycleState LifecycleState
     {
@@ -434,6 +502,17 @@ public abstract class WorkspaceView : ObservableObject
         }
     }
 
+    internal (TranscriptEntry? Oldest, TranscriptEntry? Newest) EntryBoundariesSnapshot
+    {
+        get
+        {
+            lock (_entriesGate)
+            {
+                return Entries.Count == 0 ? (null, null) : (Entries[0], Entries[^1]);
+            }
+        }
+    }
+
     public int EntryCount => Entries.Count;
 
     internal void Append(
@@ -454,6 +533,11 @@ public abstract class WorkspaceView : ObservableObject
             {
                 Entries.RemoveAt(0);
             }
+        }
+
+        if (entry.Provenance == ConversationEntryProvenance.Live && IsViewingHistory)
+        {
+            HasNewerLiveMessages = true;
         }
 
         if (markActivity && !IsActive)
@@ -514,6 +598,11 @@ public abstract class WorkspaceView : ObservableObject
                     Entries.RemoveAt(historical ? Entries.Count - 1 : 0);
                 }
 
+                if (!historical && IsViewingHistory)
+                {
+                    HasNewerLiveMessages = true;
+                }
+
                 return true;
             }
 
@@ -540,6 +629,11 @@ public abstract class WorkspaceView : ObservableObject
                     Entries.Add(ordered);
                 }
             }
+        }
+
+        if (!historical && IsViewingHistory)
+        {
+            HasNewerLiveMessages = true;
         }
 
         return true;
@@ -627,10 +721,104 @@ public abstract class WorkspaceView : ObservableObject
         }
     }
 
-    internal void SetHistoryCoverage(HistoryCoverageSnapshot coverage)
+    internal void ReplaceHistoryWindow(
+        IEnumerable<ConversationLogRecord> records,
+        ConversationEntryProvenance provenance,
+        ConversationLogRecord? anchor = null)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        var projected = ConversationHistoryOrdering.OrderAscending(records)
+            .TakeLast(MaximumEntries)
+            .Select(record => ConversationHistoryProjection.ToTranscriptEntry(record, provenance))
+            .ToArray();
+        var anchorEntry = projected.FirstOrDefault(entry => IsSameNavigationRecord(entry, anchor));
+        lock (_entriesGate)
+        {
+            using (WorkspaceProjectionBatch.Begin())
+            {
+                Entries.Clear();
+                foreach (var entry in projected)
+                {
+                    Entries.Add(entry with { IsNavigationAnchor = ReferenceEquals(entry, anchorEntry) });
+                }
+            }
+        }
+
+        NavigationAnchor = anchorEntry is null ? null : anchorEntry with { IsNavigationAnchor = true };
+    }
+
+    internal void SetNavigationAnchor(ConversationLogRecord? anchor)
+    {
+        lock (_entriesGate)
+        {
+            for (var index = 0; index < Entries.Count; index++)
+            {
+                var entry = Entries[index];
+                Entries[index] = entry with { IsNavigationAnchor = IsSameNavigationRecord(entry, anchor) };
+            }
+
+            NavigationAnchor = Entries.FirstOrDefault(entry => IsSameNavigationRecord(entry, anchor));
+        }
+    }
+
+    public void EnterHistoryView()
+    {
+        IsViewingHistory = true;
+        IsFollowingLive = false;
+        OnPropertyChanged(nameof(NavigationStatus));
+    }
+
+    public void SetLiveFollow(bool following)
+    {
+        IsFollowingLive = following;
+        IsViewingHistory = !following;
+        if (following)
+        {
+            HasNewerLiveMessages = false;
+        }
+    }
+
+    internal void ReturnToLatest()
+    {
+        NavigationAnchor = null;
+        lock (_entriesGate)
+        {
+            for (var index = 0; index < Entries.Count; index++)
+            {
+                if (Entries[index].IsNavigationAnchor)
+                {
+                    Entries[index] = Entries[index] with { IsNavigationAnchor = false };
+                }
+            }
+        }
+
+        HasNewerLiveMessages = false;
+        IsViewingHistory = false;
+        IsFollowingLive = true;
+        OnPropertyChanged(nameof(NavigationStatus));
+    }
+
+    private static bool IsSameNavigationRecord(TranscriptEntry entry, ConversationLogRecord? record)
+    {
+        if (record is null)
+        {
+            return false;
+        }
+
+        return record.ServerMessageId is { Length: > 0 }
+            ? string.Equals(entry.ServerMessageId, record.ServerMessageId, StringComparison.Ordinal)
+            : entry.Timestamp == record.Timestamp && entry.Sequence == record.DurableSequence;
+    }
+
+    internal void SetHistoryCoverage(HistoryCoverageSnapshot coverage, bool notify = true)
     {
         ArgumentNullException.ThrowIfNull(coverage);
         _historyCoverage = coverage;
+        if (!notify)
+        {
+            return;
+        }
+
         OnPropertyChanged(nameof(HistoryCoverage));
         OnPropertyChanged(nameof(OlderHistoryStatus));
     }

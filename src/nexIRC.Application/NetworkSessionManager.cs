@@ -275,6 +275,26 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 && network.Session.CanLoadOlderHistory(conversation);
     }
 
+    public bool CanLoadNewerHistory(NetworkWorkspace network, WorkspaceView view)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(view);
+        if (network.Id != view.NetworkId || view is not (ChannelView or QueryView))
+        {
+            return false;
+        }
+
+        var coverage = GetHistoryCoverage(network.Id, HistoryConversation(view));
+        if (coverage.RemoteForwardExhausted || coverage.ForwardNoProgressTerminated)
+        {
+            return false;
+        }
+
+        return _logStore is not null
+            || network.Snapshot.Registration == RegistrationState.Registered
+                && network.Session.CanLoadNewerHistory(HistoryConversation(view));
+    }
+
     public bool CanLoadContextAround(NetworkWorkspace network, WorkspaceView view, TranscriptEntry anchor)
     {
         ArgumentNullException.ThrowIfNull(network);
@@ -409,6 +429,385 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
     }
 
+    public ValueTask<HistoryNavigationResult> JumpToHistoryMessageAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        string serverMessageId,
+        CancellationToken cancellationToken = default) =>
+        NavigateHistoryAsync(
+            network,
+            view,
+            HistoryNavigationRequest.ForMessage(HistoryAddress(network, view), serverMessageId),
+            cancellationToken);
+
+    public ValueTask<HistoryNavigationResult> JumpToHistoryTimestampAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        DateTimeOffset timestamp,
+        HistoryAnchorDirection direction = HistoryAnchorDirection.Around,
+        CancellationToken cancellationToken = default) =>
+        NavigateHistoryAsync(
+            network,
+            view,
+            HistoryNavigationRequest.ForTimestamp(HistoryAddress(network, view), timestamp, direction),
+            cancellationToken);
+
+    public async ValueTask<HistoryNavigationResult> NavigateHistoryAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        HistoryNavigationRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(view);
+        ArgumentNullException.ThrowIfNull(request);
+        if (!HistoryNavigationValidation.IsValid(request)
+            || network.Id != view.NetworkId
+            || request.Conversation.NetworkId != network.Id
+            || !HistoryNavigationValidation.MatchesView(request.Conversation, HistoryAddress(network, view)))
+        {
+            return HistoryNavigationResult.Create(request, HistoryNavigationOutcome.Failed, "The history navigation target is not valid for this view.");
+        }
+
+        var local = await ReadLocalNavigationContextAsync(view, request, cancellationToken).ConfigureAwait(false);
+        if (local is { Anchor.Found: true, Records.Count: > 0 })
+        {
+            await ApplyHistoryNavigationAsync(network, view, local).ConfigureAwait(false);
+            var outcome = request.IsMessageRequest || local.Anchor.Match == HistoryAnchorMatch.Exact
+                ? HistoryNavigationOutcome.ExactLocalMatch
+                : HistoryNavigationOutcome.NearestLocalMatch;
+            return HistoryNavigationResult.Create(
+                request,
+                outcome,
+                outcome == HistoryNavigationOutcome.ExactLocalMatch ? "Jumped to the local history anchor." : "Jumped to the nearest local history anchor.",
+                local.Anchor,
+                local.Records);
+        }
+
+        var support = network.Session.ChathistorySupport;
+        if (network.Snapshot.Registration != RegistrationState.Registered || !support.IsUsable)
+        {
+            return HistoryNavigationResult.Create(request, HistoryNavigationOutcome.Unsupported, "The requested history anchor is not local and remote history is unavailable.");
+        }
+
+        var target = SelectHistoryTarget(view);
+        if (target is null)
+        {
+            return HistoryNavigationResult.Create(request, HistoryNavigationOutcome.UnsafeTarget, "Remote history navigation was refused because the current conversation target is not safely bound.");
+        }
+
+        var reference = request.IsMessageRequest
+            ? support.Supports(ChathistoryReferenceType.MessageId) && request.ServerMessageId is { Length: > 0 }
+                ? ChathistoryReference.MessageId(request.ServerMessageId)
+                : null
+            : support.Supports(ChathistoryReferenceType.Timestamp) && request.Timestamp is { } timestamp
+                ? ChathistoryReference.Timestamp(timestamp)
+                : null;
+        if (reference is null)
+        {
+            return HistoryNavigationResult.Create(request, HistoryNavigationOutcome.Unsupported, "The server does not advertise a compatible history reference type.");
+        }
+
+        var generation = network.Snapshot.ConnectionGeneration;
+        var remoteRequest = new ChathistoryRequest
+        {
+            NetworkId = network.Id,
+            ConnectionGeneration = generation,
+            Conversation = HistoryConversation(view),
+            Target = target,
+            Operation = ChathistoryOperation.Around,
+            Reference = reference,
+            Limit = Math.Min(network.Session.MaximumChathistoryRequestSize, ConfigurationLimits.MaximumHistoryContextEntries),
+            Purpose = request.IsMessageRequest ? ChathistoryRequestPurpose.NavigateToMessage : ChathistoryRequestPurpose.NavigateToTimestamp
+        };
+
+        ChathistoryResult remote;
+        try
+        {
+            remote = await network.Session.RequestHistoryAsync(remoteRequest, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return HistoryNavigationResult.Create(request, HistoryNavigationOutcome.Cancelled, "History navigation was cancelled.");
+        }
+        catch (InvalidOperationException exception)
+        {
+            return HistoryNavigationResult.Create(request, HistoryNavigationOutcome.Failed, exception.Message);
+        }
+
+        if (remote.Completion == ChathistoryRequestCompletion.StaleGeneration)
+        {
+            return HistoryNavigationResult.Create(request, HistoryNavigationOutcome.Stale, "The history navigation response belongs to a stale connection generation.");
+        }
+
+        if (remote.Completion is ChathistoryRequestCompletion.Cancelled or ChathistoryRequestCompletion.Disconnected)
+        {
+            return HistoryNavigationResult.Create(request, HistoryNavigationOutcome.Cancelled, remote.Failure ?? "History navigation was cancelled.");
+        }
+
+        if (!remote.Succeeded)
+        {
+            return HistoryNavigationResult.Create(request, HistoryNavigationOutcome.Failed, remote.Failure ?? "The remote history navigation request failed.");
+        }
+
+        if (network.Snapshot.ConnectionGeneration != generation)
+        {
+            return HistoryNavigationResult.Create(request, HistoryNavigationOutcome.Stale, "The history navigation response belongs to a stale connection generation.");
+        }
+
+        // The session completes its request at the batch terminator while
+        // semantic presentation is queued on the serialized workspace
+        // dispatcher.  Drain that boundary before querying the durable index
+        // or rebuilding the fallback context from projected rows.
+        await FlushStateDispatchAsync().ConfigureAwait(false);
+
+        var remoteContextRecords = remote.Messages
+            .Where(item => item.IsHistorical
+                && item.NetworkId == network.Id
+                && string.Equals(item.HistoricalConversation, HistoryConversation(view), StringComparison.Ordinal))
+            .Select(item => IrcEventPresentation.Render(item, network.Session.Snapshot))
+            .OfType<TranscriptEntry>()
+            .Select(item => CreateConversationRecord(network, view, item))
+            .ToArray();
+
+        if (_logStore is not null)
+        {
+            await _logStore.FlushAsync(cancellationToken).ConfigureAwait(false);
+            local = await ReadLocalNavigationContextAsync(view, request, cancellationToken).ConfigureAwait(false);
+            if (local is { Anchor.Found: true, Records.Count: > 0 })
+            {
+                await ApplyHistoryNavigationAsync(network, view, local).ConfigureAwait(false);
+                var exactOutcome = request.IsMessageRequest || local.Anchor.Match == HistoryAnchorMatch.Exact
+                    ? HistoryNavigationOutcome.RemotelyRetrievedExactMatch
+                    : HistoryNavigationOutcome.NearestLocalMatch;
+                return HistoryNavigationResult.Create(request, exactOutcome, exactOutcome == HistoryNavigationOutcome.RemotelyRetrievedExactMatch ? "Retrieved and opened the requested history anchor." : "Retrieved and opened the nearest history anchor.", local.Anchor, local.Records);
+            }
+        }
+
+        var remoteContext = ReadProjectedNavigationContext(network, view, request, remoteContextRecords);
+        if (remoteContext is { Records.Count: > 0 })
+        {
+            await ApplyHistoryNavigationAsync(network, view, remoteContext).ConfigureAwait(false);
+            var remoteOutcome = remoteContext.Anchor.Match == HistoryAnchorMatch.Exact
+                ? HistoryNavigationOutcome.RemotelyRetrievedExactMatch
+                : HistoryNavigationOutcome.RemotelyRetrievedContext;
+            return HistoryNavigationResult.Create(
+                request,
+                remoteOutcome,
+                remoteOutcome == HistoryNavigationOutcome.RemotelyRetrievedExactMatch
+                    ? "Retrieved and opened the requested history anchor."
+                    : request.IsMessageRequest ? "Retrieved surrounding history, but the requested msgid was not present." : "Retrieved surrounding history; the requested timestamp was not represented exactly.",
+                remoteContext.Anchor,
+                remoteContext.Records);
+        }
+
+        return HistoryNavigationResult.Create(request, HistoryNavigationOutcome.NotFound, "The server returned no safely navigable history for the requested anchor.");
+    }
+
+    public async ValueTask<HistoryNavigationResult> ReturnToLatestAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(view);
+        var request = HistoryNavigationRequest.ForTimestamp(HistoryAddress(network, view), DateTimeOffset.UtcNow);
+        ConversationLogRecord[] records;
+        if (_logStore is not null)
+        {
+            await _logStore.FlushAsync(cancellationToken).ConfigureAwait(false);
+            records = await ReadLatestHistoryWindowAsync(network, view, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            records = view.EntriesSnapshot.Select(entry => CreateConversationRecord(network, view, entry)).ToArray();
+        }
+
+        await InvokeOnDispatcherAsync(
+            () =>
+            {
+                if (records.Length > 0)
+                {
+                    view.ReplaceHistoryWindow(records, ConversationEntryProvenance.LocalHistory);
+                }
+
+                view.ReturnToLatest();
+                var key = HistoryCoverageKey.Create(network.Id, HistoryConversation(view));
+                var ledger = GetEntry(network.Id).CoverageLedger;
+                ledger.ObserveCanonicalContext(key, records);
+                view.SetHistoryCoverage(ledger.ObserveProjectedWindow(key, ProjectionRecords(network, view), followingLatest: true));
+                return true;
+            },
+            WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
+        NotifyNavigationChanged();
+        return HistoryNavigationResult.Create(request, HistoryNavigationOutcome.LocalEndReached, "Returned to the latest local conversation history.", records.Length == 0 ? null : HistoryAnchorResult.Missing, records);
+    }
+
+    private async ValueTask<ConversationLogRecord[]> ReadLatestHistoryWindowAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        CancellationToken cancellationToken)
+    {
+        var records = new List<ConversationLogRecord>(WorkspaceView.MaximumEntries);
+        ConversationLogRecord? boundary = null;
+        for (var pageNumber = 0; pageNumber < WorkspaceView.MaximumEntries / ConfigurationLimits.MaximumHistoryPageSize; pageNumber++)
+        {
+            var page = await _logStore!.ReadPageWindowAsync(new HistoryPageRequest
+            {
+                NetworkId = network.Id,
+                ScopeId = network.ProfileId ?? network.Id,
+                ConversationKind = HistoryKind(view),
+                ConversationName = HistoryName(view),
+                ConversationKey = HistoryConversation(view),
+                PageSize = ConfigurationLimits.MaximumHistoryPageSize,
+                Before = boundary?.Timestamp,
+                BeforeDurableSequence = boundary is { DurableSequence: > 0 } ? boundary.DurableSequence : null
+            }, cancellationToken).ConfigureAwait(false);
+            if (page.Records.Count == 0)
+            {
+                break;
+            }
+
+            records.AddRange(page.Records);
+            boundary = page.Records[^1];
+            if (!page.HasOlder)
+            {
+                break;
+            }
+        }
+
+        return ConversationHistoryOrdering.OrderAscending(
+                ConversationHistoryMerge.DeduplicateExact(records))
+            .TakeLast(WorkspaceView.MaximumEntries)
+            .ToArray();
+    }
+
+    private async ValueTask<HistoryContextResult?> ReadLocalNavigationContextAsync(
+        WorkspaceView view,
+        HistoryNavigationRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (_logStore is not null)
+        {
+            var address = request.Conversation;
+            var anchor = request.IsMessageRequest
+                ? await _logStore.FindByServerMessageIdAsync(new HistoryServerMessageAnchorRequest
+                {
+                    Conversation = address,
+                    ServerMessageId = request.ServerMessageId!
+                }, cancellationToken).ConfigureAwait(false)
+                : await _logStore.FindByTimestampAsync(new HistoryTimestampAnchorRequest
+                {
+                    Conversation = address,
+                    Timestamp = request.Timestamp!.Value,
+                    Direction = request.TimestampDirection
+                }, cancellationToken).ConfigureAwait(false);
+            if (anchor.Found)
+            {
+                return await _logStore.ReadContextAroundAsync(new HistoryContextRequest
+                {
+                    Conversation = address,
+                    ServerMessageId = request.ServerMessageId,
+                    Timestamp = request.IsMessageRequest ? null : request.Timestamp,
+                    TimestampDirection = request.TimestampDirection,
+                    BeforeCount = request.BeforeCount,
+                    AfterCount = request.AfterCount
+                }, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        return ReadProjectedNavigationContext(null, view, request);
+    }
+
+    private static HistoryContextResult? ReadProjectedNavigationContext(
+        NetworkWorkspace? network,
+        WorkspaceView view,
+        HistoryNavigationRequest request,
+        IReadOnlyList<ConversationLogRecord>? preferredRecords = null)
+    {
+        var sourceRecords = (preferredRecords is { Count: > 0 }
+                ? preferredRecords
+                : view.EntriesSnapshot.Select(entry =>
+                {
+                    return network is null ? new ConversationLogRecord
+                    {
+                        Timestamp = entry.Timestamp,
+                        NetworkId = view.NetworkId,
+                        ScopeId = request.Conversation.ScopeId,
+                        ConversationKind = request.Conversation.ConversationKind,
+                        ConversationName = request.Conversation.ConversationName,
+                        ConversationKey = request.Conversation.EffectiveConversationKey,
+                        Sender = entry.Sender,
+                        MessageKind = LogMessageKind.Message,
+                        Direction = entry.IsOutgoing ? LogDirection.Outgoing : LogDirection.Incoming,
+                        Text = entry.Text,
+                        ServerMessageId = entry.ServerMessageId,
+                        DurableSequence = entry.Sequence,
+                        TimestampSource = entry.TimestampSource
+                    } : CreateConversationRecord(network, view, entry);
+                }));
+        var locations = ConversationHistoryOrdering.OrderAscending(sourceRecords)
+            .Select((record, index) => new HistoryAnchorLocation(record, index, 0))
+            .ToArray();
+        HistoryAnchorResult anchor;
+        if (request.IsMessageRequest)
+        {
+            var exact = locations.FirstOrDefault(item => string.Equals(item.Record.ServerMessageId, request.ServerMessageId, StringComparison.Ordinal));
+            anchor = exact is null
+                ? preferredRecords is { Count: > 0 }
+                    ? new HistoryAnchorResult(
+                        HistoryAnchorMatch.BoundedMiss,
+                        null,
+                        locations.OrderBy(item => item, Comparer<HistoryAnchorLocation>.Create(HistoryAnchorPolicy.Compare)).FirstOrDefault(),
+                        locations.OrderByDescending(item => item, Comparer<HistoryAnchorLocation>.Create(HistoryAnchorPolicy.Compare)).FirstOrDefault())
+                    : HistoryAnchorResult.Missing
+                : new HistoryAnchorResult(HistoryAnchorMatch.Exact, exact);
+        }
+        else
+        {
+            anchor = HistoryAnchorPolicy.SelectTimestamp(locations, request.Timestamp!.Value, request.TimestampDirection);
+        }
+
+        if (!anchor.Found || anchor.Anchor is null)
+        {
+            if (preferredRecords is { Count: > 0 } && request.IsMessageRequest)
+            {
+                var contextRecords = ConversationHistoryOrdering.OrderAscending(
+                    ConversationHistoryMerge.DeduplicateExact(preferredRecords))
+                    .Take(ConfigurationLimits.MaximumHistoryContextEntries)
+                    .ToArray();
+                return new HistoryContextResult(anchor, contextRecords, false);
+            }
+
+            return new HistoryContextResult(anchor, Array.Empty<ConversationLogRecord>(), false);
+        }
+
+        var anchorIndex = Array.FindIndex(locations, item => item.SourceOffset == anchor.Anchor.SourceOffset);
+        var first = Math.Max(0, anchorIndex - Math.Clamp(request.BeforeCount, 0, ConfigurationLimits.MaximumHistoryContextEntries));
+        var last = Math.Min(locations.Length - 1, anchorIndex + Math.Clamp(request.AfterCount, 0, ConfigurationLimits.MaximumHistoryContextEntries));
+        return new HistoryContextResult(anchor, locations[first..(last + 1)].Select(item => item.Record).ToArray(), true);
+    }
+
+    private async ValueTask ApplyHistoryNavigationAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        HistoryContextResult context)
+    {
+        await InvokeOnDispatcherAsync(
+            () =>
+            {
+                view.ReplaceHistoryWindow(context.Records, ConversationEntryProvenance.LocalHistory, context.Anchor.Anchor?.Record);
+                view.EnterHistoryView();
+                var key = HistoryCoverageKey.Create(network.Id, HistoryConversation(view));
+                var ledger = GetEntry(network.Id).CoverageLedger;
+                ledger.ObserveCanonicalContext(key, context.Records);
+                view.SetHistoryCoverage(ledger.ObserveProjectedWindow(key, ProjectionRecords(network, view), followingLatest: false));
+                return true;
+            },
+            WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
+        NotifyNavigationChanged();
+    }
+
     /// <summary>
     /// Loads one bounded older page. Local canonical history is always
     /// consulted first. Calls for the same durable conversation coalesce so
@@ -445,6 +844,253 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             entry.HistoryPaginationTasks[conversation] = task;
             _ = RetireHistoryPaginationAsync(entry, conversation, task);
             return new ValueTask<CommandDispatchResult>(task);
+        }
+    }
+
+    public ValueTask<CommandDispatchResult> LoadNewerMessagesAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(view);
+        if (network.Id != view.NetworkId || view is not (ChannelView or QueryView))
+        {
+            return ValueTask.FromResult(CommandDispatchResult.Failure("Newer history is unavailable for this view.", view));
+        }
+
+        var entry = GetEntry(network.Id);
+        var conversation = HistoryConversation(view);
+        lock (entry.HistoryPaginationGate)
+        {
+            if (entry.HistoryPaginationTasks.TryGetValue(conversation, out var existing))
+            {
+                if (!existing.IsCompleted)
+                {
+                    entry.HistoryPaginationCoalesced++;
+                    return new ValueTask<CommandDispatchResult>(existing);
+                }
+
+                entry.HistoryPaginationTasks.Remove(conversation);
+            }
+
+            var task = LoadNewerMessagesCoreAsync(entry, network, view, conversation, cancellationToken);
+            entry.HistoryPaginationTasks[conversation] = task;
+            _ = RetireHistoryPaginationAsync(entry, conversation, task);
+            return new ValueTask<CommandDispatchResult>(task);
+        }
+    }
+
+    private async Task<CommandDispatchResult> LoadNewerMessagesCoreAsync(
+        SessionEntry entry,
+        NetworkWorkspace network,
+        WorkspaceView view,
+        string conversation,
+        CancellationToken cancellationToken)
+    {
+        var key = HistoryCoverageKey.Create(network.Id, conversation);
+        var generation = network.Snapshot.ConnectionGeneration;
+        entry.CoverageLedger.BeginGeneration(key, generation);
+        var coverage = entry.CoverageLedger.GetOrCreate(key);
+        await InvokeOnDispatcherAsync(
+            () =>
+            {
+                view.EnterHistoryView();
+                view.IsLoadingNewerHistory = true;
+                view.SetHistoryCoverage(coverage);
+                return true;
+            },
+            WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
+
+        try
+        {
+            var boundary = FindHistoryBoundary(view, oldest: false);
+            if (_logStore is not null)
+            {
+                var localPage = await _logStore.ReadPageWindowAsync(new HistoryPageRequest
+                {
+                    NetworkId = network.Id,
+                    ScopeId = network.ProfileId ?? network.Id,
+                    ConversationKind = HistoryKind(view),
+                    ConversationName = HistoryName(view),
+                    ConversationKey = conversation,
+                    PageSize = ConfigurationLimits.HistoryLocalProjectionPageSize,
+                    After = boundary?.Timestamp,
+                    AfterDurableSequence = boundary is { Sequence: > 0 } ? boundary.Sequence : null
+                }, cancellationToken).ConfigureAwait(false);
+                coverage = entry.CoverageLedger.ObserveLocalPage(key, localPage.Records, localPage.HasOlder, localPage.HasNewer);
+                if (localPage.Records.Count > 0)
+                {
+                    var projected = await InvokeOnDispatcherAsync(
+                        () => view.AppendHistoryRecords(localPage.Records, ConversationEntryProvenance.LocalHistory, preserveOlderWindow: false),
+                        WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
+                    coverage = entry.CoverageLedger.GetOrCreate(key);
+                    await InvokeOnDispatcherAsync(
+                        () =>
+                        {
+                            view.SetHistoryCoverage(entry.CoverageLedger.ObserveProjectedWindow(
+                                key,
+                                ProjectionRecords(network, view),
+                                view.IsFollowingLive));
+                            return projected;
+                        },
+                        WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
+                    return CommandDispatchResult.Success(
+                        $"Loaded {projected} newer local message{(projected == 1 ? string.Empty : "s")}.",
+                        view);
+                }
+            }
+
+            var support = network.Session.ChathistorySupport;
+            if (network.Snapshot.Registration != RegistrationState.Registered || !support.IsUsable)
+            {
+                coverage = entry.CoverageLedger.MarkUnsupported(key, "The server does not provide usable CHATHISTORY; local history is exhausted.");
+                return CommandDispatchResult.Success("The newest local history has been reached.", view);
+            }
+
+            var target = SelectHistoryTarget(view);
+            if (target is null)
+            {
+                coverage = entry.CoverageLedger.MarkUnsupported(key, "No safe current IRC target is available for this durable query.");
+                return CommandDispatchResult.Success("Local newer history is available, but remote history is deferred until the target identity is safe.", view);
+            }
+
+            var remoteFrontier = coverage.RemoteForwardFrontier;
+            var reference = remoteFrontier?.Reference
+                ?? (boundary is null
+                    ? null
+                    : SelectHistoryReference(support, boundary.ServerMessageId, boundary.Timestamp, boundary.TimestampSource));
+            if (reference is null)
+            {
+                coverage = entry.CoverageLedger.MarkUnsupported(key, "No trustworthy msgid or server-time boundary is available.");
+                return CommandDispatchResult.Success("The newest local history has been reached; no safe remote boundary is available.", view);
+            }
+
+            var anchor = new HistoryCoverageAnchor
+            {
+                NetworkId = network.Id,
+                Conversation = conversation,
+                Timestamp = remoteFrontier?.Timestamp ?? boundary!.Timestamp,
+                ServerMessageId = remoteFrontier?.ServerMessageId ?? boundary!.ServerMessageId,
+                Reference = reference,
+                ConnectionGeneration = generation,
+                Target = target,
+                Provenance = HistoryCoverageProvenance.RequestResult
+            };
+            var requestKey = string.Create(
+                System.Globalization.CultureInfo.InvariantCulture,
+                $"{generation}:{target}:{reference.SerializeWire()}");
+            if (!entry.CoverageLedger.TryBeginForwardRequest(key, anchor, requestKey, generation, out coverage))
+            {
+                coverage = entry.CoverageLedger.GetOrCreate(key);
+                return coverage.PendingRequest is not null
+                    ? CommandDispatchResult.Success("Newer history is already loading.", view)
+                    : CommandDispatchResult.Success("No further newer history is currently available.", view);
+            }
+
+            var request = ChathistoryRequest.ForAfter(
+                network.Id,
+                generation,
+                conversation,
+                target,
+                reference,
+                Math.Min(network.Session.MaximumChathistoryRequestSize, ConfigurationLimits.HistoryRemotePaginationPageSize));
+            ChathistoryResult result;
+            try
+            {
+                result = await network.Session.RequestHistoryAsync(request, cancellationToken).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException exception)
+            {
+                coverage = entry.CoverageLedger.CompleteForwardRequest(key, generation, [], false, true, exception.Message);
+                return CommandDispatchResult.Failure(exception.Message, view);
+            }
+
+            if (result.Request.ConnectionGeneration != network.Snapshot.ConnectionGeneration)
+            {
+                coverage = entry.CoverageLedger.CompleteForwardRequest(key, generation, [], false, true, "The forward pagination response belongs to a stale connection generation.");
+                return CommandDispatchResult.Failure("The history response belongs to a stale connection generation.", view);
+            }
+
+            if (!result.Succeeded)
+            {
+                coverage = entry.CoverageLedger.CompleteForwardRequest(key, generation, [], false, true, result.Failure ?? "The server history request failed.");
+                return CommandDispatchResult.Failure(result.Failure ?? "The server history request failed.", view);
+            }
+
+            var historyMessages = result.Messages
+                .Where(item => item.IsHistorical
+                    && item.NetworkId == network.Id
+                    && string.Equals(item.HistoricalConversation, conversation, StringComparison.Ordinal))
+                .ToArray();
+            var ordinaryHistoryMessages = historyMessages
+                .Where(static item => !ChathistoryContext.IsContextRow(item.Message))
+                .ToArray();
+            var frontierMessages = historyMessages
+                .Where(static item => !ChathistoryContext.IsContextRow(item.Message)
+                    && item.Message.ServerTimestamp is not null)
+                .ToArray();
+            var observations = frontierMessages
+                .Select(item =>
+                {
+                    var timestamp = item.Message.ServerTimestamp!.Value;
+                    var id = ConversationEntryIdentity.NormalizeServerMessageId(item.Message.ServerMessageId);
+                    var selectedReference = support.Supports(ChathistoryReferenceType.MessageId) && id is not null
+                        ? ChathistoryReference.MessageId(id)
+                        : support.Supports(ChathistoryReferenceType.Timestamp)
+                            ? ChathistoryReference.Timestamp(timestamp)
+                            : null;
+                    return selectedReference is null
+                        ? null
+                        : new HistoryCoverageAnchor
+                        {
+                            NetworkId = network.Id,
+                            Conversation = conversation,
+                            Timestamp = timestamp,
+                            ServerMessageId = id,
+                            Reference = selectedReference,
+                            ConnectionGeneration = generation,
+                            Target = target,
+                            Provenance = HistoryCoverageProvenance.ServerPlayback
+                        };
+                })
+                .OfType<HistoryCoverageAnchor>()
+                .ToArray();
+            var distinctRows = CountDistinctHistoryRows(ordinaryHistoryMessages);
+            coverage = entry.CoverageLedger.CompleteForwardRequest(
+                key,
+                generation,
+                observations,
+                result.HistoryEndSignaled,
+                false,
+                result.HistoryEndSignaled ? "The server explicitly reached the live/latest edge." : "The bounded server page completed.",
+                Math.Max(0, historyMessages.Length - distinctRows));
+            await InvokeOnDispatcherAsync(
+                () =>
+                {
+                    view.SetHistoryCoverage(entry.CoverageLedger.ObserveProjectedWindow(
+                        key,
+                        ProjectionRecords(network, view),
+                        view.IsFollowingLive));
+                    return true;
+                },
+                WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
+
+            var message = result.HistoryEndSignaled
+                ? distinctRows == 0 ? "The server explicitly reports no newer history." : $"Loaded {distinctRows} newer message{(distinctRows == 1 ? string.Empty : "s")}; latest history is now known."
+                : distinctRows == 0 ? "The server returned no new history; forward pagination stopped conservatively." : $"Loaded {distinctRows} newer message{(distinctRows == 1 ? string.Empty : "s")}.";
+            return CommandDispatchResult.Success(message, view);
+        }
+        finally
+        {
+            await InvokeOnDispatcherAsync(
+                () =>
+                {
+                    view.SetHistoryCoverage(entry.CoverageLedger.GetOrCreate(key));
+                    view.IsLoadingNewerHistory = false;
+                    return true;
+                },
+                WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
         }
     }
 
@@ -496,7 +1142,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                     await InvokeOnDispatcherAsync(
                         () =>
                         {
-                            view.SetHistoryCoverage(coverage);
+                            view.SetHistoryCoverage(entry.CoverageLedger.ObserveProjectedWindow(
+                                key,
+                                ProjectionRecords(network, view),
+                                view.IsFollowingLive));
                             return projected;
                         },
                         WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
@@ -600,8 +1249,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                     && string.Equals(item.HistoricalConversation, conversation, StringComparison.Ordinal)
                     && (item.Message.ServerMessageId is null || !knownServerIds.Contains(item.Message.ServerMessageId)))
                 .ToArray();
+            var ordinaryHistoricalRows = newHistoricalRows
+                .Where(static item => !ChathistoryContext.IsContextRow(item.Message))
+                .ToArray();
             var observations = newHistoricalRows
-                .Where(item => item.Message.ServerTimestamp is not null)
+                .Where(item => !ChathistoryContext.IsContextRow(item.Message)
+                    && item.Message.ServerTimestamp is not null)
                 .Select(item =>
                 {
                     var timestamp = item.Message.ServerTimestamp!.Value;
@@ -627,7 +1280,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 })
                 .OfType<HistoryCoverageAnchor>()
                 .ToArray();
-            var allObservations = result.Messages.Count(item => item.IsHistorical && item.Message.ServerTimestamp is not null);
+            var allObservations = result.Messages.Count(item => item.IsHistorical
+                && !ChathistoryContext.IsContextRow(item.Message)
+                && item.Message.ServerTimestamp is not null);
             coverage = entry.CoverageLedger.CompleteBackwardRequest(
                 key,
                 generation,
@@ -640,12 +1295,15 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 ()
                 =>
                 {
-                    view.SetHistoryCoverage(coverage);
+                    view.SetHistoryCoverage(entry.CoverageLedger.ObserveProjectedWindow(
+                        key,
+                        ProjectionRecords(network, view),
+                        view.IsFollowingLive));
                     return true;
                 },
                 WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
 
-            var loadedCount = newHistoricalRows.Length;
+            var loadedCount = ordinaryHistoricalRows.Length;
             var message = result.HistoryEndSignaled
                 ? loadedCount == 0 ? "The server explicitly reports no older history." : $"Loaded {loadedCount} older message{(loadedCount == 1 ? string.Empty : "s")}; server history is now exhausted."
                 : loadedCount == 0 ? "The server returned no new older history; pagination stopped conservatively." : $"Loaded {loadedCount} older message{(loadedCount == 1 ? string.Empty : "s")}.";
@@ -734,20 +1392,51 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         _ => throw new ArgumentException("History is available only for channels and queries.", nameof(view))
     };
 
-    private static TranscriptEntry? FindHistoryBoundary(WorkspaceView view) => view.EntriesSnapshot
-        .Where(static entry => entry.Kind is TranscriptEntryKind.Message
-            or TranscriptEntryKind.Notice
-            or TranscriptEntryKind.Action
-            or TranscriptEntryKind.Ctcp
-            or TranscriptEntryKind.OutgoingMessage
-            or TranscriptEntryKind.OutgoingPrivateMessage
-            or TranscriptEntryKind.OutgoingAction
-            or TranscriptEntryKind.OutgoingNotice
-            or TranscriptEntryKind.OutgoingCtcp)
-        .Where(IsHistoryMessageBoundary)
-        .OrderBy(static entry => entry.Timestamp)
-        .ThenBy(static entry => entry.Sequence)
-        .FirstOrDefault();
+    private static TranscriptEntry? FindHistoryBoundary(WorkspaceView view, bool oldest = true)
+    {
+        var ordered = view.EntriesSnapshot
+            .Where(static entry => entry.Kind is TranscriptEntryKind.Message
+                or TranscriptEntryKind.Notice
+                or TranscriptEntryKind.Action
+                or TranscriptEntryKind.Ctcp
+                or TranscriptEntryKind.OutgoingMessage
+                or TranscriptEntryKind.OutgoingPrivateMessage
+                or TranscriptEntryKind.OutgoingAction
+                or TranscriptEntryKind.OutgoingNotice
+                or TranscriptEntryKind.OutgoingCtcp)
+            .Where(IsHistoryMessageBoundary)
+            .OrderBy(static entry => entry.Timestamp)
+            .ThenBy(static entry => entry.Sequence)
+            .ThenBy(static entry => entry.ServerMessageId, StringComparer.Ordinal)
+            .ToArray();
+        return oldest ? ordered.FirstOrDefault() : ordered.LastOrDefault();
+    }
+
+    private static int CountDistinctHistoryRows(IEnumerable<IrcSemanticEvent> events)
+    {
+        var identities = new HashSet<string>(StringComparer.Ordinal);
+        var noIdentityRows = 0;
+        foreach (var item in events)
+        {
+            var id = ConversationEntryIdentity.NormalizeServerMessageId(item.Message.ServerMessageId);
+            if (id is null)
+            {
+                noIdentityRows++;
+            }
+            else
+            {
+                identities.Add($"{item.NetworkId:N}\0{id}");
+            }
+        }
+
+        return identities.Count + noIdentityRows;
+    }
+
+    private static ConversationLogRecord[] ProjectionRecords(NetworkWorkspace network, WorkspaceView view) =>
+        view.EntriesSnapshot
+            .Where(IsHistoryMessageBoundary)
+            .Select(entry => CreateConversationRecord(network, view, entry))
+            .ToArray();
 
     private static bool IsHistoryMessageBoundary(TranscriptEntry entry) =>
         entry.Kind is TranscriptEntryKind.Message
@@ -830,7 +1519,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 ConversationKey = conversation,
                 PageSize = ConfigurationLimits.HistoryLocalProjectionPageSize
             }).ConfigureAwait(false);
-            var coverage = GetEntry(network.Id).CoverageLedger.ObserveLocalPage(
+            GetEntry(network.Id).CoverageLedger.ObserveLocalPage(
                 HistoryCoverageKey.Create(network.Id, conversation),
                 page.Records,
                 page.HasOlder,
@@ -840,7 +1529,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 () =>
                 {
                     view.AppendHistoryRecords(page.Records);
-                    view.SetHistoryCoverage(coverage);
+                    var ledger = GetEntry(network.Id).CoverageLedger;
+                    view.SetHistoryCoverage(ledger.ObserveProjectedWindow(
+                        HistoryCoverageKey.Create(network.Id, HistoryConversation(view)),
+                        ProjectionRecords(network, view),
+                        view.IsFollowingLive));
                     return true;
                 },
                 WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
@@ -3863,6 +4556,33 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         _logging?.Record(view.NetworkId, workspace.ProfileId, view, entry);
+        // Keep canonical coverage current for active historical navigation and
+        // playback, while checkpointing ordinary live traffic.  Rebuilding a
+        // coverage snapshot for every live row would contend with the single
+        // serialized presentation dispatcher during sustained bursts.
+        var reconcileCoverage = isHistorical
+            || view.IsViewingHistory
+            || view.HistoryCoverage is null
+            || (entry.Sequence & 63) == 0;
+        if (reconcileCoverage
+            && view is (ChannelView or QueryView)
+            && IsHistoryMessageBoundary(entry))
+        {
+            var key = HistoryCoverageKey.Create(view.NetworkId, HistoryConversation(view));
+            var ledger = GetEntry(view.NetworkId).CoverageLedger;
+            ledger.ObserveCanonicalContext(
+                key,
+                [CreateConversationRecord(workspace, view, entry)],
+                isHistorical ? HistoryCoverageProvenance.ServerPlayback : HistoryCoverageProvenance.CanonicalHistory);
+            var boundaries = view.EntryBoundariesSnapshot;
+            view.SetHistoryCoverage(
+                ledger.ObserveProjectedBoundaries(
+                    key,
+                    boundaries.Oldest is { } oldest ? CreateConversationRecord(workspace, view, oldest) : null,
+                    boundaries.Newest is { } newest ? CreateConversationRecord(workspace, view, newest) : null,
+                    view.IsFollowingLive),
+                notify: false);
+        }
         if (!view.IsActive && effectiveActivity != WorkspaceActivity.None)
         {
             view.MarkActivity(effectiveActivity);
@@ -3879,7 +4599,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             }
         }
 
-        NotifyNavigationChanged();
+        if (isHistorical && view.IsViewingHistory)
+        {
+            NotifyNavigationChanged();
+        }
 
         if (isResynchronization || isHistorical || !publishNotification)
         {

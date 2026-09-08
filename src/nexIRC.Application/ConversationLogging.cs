@@ -237,6 +237,7 @@ public enum HistoryExportFormat
 public sealed record HistoryExportRequest
 {
     public required Guid ScopeId { get; init; }
+    public Guid? NetworkId { get; init; }
     public required LogConversationKind ConversationKind { get; init; }
     public required string ConversationName { get; init; }
     public string? ConversationKey { get; init; }
@@ -927,7 +928,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         {
             await foreach (var record in ReadFileAsync(path, cancellationToken).ConfigureAwait(false))
             {
-                if (!IsConversationRecord(record, request.ScopeId, request.ConversationKind, request.ConversationName, request.ConversationKey))
+                if (!IsConversationRecord(record, request.ScopeId, request.ConversationKind, request.ConversationName, request.ConversationKey, request.NetworkId))
                 {
                     continue;
                 }
@@ -992,7 +993,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                 request.ConversationKind,
                 request.ConversationName,
                 request.ConversationKey,
-                null,
+                request.NetworkId,
                 cancellationToken).ConfigureAwait(false);
             if (indexedRecords is not null)
             {
@@ -1006,7 +1007,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         {
             await foreach (var record in ReadFileAsync(path, cancellationToken).ConfigureAwait(false))
             {
-                if (!IsConversationRecord(record, request.ScopeId, request.ConversationKind, request.ConversationName, request.ConversationKey)
+                if (!IsConversationRecord(record, request.ScopeId, request.ConversationKind, request.ConversationName, request.ConversationKey, request.NetworkId)
                     || request.From is not null && record.Timestamp < request.From.Value
                     || request.To is not null && record.Timestamp > request.To.Value)
                 {
@@ -1035,8 +1036,10 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         Guid scopeId,
         LogConversationKind conversationKind,
         string conversationName,
-        string? conversationKey = null) =>
+        string? conversationKey = null,
+        Guid? networkId = null) =>
         record.ScopeId == scopeId
+        && (networkId is null || record.NetworkId == networkId)
         && record.ConversationKind == conversationKind
         && (string.IsNullOrWhiteSpace(conversationKey)
             ? IrcIdentity.Equals(record.ConversationName, conversationName, IrcCaseMapping.Rfc1459)
@@ -2306,6 +2309,7 @@ internal static class HistoryPageSelector
 
     internal static bool MatchesHistoryRecord(ConversationLogRecord record, HistoryExportRequest request) =>
         record.ScopeId == request.ScopeId
+        && (request.NetworkId is null || record.NetworkId == request.NetworkId)
         && record.ConversationKind == request.ConversationKind
         && (string.IsNullOrWhiteSpace(request.ConversationKey)
             ? IrcIdentity.Equals(record.ConversationName, request.ConversationName, IrcCaseMapping.Rfc1459)

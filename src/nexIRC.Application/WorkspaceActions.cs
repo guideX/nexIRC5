@@ -19,6 +19,10 @@ public enum WorkspaceActionId
     RequestModes,
     RefreshNames,
     LoadOlderMessages,
+    LoadNewerMessages,
+    ReturnToLatest,
+    GoToHistoryTimestamp,
+    JumpToHistoryMessage,
     LoadContextAround
 }
 
@@ -69,6 +73,13 @@ public sealed class WorkspaceActionRouter
 
     public ChannelActionService ChannelActions { get; }
 
+    public ValueTask<HistoryNavigationResult> NavigateHistoryAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        HistoryNavigationRequest request,
+        CancellationToken cancellationToken = default) =>
+        _sessions.NavigateHistoryAsync(network, view, request, cancellationToken);
+
     public IReadOnlyList<WorkspaceActionDescriptor> BuildNetworkActions(NetworkWorkspace network)
     {
         ArgumentNullException.ThrowIfNull(network);
@@ -103,6 +114,7 @@ public sealed class WorkspaceActionRouter
         var authority = consistent ? ChannelAuthority.Evaluate(network, channel) : null;
         var target = new WorkspaceActionTarget(network.Id, channel.Id, channel.Channel);
         var canLoadOlder = joined && _sessions.CanLoadOlderHistory(network, channel);
+        var canLoadNewer = joined && _sessions.CanLoadNewerHistory(network, channel);
         var channelEntries = channel.EntriesSnapshot;
         var contextAnchor = channelEntries.Count == 0 ? null : channelEntries[^1];
         var canLoadContext = joined && contextAnchor is not null && _sessions.CanLoadContextAround(network, channel, contextAnchor);
@@ -125,6 +137,14 @@ public sealed class WorkspaceActionRouter
                 joined ? null : "Join the channel first."),
             new(WorkspaceActionId.LoadOlderMessages, "Load older messages", WorkspaceActionTargetKind.Channel, target, canLoadOlder,
                 canLoadOlder ? null : !joined ? "Join the channel first." : "Server history is unavailable or already exhausted."),
+            new(WorkspaceActionId.LoadNewerMessages, "Load newer messages", WorkspaceActionTargetKind.Channel, target, canLoadNewer,
+                canLoadNewer ? null : !joined ? "Join the channel first." : "Newer history is unavailable or already exhausted."),
+            new(WorkspaceActionId.ReturnToLatest, "Return to latest", WorkspaceActionTargetKind.Channel, target, channel.EntryCount > 0,
+                channel.EntryCount > 0 ? null : "There is no projected history to return to."),
+            new(WorkspaceActionId.GoToHistoryTimestamp, "Go to date/time", WorkspaceActionTargetKind.Channel, target, false,
+                "Choose a validated timestamp through the typed history-navigation API."),
+            new(WorkspaceActionId.JumpToHistoryMessage, "Jump to message", WorkspaceActionTargetKind.Channel, target, false,
+                "Choose a canonical message anchor through the typed history-navigation API."),
             new(WorkspaceActionId.LoadContextAround, "Load context around latest message", WorkspaceActionTargetKind.Channel, target, canLoadContext,
                 canLoadContext ? null : "A supported server-time or msgid anchor is required.")
         ];
@@ -138,6 +158,7 @@ public sealed class WorkspaceActionRouter
         var registered = consistent && IsRegistered(network);
         var target = new WorkspaceActionTarget(network.Id, query.Id, query.Nickname, query.Nickname);
         var canLoadOlder = registered && _sessions.CanLoadOlderHistory(network, query);
+        var canLoadNewer = registered && _sessions.CanLoadNewerHistory(network, query);
         var queryEntries = query.EntriesSnapshot;
         var contextAnchor = queryEntries.Count == 0 ? null : queryEntries[^1];
         var canLoadContext = registered && contextAnchor is not null && _sessions.CanLoadContextAround(network, query, contextAnchor);
@@ -145,6 +166,14 @@ public sealed class WorkspaceActionRouter
         [
             new(WorkspaceActionId.LoadOlderMessages, "Load older messages", WorkspaceActionTargetKind.Query, target, canLoadOlder,
                 canLoadOlder ? null : !registered ? "The network is not registered." : "Server history is unavailable or already exhausted."),
+            new(WorkspaceActionId.LoadNewerMessages, "Load newer messages", WorkspaceActionTargetKind.Query, target, canLoadNewer,
+                canLoadNewer ? null : !registered ? "The network is not registered." : "Newer history is unavailable or already exhausted."),
+            new(WorkspaceActionId.ReturnToLatest, "Return to latest", WorkspaceActionTargetKind.Query, target, query.EntryCount > 0,
+                query.EntryCount > 0 ? null : "There is no projected history to return to."),
+            new(WorkspaceActionId.GoToHistoryTimestamp, "Go to date/time", WorkspaceActionTargetKind.Query, target, false,
+                "Choose a validated timestamp through the typed history-navigation API."),
+            new(WorkspaceActionId.JumpToHistoryMessage, "Jump to message", WorkspaceActionTargetKind.Query, target, false,
+                "Choose a canonical message anchor through the typed history-navigation API."),
             new(WorkspaceActionId.LoadContextAround, "Load context around latest message", WorkspaceActionTargetKind.Query, target, canLoadContext,
                 canLoadContext ? null : "A supported server-time or msgid anchor is required.")
         ];
@@ -230,6 +259,10 @@ public sealed class WorkspaceActionRouter
                 return CommandDispatchResult.Success($"Refreshing members for {channel.Channel}.", channel);
             case WorkspaceActionId.LoadOlderMessages:
                 return await _sessions.LoadOlderMessagesAsync(network, channel, cancellationToken).ConfigureAwait(false);
+            case WorkspaceActionId.LoadNewerMessages:
+                return await _sessions.LoadNewerMessagesAsync(network, channel, cancellationToken).ConfigureAwait(false);
+            case WorkspaceActionId.ReturnToLatest:
+                return ToDispatchResult(await _sessions.ReturnToLatestAsync(network, channel, cancellationToken).ConfigureAwait(false), channel);
             case WorkspaceActionId.LoadContextAround:
                 return await _sessions.LoadContextAroundAsync(network, channel, channel.EntriesSnapshot[^1], cancellationToken).ConfigureAwait(false);
             default:
@@ -257,6 +290,8 @@ public sealed class WorkspaceActionRouter
         return action switch
         {
             WorkspaceActionId.LoadOlderMessages => await _sessions.LoadOlderMessagesAsync(network, query, cancellationToken).ConfigureAwait(false),
+            WorkspaceActionId.LoadNewerMessages => await _sessions.LoadNewerMessagesAsync(network, query, cancellationToken).ConfigureAwait(false),
+            WorkspaceActionId.ReturnToLatest => ToDispatchResult(await _sessions.ReturnToLatestAsync(network, query, cancellationToken).ConfigureAwait(false), query),
             WorkspaceActionId.LoadContextAround => await _sessions.LoadContextAroundAsync(network, query, query.EntriesSnapshot[^1], cancellationToken).ConfigureAwait(false),
             _ => CommandDispatchResult.Failure("The query action is not supported.", query)
         };
@@ -467,6 +502,11 @@ public sealed class WorkspaceActionRouter
 
     private static int CommandLimit(NetworkWorkspace network) =>
         Math.Max(3, Math.Min(network.Session.MaximumOutboundLineBytes, network.Snapshot.Features.LineLength));
+
+    private static CommandDispatchResult ToDispatchResult(HistoryNavigationResult result, WorkspaceView view) =>
+        result.Succeeded
+            ? CommandDispatchResult.Success(result.Message, view)
+            : CommandDispatchResult.Failure(result.Message, view);
 
     private static void ValidateTarget(string value, string name)
     {
