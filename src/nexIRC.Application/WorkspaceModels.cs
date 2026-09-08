@@ -255,6 +255,8 @@ public abstract class WorkspaceView : ObservableObject
     private int _recoveredHistoryCount;
     private bool _isActive;
     private bool _isViewOpen = true;
+    private bool _isLoadingOlderHistory;
+    private HistoryCoverageSnapshot? _historyCoverage;
     private ConversationLifecycleState _lifecycleState = ConversationLifecycleState.HistoricalOnly;
     private DateTimeOffset _lastActivity;
     private long _lastActivitySequence;
@@ -354,6 +356,31 @@ public abstract class WorkspaceView : ObservableObject
         get => _isViewOpen;
         private set => SetProperty(ref _isViewOpen, value);
     }
+
+    public bool IsLoadingOlderHistory
+    {
+        get => _isLoadingOlderHistory;
+        internal set
+        {
+            if (SetProperty(ref _isLoadingOlderHistory, value))
+            {
+                OnPropertyChanged(nameof(OlderHistoryStatus));
+            }
+        }
+    }
+
+    public HistoryCoverageSnapshot? HistoryCoverage => _historyCoverage;
+
+    public string OlderHistoryStatus => IsLoadingOlderHistory
+        ? "Loading older history…"
+        : _historyCoverage?.State switch
+        {
+            HistoryCoverageState.RemoteExhausted => "Beginning of server history reached",
+            HistoryCoverageState.Unsupported => "Older history is local-only",
+            HistoryCoverageState.NoProgress => "Older history is temporarily unavailable",
+            HistoryCoverageState.LocalBeginningReached => "Local history exhausted",
+            _ => "Load older messages"
+        };
 
     public ConversationLifecycleState LifecycleState
     {
@@ -484,7 +511,7 @@ public abstract class WorkspaceView : ObservableObject
                 Entries.Add(entry);
                 while (Entries.Count > MaximumEntries)
                 {
-                    Entries.RemoveAt(0);
+                    Entries.RemoveAt(historical ? Entries.Count - 1 : 0);
                 }
 
                 return true;
@@ -495,7 +522,14 @@ public abstract class WorkspaceView : ObservableObject
             entries.Sort(static (left, right) => CompareTranscriptEntries(left, right));
             if (entries.Count > MaximumEntries)
             {
-                entries.RemoveRange(0, entries.Count - MaximumEntries);
+                if (historical)
+                {
+                    entries.RemoveRange(MaximumEntries, entries.Count - MaximumEntries);
+                }
+                else
+                {
+                    entries.RemoveRange(0, entries.Count - MaximumEntries);
+                }
             }
 
             using (WorkspaceProjectionBatch.Begin())
@@ -520,6 +554,85 @@ public abstract class WorkspaceView : ObservableObject
             Persist = provenance == ConversationEntryProvenance.ServerPlayback
         };
         return AppendConversationCandidate(candidate, ConversationHistoryProjection.ToTranscriptEntry(record, provenance), updateLastActivity: false);
+    }
+
+    /// <summary>
+    /// Projects one bounded historical page in one collection mutation. The
+    /// canonical records are sorted before insertion; no historical row may
+    /// mark activity or mutate the live state projection.
+    /// </summary>
+    internal int AppendHistoryRecords(
+        IEnumerable<ConversationLogRecord> records,
+        ConversationEntryProvenance provenance = ConversationEntryProvenance.LocalHistory,
+        bool preserveOlderWindow = true)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        var additions = ConversationHistoryOrdering.OrderAscending(records)
+            .Select(record => ConversationHistoryProjection.ToTranscriptEntry(record, provenance))
+            .ToArray();
+        if (additions.Length == 0)
+        {
+            return 0;
+        }
+
+        lock (_entriesGate)
+        {
+            var existingIdentities = Entries
+                .Select(entry => ConversationEntryIdentity.GetServerIdentityKey(new ConversationLogRecord
+                {
+                    NetworkId = NetworkId,
+                    ServerMessageId = entry.ServerMessageId
+                }))
+                .Where(static identity => identity is not null)
+                .ToHashSet(StringComparer.Ordinal);
+            var accepted = additions.Where(entry =>
+            {
+                var identity = ConversationEntryIdentity.GetServerIdentityKey(new ConversationLogRecord
+                {
+                    NetworkId = NetworkId,
+                    ServerMessageId = entry.ServerMessageId
+                });
+                return identity is null || existingIdentities.Add(identity);
+            }).ToArray();
+            if (accepted.Length == 0)
+            {
+                return 0;
+            }
+
+            var merged = Entries.Concat(accepted)
+                .OrderBy(entry => entry, Comparer<TranscriptEntry>.Create(CompareTranscriptEntries))
+                .ToList();
+            if (merged.Count > MaximumEntries)
+            {
+                if (preserveOlderWindow)
+                {
+                    merged.RemoveRange(MaximumEntries, merged.Count - MaximumEntries);
+                }
+                else
+                {
+                    merged.RemoveRange(0, merged.Count - MaximumEntries);
+                }
+            }
+
+            using (WorkspaceProjectionBatch.Begin())
+            {
+                Entries.Clear();
+                foreach (var entry in merged)
+                {
+                    Entries.Add(entry);
+                }
+            }
+
+            return accepted.Length;
+        }
+    }
+
+    internal void SetHistoryCoverage(HistoryCoverageSnapshot coverage)
+    {
+        ArgumentNullException.ThrowIfNull(coverage);
+        _historyCoverage = coverage;
+        OnPropertyChanged(nameof(HistoryCoverage));
+        OnPropertyChanged(nameof(OlderHistoryStatus));
     }
 
     private static int CompareTranscriptEntries(TranscriptEntry left, TranscriptEntry right)

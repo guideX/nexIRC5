@@ -22,6 +22,9 @@ public partial class MainWindow : Window
     private bool _renderingSubscribed;
     private readonly PresentationTimingProbe _presentationTiming = new();
     private readonly TaskCompletionSource _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly HashSet<ListBox> _historyScrollArmed = [];
+    private readonly HashSet<ListBox> _historyScrollLoading = [];
+    private readonly Dictionary<ListBox, (double Offset, double Extent)> _historyScrollPositions = [];
 
     public MainWindow(
         IIrcTransportFactory transportFactory,
@@ -88,6 +91,79 @@ public partial class MainWindow : Window
         if (valid.WindowTop is double top) Top = top;
         NavigationColumn.Width = new GridLength(valid.NavigationPaneWidth);
         if (valid.IsMaximized) WindowState = WindowState.Maximized;
+    }
+
+    private void OnConversationPreviewMouseWheel(object sender, MouseWheelEventArgs e)
+    {
+        if (sender is ListBox list && e.Delta > 0)
+        {
+            _historyScrollArmed.Add(list);
+        }
+    }
+
+    private void OnConversationPreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (sender is ListBox list && e.Key is Key.Up or Key.PageUp or Key.Home)
+        {
+            _historyScrollArmed.Add(list);
+        }
+    }
+
+    private async void OnConversationScrollChanged(object sender, ScrollChangedEventArgs e)
+    {
+        var list = sender as ListBox ?? FindAncestor<ListBox>(e.OriginalSource as DependencyObject);
+        if (list is null
+            || e.VerticalOffset > 1
+            || !_historyScrollArmed.Contains(list)
+            || _historyScrollLoading.Contains(list)
+            || list.DataContext is not WorkspaceView view
+            || !ViewModel.Sessions.TryGet(view.NetworkId, out var network)
+            || network is null)
+        {
+            return;
+        }
+
+        var scroll = e.OriginalSource as ScrollViewer ?? FindDescendant<ScrollViewer>(list);
+        if (scroll is null)
+        {
+            return;
+        }
+
+        _historyScrollLoading.Add(list);
+        _historyScrollPositions[list] = (scroll.VerticalOffset, scroll.ExtentHeight);
+        try
+        {
+            await ViewModel.Sessions.LoadOlderMessagesAsync(network, view).ConfigureAwait(true);
+            await ViewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+            await Dispatcher.InvokeAsync(
+                () =>
+                {
+                    scroll.UpdateLayout();
+                    var previous = _historyScrollPositions[list];
+                    var delta = scroll.ExtentHeight - previous.Extent;
+                    scroll.ScrollToVerticalOffset(Math.Max(0, previous.Offset + delta));
+                },
+                System.Windows.Threading.DispatcherPriority.Loaded);
+        }
+        finally
+        {
+            _historyScrollLoading.Remove(list);
+            _historyScrollPositions.Remove(list);
+            _historyScrollArmed.Remove(list);
+        }
+    }
+
+    private async void OnLoadOlderMessagesClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not System.Windows.Controls.Button { DataContext: WorkspaceView view }
+            || !ViewModel.Sessions.TryGet(view.NetworkId, out var network)
+            || network is null)
+        {
+            return;
+        }
+
+        var result = await ViewModel.Sessions.LoadOlderMessagesAsync(network, view).ConfigureAwait(true);
+        ViewModel.StatusText = result.Message;
     }
 
     private void OnRendering(object? sender, EventArgs e) => _presentationTiming.RecordRendering(Stopwatch.GetTimestamp());
@@ -755,6 +831,26 @@ public partial class MainWindow : Window
             }
 
             current = VisualTreeHelper.GetParent(current);
+        }
+
+        return null;
+    }
+
+    private static T? FindDescendant<T>(DependencyObject source)
+        where T : DependencyObject
+    {
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(source); index++)
+        {
+            var child = VisualTreeHelper.GetChild(source, index);
+            if (child is T match)
+            {
+                return match;
+            }
+
+            if (FindDescendant<T>(child) is { } descendant)
+            {
+                return descendant;
+            }
         }
 
         return null;

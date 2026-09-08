@@ -34,6 +34,11 @@ public static class ConfigurationLimits
     public const int MaximumSearchResults = 500;
     public const int MaximumSearchQueryLength = 256;
     public const int MaximumHistoryPageSize = 100;
+    public const int HistoryLocalProjectionPageSize = 50;
+    public const int HistoryRemotePaginationPageSize = 50;
+    public const int MaximumHistoryRowsPerProjection = 500;
+    public const int MaximumPaginationRequestsPerAction = 1;
+    public const int MaximumQueuedPaginationRequests = 16;
     public const int MaximumHistoryContextEntries = 100;
     public const int MaximumHistoryExportRecords = 10_000;
     public const long MaximumHistoryFileBytes = 256L * 1024 * 1024;

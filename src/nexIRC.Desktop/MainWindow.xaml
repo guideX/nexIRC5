@@ -147,16 +147,18 @@
                     </Grid.ColumnDefinitions>
                     <Grid>
                         <Grid.RowDefinitions>
-                            <RowDefinition Height="*" />
-                            <RowDefinition Height="Auto" />
-                        </Grid.RowDefinitions>
-                        <ListBox ItemsSource="{Binding Entries}" ItemTemplate="{StaticResource TranscriptEntryTemplate}" BorderThickness="0" Background="White" FontFamily="Cascadia Mono" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                        <ListBox ItemsSource="{Binding Entries}" ItemTemplate="{StaticResource TranscriptEntryTemplate}" BorderThickness="0" Background="White" FontFamily="Cascadia Mono" PreviewMouseWheel="OnConversationPreviewMouseWheel" PreviewKeyDown="OnConversationPreviewKeyDown" ScrollViewer.ScrollChanged="OnConversationScrollChanged" />
                         <Expander Grid.Row="1" Header="Historical context" IsExpanded="True" Visibility="{Binding HasHistoryContext, Converter={StaticResource BooleanToVisibility}}" Margin="0,8,0,0">
                             <DockPanel MaxHeight="220">
                                 <TextBlock DockPanel.Dock="Top" Text="{Binding HistoryContextMatch, StringFormat=Match: {0}}" Foreground="#92400E" Margin="6,4" />
                                 <ListBox ItemsSource="{Binding HistoryContext}" ItemTemplate="{StaticResource HistoryContextEntryTemplate}" BorderThickness="0" FontFamily="Cascadia Mono" />
                             </DockPanel>
                         </Expander>
+                        <Button Grid.Row="2" Content="{Binding OlderHistoryStatus}" Click="OnLoadOlderMessagesClick" HorizontalAlignment="Left" Padding="10,3" Margin="0,8,0,0" AutomationProperties.AutomationId="LoadOlderMessages" />
                     </Grid>
                     <Border Grid.Column="1" Width="205" Margin="10,0,0,0" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="1" Visibility="{Binding DataContext.IsMemberListVisible, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource BooleanToVisibility}}">
                         <DockPanel>
@@ -189,16 +191,18 @@
                 </StackPanel>
                 <Grid Grid.Row="1">
                     <Grid.RowDefinitions>
-                        <RowDefinition Height="*" />
-                        <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-                    <ListBox ItemsSource="{Binding Entries}" ItemTemplate="{StaticResource TranscriptEntryTemplate}" BorderThickness="0" Background="White" FontFamily="Cascadia Mono" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                    <ListBox ItemsSource="{Binding Entries}" ItemTemplate="{StaticResource TranscriptEntryTemplate}" BorderThickness="0" Background="White" FontFamily="Cascadia Mono" PreviewMouseWheel="OnConversationPreviewMouseWheel" PreviewKeyDown="OnConversationPreviewKeyDown" ScrollViewer.ScrollChanged="OnConversationScrollChanged" />
                     <Expander Grid.Row="1" Header="Historical context" IsExpanded="True" Visibility="{Binding HasHistoryContext, Converter={StaticResource BooleanToVisibility}}" Margin="0,8,0,0">
                         <DockPanel MaxHeight="220">
                             <TextBlock DockPanel.Dock="Top" Text="{Binding HistoryContextMatch, StringFormat=Match: {0}}" Foreground="#92400E" Margin="6,4" />
                             <ListBox ItemsSource="{Binding HistoryContext}" ItemTemplate="{StaticResource HistoryContextEntryTemplate}" BorderThickness="0" FontFamily="Cascadia Mono" />
                         </DockPanel>
                     </Expander>
+                    <Button Grid.Row="2" Content="{Binding OlderHistoryStatus}" Click="OnLoadOlderMessagesClick" HorizontalAlignment="Left" Padding="10,3" Margin="0,8,0,0" AutomationProperties.AutomationId="LoadOlderMessages" />
                 </Grid>
             </Grid>
         </DataTemplate>

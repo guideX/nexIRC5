@@ -29,6 +29,7 @@ internal static class UiSmokeHarness
         "query-nick",
         "ircv3-metadata",
         "chathistory",
+        "history-pagination",
         "history-gap-repair",
         "history-discovery",
         "history-identity",
@@ -106,6 +107,9 @@ internal static class UiSmokeHarness
                 break;
             case "chathistory":
                 await ChathistoryAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "history-pagination":
+                await HistoryPaginationAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
             case "history-gap-repair":
                 await HistoryGapRepairAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -267,7 +271,25 @@ internal static class UiSmokeHarness
         var descriptor = window.ViewModel.Actions.BuildChannelActions(network, channel)
             .Single(item => item.Action == WorkspaceActionId.LoadOlderMessages);
         Require(descriptor.IsEnabled, "CHATHISTORY older-history action was not enabled");
-        var request = window.ViewModel.Actions.ExecuteChannelAsync(network, channel, WorkspaceActionId.LoadOlderMessages).AsTask();
+        CommandDispatchResult? result = null;
+        Task<CommandDispatchResult>? pendingRequest = null;
+        for (var page = 0; page < 64; page++)
+        {
+            pendingRequest = window.ViewModel.Actions.ExecuteChannelAsync(network, channel, WorkspaceActionId.LoadOlderMessages).AsTask();
+            await Task.WhenAny(pendingRequest, Task.Delay(50)).ConfigureAwait(true);
+            if (demo.AlphaTransport.OutboundLines.Any(line => line.StartsWith("CHATHISTORY BEFORE #general", StringComparison.Ordinal)))
+            {
+                break;
+            }
+
+            result = await pendingRequest.ConfigureAwait(true);
+            await window.ViewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+            Require(
+                result.Succeeded,
+                $"local history pagination failed before CHATHISTORY fallback: {result.Message}; outbound={string.Join(" | ", demo.AlphaTransport.OutboundLines.TakeLast(4))}");
+        }
+
+        Require(pendingRequest is not null && !pendingRequest.IsCompleted, "local history pagination did not reach a remote fallback request");
         await WaitForPollingAsync(() => demo.AlphaTransport.OutboundLines.Any(line => line.StartsWith("CHATHISTORY BEFORE #general", StringComparison.Ordinal)), "CHATHISTORY command was not sent").ConfigureAwait(true);
         demo.AlphaTransport.EnqueueInboundLine(":alpha.server BATCH +history chathistory #general");
         demo.AlphaTransport.EnqueueInboundLine("@batch=history;msgid=live-boundary;time=2026-09-07T12:00:00.000Z :Alex!u@alpha PRIVMSG #general :live boundary");
@@ -275,7 +297,7 @@ internal static class UiSmokeHarness
         demo.AlphaTransport.EnqueueInboundLine("@batch=history :Alex!u@alpha PRIVMSG #general :legitimate repeat");
         demo.AlphaTransport.EnqueueInboundLine(":alpha.server BATCH -history");
 
-        var result = await request.ConfigureAwait(true);
+        result = await pendingRequest!.ConfigureAwait(true);
         await window.ViewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
         Require(result.Succeeded && result.Message.Contains("2 older", StringComparison.Ordinal), "CHATHISTORY playback feedback did not report the bounded merge");
         Require(channel.UnreadCount == beforeUnread, "CHATHISTORY playback changed unread state");
@@ -283,6 +305,76 @@ internal static class UiSmokeHarness
         Require(channel.EntriesSnapshot.Count(entry => entry.Text == "legitimate repeat") == 2, "CHATHISTORY no-ID repeats were not retained");
         Require(channel.EntriesSnapshot.Count(entry => entry.ServerMessageId == "live-boundary") == 1, "CHATHISTORY authoritative overlap was not deduplicated");
         Console.WriteLine($"CHATHISTORY_UI_TRACE entries={channel.EntryCount} unread={channel.UnreadCount} members={channel.Members.Count}");
+    }
+
+    private static async Task HistoryPaginationAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var sessions = window.ViewModel.Sessions;
+        var logs = sessions.LogStore ?? throw new InvalidOperationException("The history-pagination smoke requires the durable log store.");
+        var conversationName = "#phase21-pagination";
+        var conversationKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, conversationName);
+        var scope = network.ProfileId ?? network.Id;
+        var baseTime = DateTimeOffset.UnixEpoch.AddDays(20);
+        for (var index = 1; index <= 300; index++)
+        {
+            await logs.AppendAsync(new ConversationLogRecord
+            {
+                Timestamp = baseTime.AddMinutes(index),
+                NetworkId = network.Id,
+                ScopeId = scope,
+                ProfileId = network.ProfileId,
+                ConversationKind = LogConversationKind.Channel,
+                ConversationName = conversationName,
+                ConversationKey = conversationKey,
+                Sender = "alice",
+                MessageKind = LogMessageKind.Message,
+                Direction = LogDirection.Incoming,
+                Text = $"local-{index:000}",
+                ServerMessageId = $"local-{index:000}",
+                TimestampSource = ConversationTimestampSource.ServerTime
+            }).ConfigureAwait(true);
+        }
+
+        await logs.FlushAsync().ConfigureAwait(true);
+        var view = (ChannelView)sessions.OpenHistoricalConversation(network.Id, DestinationKind.Channel, conversationName);
+        await WaitForPollingAsync(() => view.EntryCount == ConfigurationLimits.HistoryLocalProjectionPageSize, "history-pagination initial local page did not project").ConfigureAwait(true);
+        Require(view.EntriesSnapshot[0].Text == "local-251" && view.EntriesSnapshot[^1].Text == "local-300", "initial local projection was not the newest bounded page");
+        var chathistoryBefore = demo.AlphaTransport.OutboundLines.Count(line => line.StartsWith("CHATHISTORY", StringComparison.Ordinal));
+
+        for (var page = 0; page < 5; page++)
+        {
+            var result = await sessions.LoadOlderMessagesAsync(network, view).ConfigureAwait(true);
+            Require(result.Succeeded, "local-first pagination failed");
+        }
+
+        await sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+        var localEntries = view.EntriesSnapshot;
+        Require(localEntries.Count == 300, $"local pagination did not project all canonical rows (count={localEntries.Count}, first={(localEntries.Count == 0 ? "none" : localEntries[0].Text)}, last={(localEntries.Count == 0 ? "none" : localEntries[^1].Text)})");
+        Require(localEntries[0].Text == "local-001" && localEntries[^1].Text == "local-300", $"local pagination ordering was not canonical (first={localEntries[0].Text}, last={localEntries[^1].Text})");
+        Require(demo.AlphaTransport.OutboundLines.Count(line => line.StartsWith("CHATHISTORY", StringComparison.Ordinal)) == chathistoryBefore, "local pagination issued unexpected IRC history traffic");
+
+        var remote = sessions.LoadOlderMessagesAsync(network, view).AsTask();
+        await WaitForPollingAsync(() => demo.AlphaTransport.OutboundLines.Any(line => line.StartsWith($"CHATHISTORY BEFORE {conversationName}", StringComparison.Ordinal)), "remote pagination BEFORE request was not sent").ConfigureAwait(true);
+        var coalesced = Enumerable.Range(0, 10)
+            .Select(_ => sessions.LoadOlderMessagesAsync(network, view).AsTask())
+            .ToArray();
+        Require(coalesced.All(task => ReferenceEquals(task, remote)), "repeated top-scroll pagination requests did not coalesce");
+        demo.AlphaTransport.EnqueueInboundLine($"@draft/chathistory-end :alpha.server BATCH +phase21-page chathistory {conversationName}");
+        demo.AlphaTransport.EnqueueInboundLine($"@batch=phase21-page;msgid=remote-001;time={baseTime.AddMinutes(-1):O} :alice!u@alpha PRIVMSG {conversationName} :remote-001");
+        demo.AlphaTransport.EnqueueInboundLine($"@batch=phase21-page;msgid=remote-001;time={baseTime.AddMinutes(-1):O} :alice!u@alpha PRIVMSG {conversationName} :remote-001 duplicate");
+        demo.AlphaTransport.EnqueueInboundLine(":alpha.server BATCH -phase21-page");
+        var remoteResult = await remote.ConfigureAwait(true);
+        await sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+        Require(
+            remoteResult.Succeeded
+            && view.EntriesSnapshot.Count(entry => entry.ServerMessageId == "remote-001") == 1,
+            "remote pagination page was not canonically deduplicated and projected");
+        Require(sessions.GetHistoryCoverage(network.Id, conversationKey).RemoteExhausted, "explicit server end did not establish remote exhaustion");
+
+        var requestsAfterEnd = demo.AlphaTransport.OutboundLines.Count(line => line.StartsWith($"CHATHISTORY BEFORE {conversationName}", StringComparison.Ordinal));
+        await sessions.LoadOlderMessagesAsync(network, view).ConfigureAwait(true);
+        Require(demo.AlphaTransport.OutboundLines.Count(line => line.StartsWith($"CHATHISTORY BEFORE {conversationName}", StringComparison.Ordinal)) == requestsAfterEnd, "remote exhaustion did not suppress a repeated BEFORE request");
+        Console.WriteLine($"HISTORY_PAGINATION_UI_TRACE local_pages=6 local_rows=300 remote_pages=1 coalesced_requests=10 end_reached=true repeated_before_suppressed=true");
     }
 
     private static async Task HistoryGapRepairAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)

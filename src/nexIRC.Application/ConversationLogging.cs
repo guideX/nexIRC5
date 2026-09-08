@@ -196,12 +196,19 @@ public sealed record ConversationLogCleanupStatistics(
 public sealed record HistoryPageRequest
 {
     public required Guid ScopeId { get; init; }
+    /// <summary>
+    /// Optional for compatibility with profile-wide history tools. When set,
+    /// local conversation paging is isolated to this logical network.
+    /// </summary>
+    public Guid? NetworkId { get; init; }
     public required LogConversationKind ConversationKind { get; init; }
     public required string ConversationName { get; init; }
     public string? ConversationKey { get; init; }
     public int PageSize { get; init; } = ConfigurationLimits.MaximumHistoryPageSize;
     public DateTimeOffset? Before { get; init; }
+    public long? BeforeDurableSequence { get; init; }
     public DateTimeOffset? After { get; init; }
+    public long? AfterDurableSequence { get; init; }
     public bool Oldest { get; init; }
     public DateTimeOffset? Around { get; init; }
     public TimeSpan AroundWindow { get; init; } = TimeSpan.FromHours(12);
@@ -985,6 +992,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                 request.ConversationKind,
                 request.ConversationName,
                 request.ConversationKey,
+                null,
                 cancellationToken).ConfigureAwait(false);
             if (indexedRecords is not null)
             {
@@ -1993,11 +2001,11 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             return null;
         }
 
-        var eligible = index.Entries.Where(entry => request.Around is not null
+        var scopedEntries = index.Entries.Where(entry => request.NetworkId is null || entry.NetworkId == request.NetworkId).ToArray();
+        var eligible = scopedEntries.Where(entry => request.Around is not null
                 ? entry.TimestampTicks >= request.Around.Value.UtcTicks - request.AroundWindow.Ticks
                     && entry.TimestampTicks <= request.Around.Value.UtcTicks + request.AroundWindow.Ticks
-                : (request.Before is null || entry.TimestampTicks < request.Before.Value.UtcTicks)
-                    && (request.After is null || entry.TimestampTicks > request.After.Value.UtcTicks))
+                : HistoryPageSelector.IsBefore(entry, request) && HistoryPageSelector.IsAfter(entry, request))
             .ToArray();
         var selected = request.Around is not null
             ? eligible.OrderBy(entry => Distance(entry.TimestampTicks, request.Around.Value.UtcTicks)).ThenByDescending(entry => entry.TimestampTicks).ThenByDescending(entry => entry.Offset).Take(pageSize).ToArray()
@@ -2016,6 +2024,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             request.ConversationKind,
             request.ConversationName,
             request.ConversationKey,
+            request.NetworkId,
             cancellationToken).ConfigureAwait(false);
         if (loaded is null || loaded.Count != selected.Length)
         {
@@ -2024,8 +2033,8 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
 
         var records = ConversationHistoryOrdering.OrderDescending(
             ConversationHistoryMerge.DeduplicateExact(loaded)).ToArray();
-        var oldest = index.Entries.Min(entry => entry.TimestampTicks);
-        var newest = index.Entries.Max(entry => entry.TimestampTicks);
+        var oldest = scopedEntries.Min(entry => entry.TimestampTicks);
+        var newest = scopedEntries.Max(entry => entry.TimestampTicks);
         return new HistoryPage(
             records,
             oldest < records[^1].Timestamp.UtcTicks,
@@ -2097,6 +2106,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         LogConversationKind conversationKind,
         string conversationName,
         string? conversationKey,
+        Guid? networkId,
         CancellationToken cancellationToken)
     {
         var entries = selected.ToArray();
@@ -2117,6 +2127,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                 var record = JsonSerializer.Deserialize<ConversationLogRecord>(bytes, JsonOptions);
                 if (!ConversationLogRecordValidation.IsReadable(record)
                     || record!.Text.Length > ConfigurationLimits.MaximumLogRecordBytes
+                    || networkId is not null && record.NetworkId != networkId
                     || record.ScopeId != scopeId
                     || record.ConversationKind != conversationKind
                     || !IsConversationRecord(record, scopeId, conversationKind, conversationName, conversationKey)
@@ -2287,6 +2298,7 @@ internal static class HistoryPageSelector
 {
     internal static bool MatchesHistoryRecord(ConversationLogRecord record, HistoryPageRequest request) =>
         record.ScopeId == request.ScopeId
+        && (request.NetworkId is null || record.NetworkId == request.NetworkId)
         && record.ConversationKind == request.ConversationKind
         && (string.IsNullOrWhiteSpace(request.ConversationKey)
             ? IrcIdentity.Equals(record.ConversationName, request.ConversationName, IrcCaseMapping.Rfc1459)
@@ -2313,8 +2325,7 @@ internal static class HistoryPageSelector
         var pageSize = Math.Clamp(request.PageSize, 1, ConfigurationLimits.MaximumHistoryPageSize);
         var eligible = matching.Where(record => request.Around is not null
                 ? record.Timestamp >= request.Around.Value - request.AroundWindow && record.Timestamp <= request.Around.Value + request.AroundWindow
-                : (request.Before is null || record.Timestamp < request.Before.Value)
-                    && (request.After is null || record.Timestamp > request.After.Value))
+                : IsBefore(record, request) && IsAfter(record, request))
             .ToArray();
         var selected = request.Around is not null
             ? eligible.OrderBy(record => Math.Abs((record.Timestamp - request.Around.Value).Ticks))
@@ -2333,6 +2344,42 @@ internal static class HistoryPageSelector
         var newest = matching.Max(record => record.Timestamp);
         return new HistoryPage(records, oldest < records[^1].Timestamp, newest > records[0].Timestamp, records[^1].Timestamp, records[0].Timestamp);
     }
+
+    internal static bool IsBefore(JsonlHistoryIndexEntry entry, HistoryPageRequest request) =>
+        request.Before is null
+            ? true
+            : entry.TimestampTicks < request.Before.Value.UtcTicks
+                || entry.TimestampTicks == request.Before.Value.UtcTicks
+                    && request.BeforeDurableSequence is long sequence
+                    && entry.DurableSequence > 0
+                    && entry.DurableSequence < sequence;
+
+    internal static bool IsAfter(JsonlHistoryIndexEntry entry, HistoryPageRequest request) =>
+        request.After is null
+            ? true
+            : entry.TimestampTicks > request.After.Value.UtcTicks
+                || entry.TimestampTicks == request.After.Value.UtcTicks
+                    && request.AfterDurableSequence is long sequence
+                    && entry.DurableSequence > 0
+                    && entry.DurableSequence > sequence;
+
+    internal static bool IsBefore(ConversationLogRecord record, HistoryPageRequest request) =>
+        request.Before is null
+            ? true
+            : record.Timestamp < request.Before.Value
+                || record.Timestamp == request.Before.Value
+                    && request.BeforeDurableSequence is long sequence
+                    && record.DurableSequence > 0
+                    && record.DurableSequence < sequence;
+
+    internal static bool IsAfter(ConversationLogRecord record, HistoryPageRequest request) =>
+        request.After is null
+            ? true
+            : record.Timestamp > request.After.Value
+                || record.Timestamp == request.After.Value
+                    && request.AfterDurableSequence is long sequence
+                    && record.DurableSequence > 0
+                    && record.DurableSequence > sequence;
 }
 
 public sealed class InMemoryConversationLogStore : IConversationLogStore
