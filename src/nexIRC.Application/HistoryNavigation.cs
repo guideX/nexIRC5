@@ -33,6 +33,13 @@ public sealed record HistoryNavigationRequest
 
     public DateTimeOffset? Timestamp { get; init; }
 
+    /// <summary>
+    /// Exact canonical location supplied by a local search result. It is used
+    /// before timestamp fallback and is validated against JSONL before context
+    /// is projected.
+    /// </summary>
+    public HistoryAnchorLocation? CanonicalAnchor { get; init; }
+
     public HistoryAnchorDirection TimestampDirection { get; init; } = HistoryAnchorDirection.Around;
 
     public int BeforeCount { get; init; } = ConfigurationLimits.MaximumHistoryContextEntries / 2;
@@ -43,10 +50,12 @@ public sealed record HistoryNavigationRequest
 
     public bool IsTimestampRequest => Timestamp is not null;
 
+    public bool IsCanonicalRequest => CanonicalAnchor is not null;
+
     public static HistoryNavigationRequest ForMessage(HistoryConversationAddress conversation, string serverMessageId) => new()
     {
         Conversation = conversation,
-        ServerMessageId = serverMessageId
+        ServerMessageId = serverMessageId?.Trim()
     };
 
     public static HistoryNavigationRequest ForTimestamp(
@@ -57,6 +66,16 @@ public sealed record HistoryNavigationRequest
             Conversation = conversation,
             Timestamp = timestamp.ToUniversalTime(),
             TimestampDirection = direction
+        };
+
+    public static HistoryNavigationRequest ForSearchResult(
+        HistoryConversationAddress conversation,
+        ConversationLogSearchResult result) => new()
+        {
+            Conversation = conversation,
+            ServerMessageId = result.ServerMessageId,
+            Timestamp = result.ServerMessageId is null ? result.Timestamp : null,
+            CanonicalAnchor = result.CanonicalAnchor
         };
 }
 
@@ -104,7 +123,16 @@ internal static class HistoryNavigationValidation
         && request.Conversation.NetworkId != Guid.Empty
         && request.Conversation.ScopeId != Guid.Empty
         && !string.IsNullOrWhiteSpace(request.Conversation.ConversationName)
-        && (request.IsMessageRequest ^ request.IsTimestampRequest);
+        && (request.IsMessageRequest ^ request.IsTimestampRequest)
+        && (!request.IsMessageRequest
+            || HistorySearchInput.TryNormalizeServerMessageId(request.ServerMessageId, out _, out _))
+        && (!request.IsCanonicalRequest
+            || request.CanonicalAnchor is
+            {
+                SourceOffset: >= 0,
+                SourceLength: > 0,
+                Record: not null
+            });
 
     public static bool MatchesView(HistoryConversationAddress request, HistoryConversationAddress current) =>
         request.NetworkId == current.NetworkId

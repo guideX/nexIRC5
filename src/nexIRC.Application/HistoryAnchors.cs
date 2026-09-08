@@ -60,7 +60,11 @@ public sealed record HistoryAnchorLocation(
     long SourceOffset,
     int SourceLength)
 {
-    internal string? SourcePath { get; init; }
+    /// <summary>
+    /// Source segment path used to validate a search result's canonical
+    /// location. It is an opaque local hint; JSONL remains authoritative.
+    /// </summary>
+    public string? SourcePath { get; init; }
 }
 
 public sealed record HistoryAnchorResult(
@@ -79,6 +83,8 @@ public sealed record HistoryContextRequest
     public required HistoryConversationAddress Conversation { get; init; }
 
     public string? ServerMessageId { get; init; }
+
+    public HistoryAnchorLocation? CanonicalAnchor { get; init; }
 
     public DateTimeOffset? Timestamp { get; init; }
 

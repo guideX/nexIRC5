@@ -33,6 +33,11 @@ public static class ConfigurationLimits
     public const int MaximumRecentQueriesPerProfile = 50;
     public const int MaximumSearchResults = 500;
     public const int MaximumSearchQueryLength = 256;
+    public const int MaximumSearchSenderLength = 128;
+    public const int MaximumSearchConversationLength = 256;
+    public const int MaximumSearchConversationKeyLength = 512;
+    public const int MaximumHistoryMessageIdLength = 256;
+    public const int MaximumSearchSnippetLength = 240;
     public const int MaximumHistoryPageSize = 100;
     public const int HistoryLocalProjectionPageSize = 50;
     public const int HistoryRemotePaginationPageSize = 50;

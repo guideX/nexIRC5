@@ -434,11 +434,16 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         WorkspaceView view,
         string serverMessageId,
         CancellationToken cancellationToken = default) =>
-        NavigateHistoryAsync(
-            network,
-            view,
-            HistoryNavigationRequest.ForMessage(HistoryAddress(network, view), serverMessageId),
-            cancellationToken);
+        HistorySearchInput.TryNormalizeServerMessageId(serverMessageId, out var normalized, out var error)
+            ? NavigateHistoryAsync(
+                network,
+                view,
+                HistoryNavigationRequest.ForMessage(HistoryAddress(network, view), normalized),
+                cancellationToken)
+            : ValueTask.FromResult(HistoryNavigationResult.Create(
+                HistoryNavigationRequest.ForMessage(HistoryAddress(network, view), string.Empty),
+                HistoryNavigationOutcome.Failed,
+                error));
 
     public ValueTask<HistoryNavigationResult> JumpToHistoryTimestampAsync(
         NetworkWorkspace network,
@@ -451,6 +456,34 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             view,
             HistoryNavigationRequest.ForTimestamp(HistoryAddress(network, view), timestamp, direction),
             cancellationToken);
+
+    /// <summary>
+    /// Routes a local search result through the same Phase 22 navigation
+    /// substrate used by explicit msgid and timestamp jumps. A source offset
+    /// preserves distinct no-msgid records; a server msgid remains the remote
+    /// fallback if the disposable local index has gone stale.
+    /// </summary>
+    public async ValueTask<HistoryNavigationResult> NavigateToHistorySearchResultAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        ConversationLogSearchResult result,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        if (result.NetworkId != network.Id
+            || result.Location.ScopeId != (network.ProfileId ?? network.Id)
+            || result.ConversationKind != HistoryKind(view)
+            || !string.Equals(result.DurableConversationKey, HistoryConversation(view), StringComparison.Ordinal))
+        {
+            var invalidRequest = HistoryNavigationRequest.ForTimestamp(
+                HistoryAddress(network, view),
+                result.Timestamp);
+            return HistoryNavigationResult.Create(invalidRequest, HistoryNavigationOutcome.Failed, "The history result is not scoped to the selected network and conversation.");
+        }
+
+        var request = HistoryNavigationRequest.ForSearchResult(HistoryAddress(network, view), result);
+        return await NavigateHistoryAsync(network, view, request, cancellationToken).ConfigureAwait(false);
+    }
 
     public async ValueTask<HistoryNavigationResult> NavigateHistoryAsync(
         NetworkWorkspace network,
@@ -690,6 +723,21 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         if (_logStore is not null)
         {
             var address = request.Conversation;
+            if (request.CanonicalAnchor is { } canonicalAnchor)
+            {
+                var canonical = await _logStore.ReadContextAroundAsync(new HistoryContextRequest
+                {
+                    Conversation = address,
+                    CanonicalAnchor = canonicalAnchor,
+                    BeforeCount = request.BeforeCount,
+                    AfterCount = request.AfterCount
+                }, cancellationToken).ConfigureAwait(false);
+                if (canonical.Anchor.Found)
+                {
+                    return canonical;
+                }
+            }
+
             var anchor = request.IsMessageRequest
                 ? await _logStore.FindByServerMessageIdAsync(new HistoryServerMessageAnchorRequest
                 {
@@ -1473,15 +1521,22 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         return null;
     }
 
-    public WorkspaceView OpenHistoricalConversation(Guid networkId, DestinationKind kind, string name)
+    public WorkspaceView OpenHistoricalConversation(Guid networkId, DestinationKind kind, string name) =>
+        OpenHistoricalConversation(networkId, kind, name, null);
+
+    public WorkspaceView OpenHistoricalConversation(Guid networkId, DestinationKind kind, string name, string? conversationKey)
     {
         var workspace = GetWorkspace(networkId);
         var existing = kind == DestinationKind.Channel
             ? workspace.Channels.Any(channel => IrcCaseMappingComparer.Equals(channel.Channel, name, workspace.Snapshot.Features.CaseMapping))
-            : workspace.Queries.Any(query => IrcCaseMappingComparer.Equals(query.Nickname, name, workspace.Snapshot.Features.CaseMapping));
+            : conversationKey is not null
+                ? workspace.FindQueryByHistoryKey(conversationKey) is not null
+                : workspace.Queries.Any(query => IrcCaseMappingComparer.Equals(query.Nickname, name, workspace.Snapshot.Features.CaseMapping));
         WorkspaceView view = kind == DestinationKind.Channel
             ? workspace.EnsureChannel(name)
-            : workspace.EnsureQuery(name);
+            : conversationKey is not null
+                ? workspace.EnsureHistoricalQuery(name, conversationKey)
+                : workspace.EnsureQuery(name);
         if (!existing && view is ChannelView channel && !channel.IsJoined)
         {
             view.SetLifecycleState(ConversationLifecycleState.HistoricalOnly);

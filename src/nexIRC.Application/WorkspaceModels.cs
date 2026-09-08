@@ -1811,6 +1811,26 @@ public sealed class NetworkWorkspace : ObservableObject
         return view;
     }
 
+    internal QueryView EnsureHistoricalQuery(string nickname, string historyConversationKey)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
+        ArgumentException.ThrowIfNullOrWhiteSpace(historyConversationKey);
+        var existing = Queries.FirstOrDefault(query =>
+            string.Equals(query.HistoryConversationKey, historyConversationKey, StringComparison.Ordinal));
+        if (existing is not null)
+        {
+            ReopenView(existing);
+            return existing;
+        }
+
+        var view = new QueryView(Id, Guid.NewGuid(), nickname, historyConversationKey);
+        view.MarkIdentityBoundary(_snapshot.ConnectionGeneration);
+        view.ApplyConnectionState(false);
+        Queries.Add(view);
+        InsertView(view);
+        return view;
+    }
+
     internal QueryView EnsureIncomingQuery(string nickname, string? account = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(nickname);

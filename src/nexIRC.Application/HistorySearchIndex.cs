@@ -35,7 +35,7 @@ internal static class JsonlSearchIndex
         Converters = { new JsonStringEnumConverter() }
     };
     private static readonly byte[] Magic = "NEXSIDX1"u8.ToArray();
-    private const int FormatVersion = 1;
+    private const int FormatVersion = 2;
     private const int HashCount = 3;
     private const int SidecarHashBytes = 32;
     private static readonly int BloomBits = ConfigurationLimits.HistorySearchIndexBloomBytes * 8;
@@ -87,6 +87,91 @@ internal static class JsonlSearchIndex
             return snapshot;
         }
         catch (UnauthorizedAccessException)
+        {
+            return snapshot;
+        }
+    }
+
+    /// <summary>
+    /// Extends a current sidecar with one canonical append. This is best
+    /// effort: any source or sidecar mismatch returns null and the next search
+    /// will rebuild from JSONL. The append path never depends on this method
+    /// for durable history persistence.
+    /// </summary>
+    internal static async Task<JsonlSearchIndexSnapshot?> TryAppendBuiltAsync(
+        string sourcePath,
+        JsonlSearchIndexSnapshot previous,
+        ConversationLogRecord record,
+        long offset,
+        int sourceLength,
+        CancellationToken cancellationToken)
+    {
+        if (previous.Blocks.Count == 0
+            || offset != previous.SourceLength
+            || sourceLength <= 0)
+        {
+            return null;
+        }
+
+        FileInfo sourceInfo;
+        try
+        {
+            sourceInfo = new FileInfo(sourcePath);
+            if (!IsEligibleSource(sourceInfo)
+                || sourceInfo.Length != checked(previous.SourceLength + sourceLength))
+            {
+                return null;
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or OverflowException)
+        {
+            return null;
+        }
+
+        var last = previous.Blocks[^1];
+        if (last.Offset + last.Length != previous.SourceLength)
+        {
+            return null;
+        }
+
+        var blocks = previous.Blocks.ToList();
+        if (last.RecordCount < ConfigurationLimits.HistorySearchIndexBlockRecords)
+        {
+            blocks[^1] = AppendToBlock(last, record, sourceLength);
+        }
+        else
+        {
+            if (blocks.Count >= ConfigurationLimits.MaximumHistorySearchIndexBlocks)
+            {
+                return null;
+            }
+
+            var builder = new BlockBuilder();
+            builder.Add(offset, record);
+            blocks.Add(builder.Complete(sourceLength));
+        }
+
+        var snapshot = new JsonlSearchIndexSnapshot(
+            sourceInfo.Length,
+            sourceInfo.LastWriteTimeUtc.Ticks,
+            blocks);
+        try
+        {
+            await WriteAsync(GetSidecarPath(sourcePath), snapshot, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return snapshot;
+        }
+
+        try
+        {
+            var sidecarInfo = new FileInfo(GetSidecarPath(sourcePath));
+            return sidecarInfo.Exists
+                ? snapshot with { SidecarLength = sidecarInfo.Length, SidecarLastWriteTicks = sidecarInfo.LastWriteTimeUtc.Ticks }
+                : snapshot;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             return snapshot;
         }
@@ -297,6 +382,31 @@ internal static class JsonlSearchIndex
         && sourceInfo.Length == length
         && sourceInfo.LastWriteTimeUtc.Ticks == lastWriteTicks;
 
+    private static JsonlSearchIndexBlock AppendToBlock(
+        JsonlSearchIndexBlock block,
+        ConversationLogRecord record,
+        int sourceLength)
+    {
+        var bloom = (byte[])block.Bloom.Clone();
+        AddText(bloom, record.Text);
+        if (record.Sender is not null) AddText(bloom, record.Sender);
+        AddText(bloom, record.ConversationName);
+        return new JsonlSearchIndexBlock(
+            block.Offset,
+            checked(block.Length + sourceLength),
+            Math.Min(block.MinimumTimestampTicks, record.Timestamp.UtcTicks),
+            Math.Max(block.MaximumTimestampTicks, record.Timestamp.UtcTicks),
+            checked(block.RecordCount + 1),
+            bloom);
+    }
+
+    private static void AddText(byte[] bloom, string value)
+    {
+        var normalized = Normalize(value);
+        if (normalized is null) return;
+        for (var index = 0; index <= normalized.Length - 3; index++) AddTrigram(bloom, normalized, index);
+    }
+
     private static string? Normalize(string value)
     {
         if (value.Any(character => character > 127))
@@ -365,17 +475,18 @@ internal static class JsonlSearchIndex
             RecordCount++;
             _minimumTimestampTicks = Math.Min(_minimumTimestampTicks, record.Timestamp.UtcTicks);
             _maximumTimestampTicks = Math.Max(_maximumTimestampTicks, record.Timestamp.UtcTicks);
-            AddText(record.Text);
-            if (record.Sender is not null) AddText(record.Sender);
+            AddText(_bloom, record.Text);
+            if (record.Sender is not null) AddText(_bloom, record.Sender);
+            AddText(_bloom, record.ConversationName);
         }
 
         public JsonlSearchIndexBlock Complete(long length) => new(Offset, length, _minimumTimestampTicks, _maximumTimestampTicks, RecordCount, _bloom);
 
-        private void AddText(string value)
+        private static void AddText(byte[] bloom, string value)
         {
             var normalized = Normalize(value);
             if (normalized is null) return;
-            for (var index = 0; index <= normalized.Length - 3; index++) AddTrigram(_bloom, normalized, index);
+            for (var index = 0; index <= normalized.Length - 3; index++) AddTrigram(bloom, normalized, index);
         }
     }
 }

@@ -523,20 +523,81 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public bool RouteLogSearchResult(ConversationLogSearchResult result)
         => RouteLogSearchResultAsync(result).GetAwaiter().GetResult();
 
+    public async Task<HistoryNavigationResult> NavigateHistoryMessageAsync(
+        Guid networkId,
+        LogConversationKind kind,
+        string conversationName,
+        string? conversationKey,
+        string serverMessageId,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Sessions.TryGet(networkId, out var network) || network is null || kind is LogConversationKind.Status)
+        {
+            return HistoryNavigationResult.Create(
+                HistoryNavigationRequest.ForMessage(new HistoryConversationAddress
+                {
+                    NetworkId = networkId,
+                    ScopeId = network?.ProfileId ?? networkId,
+                    ConversationKind = kind,
+                    ConversationName = conversationName,
+                    ConversationKey = conversationKey
+                }, string.Empty),
+                HistoryNavigationOutcome.Failed,
+                "Choose a valid network, channel, or private conversation.");
+        }
+
+        var view = Sessions.OpenHistoricalConversation(
+            networkId,
+            kind == LogConversationKind.Channel ? DestinationKind.Channel : DestinationKind.Query,
+            conversationName,
+            conversationKey);
+        SelectView(view);
+        return await Sessions.JumpToHistoryMessageAsync(network, view, serverMessageId, cancellationToken).ConfigureAwait(true);
+    }
+
+    public async Task<HistoryNavigationResult> NavigateHistoryTimestampAsync(
+        Guid networkId,
+        LogConversationKind kind,
+        string conversationName,
+        string? conversationKey,
+        DateTimeOffset timestamp,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Sessions.TryGet(networkId, out var network) || network is null || kind is LogConversationKind.Status)
+        {
+            var request = HistoryNavigationRequest.ForTimestamp(new HistoryConversationAddress
+            {
+                NetworkId = networkId,
+                ScopeId = network?.ProfileId ?? networkId,
+                ConversationKind = kind,
+                ConversationName = conversationName,
+                ConversationKey = conversationKey
+            }, timestamp);
+            return HistoryNavigationResult.Create(request, HistoryNavigationOutcome.Failed, "Choose a valid network, channel, or private conversation.");
+        }
+
+        var view = Sessions.OpenHistoricalConversation(
+            networkId,
+            kind == LogConversationKind.Channel ? DestinationKind.Channel : DestinationKind.Query,
+            conversationName,
+            conversationKey);
+        SelectView(view);
+        return await Sessions.JumpToHistoryTimestampAsync(network, view, timestamp, cancellationToken: cancellationToken).ConfigureAwait(true);
+    }
+
     public async Task<bool> RouteLogSearchResultAsync(ConversationLogSearchResult result, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(result);
-        var network = Sessions.Networks.FirstOrDefault(item => item.Id == result.NetworkId)
-            ?? (result.ProfileId is Guid profileId ? Sessions.Networks.FirstOrDefault(item => item.ProfileId == profileId) : null);
+        var network = Sessions.Networks.FirstOrDefault(item => item.Id == result.NetworkId);
         if (network is not null)
         {
             cancellationToken.ThrowIfCancellationRequested();
             WorkspaceView view = result.ConversationKind switch
             {
-                LogConversationKind.Channel => Sessions.OpenHistoricalConversation(network.Id, DestinationKind.Channel, result.ConversationName),
+                LogConversationKind.Channel => Sessions.OpenHistoricalConversation(network.Id, DestinationKind.Channel, result.ConversationName, result.DurableConversationKey),
                 LogConversationKind.PrivateConversation => network.Queries.FirstOrDefault(query =>
-                        string.Equals(query.HistoryConversationKey, result.Location.ConversationKey, StringComparison.Ordinal))
-                    ?? Sessions.OpenHistoricalConversation(network.Id, DestinationKind.Query, result.ConversationName),
+                        string.Equals(query.HistoryConversationKey, result.DurableConversationKey, StringComparison.Ordinal))
+                    ?? Sessions.OpenHistoricalConversation(network.Id, DestinationKind.Query, result.ConversationName, result.DurableConversationKey),
                 _ => network.StatusView
             };
             if (!view.IsViewOpen)
@@ -544,46 +605,22 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 Sessions.ReopenView(view.Id);
             }
             SelectView(view);
-            if (Sessions.LogStore is { } store)
+            if (view is ChannelView or QueryView)
             {
-                var address = new HistoryConversationAddress
+                var navigation = await Sessions.NavigateToHistorySearchResultAsync(network, view, result, cancellationToken).ConfigureAwait(true);
+                if (!navigation.Succeeded)
                 {
-                    NetworkId = result.NetworkId,
-                    ScopeId = result.Location.ScopeId,
-                    ConversationKind = result.ConversationKind,
-                    ConversationName = result.ConversationName,
-                    ConversationKey = result.Location.ConversationKey
-                };
-                var anchored = result.Record.ServerMessageId is { Length: > 0 }
-                    ? await store.ReadContextAroundAsync(new HistoryContextRequest
-                    {
-                        Conversation = address,
-                        ServerMessageId = result.Record.ServerMessageId,
-                        BeforeCount = ConfigurationLimits.MaximumHistoryContextEntries / 2,
-                        AfterCount = ConfigurationLimits.MaximumHistoryContextEntries / 2
-                    }, cancellationToken).ConfigureAwait(true)
-                    : HistoryContextResult.Missing;
-                var records = anchored.Anchor.Found && anchored.IsCompleteLocally
-                    ? anchored.Records
-                    : (await store.ReadPageWindowAsync(new HistoryPageRequest
-                    {
-                        ScopeId = result.Location.ScopeId,
-                        ConversationKind = result.ConversationKind,
-                        ConversationName = result.ConversationName,
-                        ConversationKey = result.Location.ConversationKey,
-                        PageSize = ConfigurationLimits.MaximumHistoryContextEntries,
-                        Around = result.Timestamp
-                    }, cancellationToken).ConfigureAwait(true)).Records;
-                view.SetHistoryContext(
-                    records.Select(record => new HistoryContextEntry(record, IsSameHistoryRecord(record, result))),
-                    result.Preview);
+                    StatusText = navigation.Message;
+                    return false;
+                }
+
+                StatusText = navigation.Message;
             }
             else
             {
                 view.SetHistoryContext([new HistoryContextEntry(result.Record, true)], result.Preview);
             }
 
-            StatusText = $"Opened {result.ConversationName} with surrounding history.";
             return true;
         }
 

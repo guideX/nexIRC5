@@ -33,7 +33,7 @@ public partial class App : System.Windows.Application
 
         if (smokeScenario is not null && !UiSmokeHarness.IsKnownScenario(smokeScenario))
         {
-            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": unknown scenario. Expected the existing smoke scenarios, ircv3-metadata, contextual-actions, sustained-interactivity, or close-idle/close-sustained/close-backlog/close-reconnect/close-partial/close-registered/close-persistence/close-interacted.");
+            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": unknown scenario. Expected the existing smoke scenarios, history-search, stale-search, index-recovery, ircv3-metadata, contextual-actions, sustained-interactivity, or close-idle/close-sustained/close-backlog/close-reconnect/close-partial/close-registered/close-persistence/close-interacted.");
             Environment.ExitCode = 2;
             Shutdown(2);
             return;

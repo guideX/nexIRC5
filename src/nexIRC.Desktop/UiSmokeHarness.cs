@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Windows;
 using System.Globalization;
+using System.IO;
 using nexIRC.Application;
 using nexIRC.Core.Networking;
 using nexIRC.Core.Session;
@@ -32,6 +33,9 @@ internal static class UiSmokeHarness
         "history-pagination",
         "forward-pagination",
         "history-navigation",
+        "history-search",
+        "stale-search",
+        "index-recovery",
         "history-gap-repair",
         "history-discovery",
         "history-identity",
@@ -118,6 +122,15 @@ internal static class UiSmokeHarness
                 break;
             case "history-navigation":
                 await HistoryNavigationAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "history-search":
+                await HistorySearchAsync(window, demo, state.Alpha, state.Beta).ConfigureAwait(true);
+                break;
+            case "stale-search":
+                StaleSearchAsync();
+                break;
+            case "index-recovery":
+                await IndexRecoveryAsync().ConfigureAwait(true);
                 break;
             case "history-gap-repair":
                 await HistoryGapRepairAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -613,6 +626,283 @@ internal static class UiSmokeHarness
         Require(channel.UnreadCount == unreadBeforeHistory, "historical gap playback changed unread state");
         Require(replacement.OutboundLines.Count(line => line.StartsWith("CHATHISTORY BETWEEN #general", StringComparison.Ordinal)) == 1, "the repaired gap triggered more than one exact network request");
         Console.WriteLine($"HISTORY_GAP_REPAIR_UI_TRACE state=repaired between_requests=1 chronology=A,B,C,D,E,F unread_unchanged=true");
+    }
+
+    private static async Task HistorySearchAsync(
+        MainWindow window,
+        DemoScenario demo,
+        NetworkWorkspace alpha,
+        NetworkWorkspace beta)
+    {
+        var viewModel = window.ViewModel;
+        var sessions = viewModel.Sessions;
+        var logs = sessions.LogStore ?? throw new InvalidOperationException("The history-search smoke requires the durable log store.");
+        var alphaScope = alpha.ProfileId ?? alpha.Id;
+        var betaScope = beta.ProfileId ?? beta.Id;
+        var alphaKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, "#alpha");
+        var betaKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, "#lounge");
+        var baseTime = new DateTimeOffset(2026, 9, 8, 12, 0, 0, TimeSpan.Zero);
+
+        ConversationLogRecord Record(
+            NetworkWorkspace network,
+            Guid scope,
+            LogConversationKind conversationKind,
+            string conversationName,
+            string conversationKey,
+            string text,
+            string sender,
+            LogMessageKind messageKind = LogMessageKind.Message,
+            string? messageId = null,
+            DateTimeOffset? timestamp = null) => new()
+            {
+                Timestamp = timestamp ?? baseTime,
+                NetworkId = network.Id,
+                ScopeId = scope,
+                ProfileId = network.ProfileId,
+                ConversationKind = conversationKind,
+                ConversationName = conversationName,
+                ConversationKey = conversationKey,
+                Sender = sender,
+                MessageKind = messageKind,
+                Direction = LogDirection.Incoming,
+                Text = text,
+                ServerMessageId = messageId,
+                TimestampSource = ConversationTimestampSource.ServerTime,
+                Provenance = ConversationEntryProvenance.Live
+            };
+
+        for (var index = 0; index < 600; index++)
+        {
+            await logs.AppendAsync(Record(
+                alpha,
+                alphaScope,
+                LogConversationKind.Channel,
+                "#alpha",
+                alphaKey,
+                $"kernel search row {index:000}",
+                index % 2 == 0 ? "Alice" : "Rook",
+                timestamp: baseTime.AddMinutes(index))).ConfigureAwait(true);
+        }
+
+        var alphaUnique = Record(
+            alpha,
+            alphaScope,
+            LogConversationKind.Channel,
+            "#alpha",
+            alphaKey,
+            "phase twenty three unique message",
+            "Alice",
+            messageId: "phase23-alpha-unique",
+            timestamp: baseTime.AddMinutes(-2000));
+        var betaUnique = Record(
+            beta,
+            betaScope,
+            LogConversationKind.Channel,
+            "#lounge",
+            betaKey,
+            "phase twenty three unique message",
+            "Alice",
+            messageId: "phase23-beta-unique",
+            timestamp: baseTime.AddMinutes(-1999));
+        var historicalEvent = Record(
+            alpha,
+            alphaScope,
+            LogConversationKind.Channel,
+            "#alpha",
+            alphaKey,
+            "phase twenty three unique event",
+            "Oper",
+            LogMessageKind.Topic,
+            "phase23-topic",
+            baseTime.AddMinutes(-1998));
+        var aliceKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.PrivateConversation, "Alice");
+        var aliceHistory = Record(
+            alpha,
+            alphaScope,
+            LogConversationKind.PrivateConversation,
+            "Alice",
+            aliceKey,
+            "Alice account alice123 historical message",
+            "Alice",
+            messageId: "phase23-alice",
+            timestamp: baseTime.AddMinutes(-1997));
+
+        await logs.AppendAsync(alphaUnique).ConfigureAwait(true);
+        await logs.AppendAsync(betaUnique).ConfigureAwait(true);
+        await logs.AppendAsync(historicalEvent).ConfigureAwait(true);
+        await logs.AppendAsync(aliceHistory).ConfigureAwait(true);
+        await logs.FlushAsync().ConfigureAwait(true);
+
+        var current = await logs.SearchDetailedAsync(new ConversationLogQuery
+        {
+            Scope = ConversationLogSearchScope.CurrentConversation,
+            HistoryScopeId = alphaScope,
+            NetworkId = alpha.Id,
+            ConversationKind = LogConversationKind.Channel,
+            ConversationName = "#alpha",
+            ConversationKey = alphaKey,
+            Text = "kernel",
+            MaximumResults = 50
+        }).ConfigureAwait(true);
+        Require(current.Results.Count == 50 && current.Statistics.ResultsTruncated, "history-search did not bound common-term results");
+
+        var crossNetwork = await logs.SearchDetailedAsync(new ConversationLogQuery
+        {
+            Scope = ConversationLogSearchScope.AllHistory,
+            Text = "phase twenty three unique message",
+            MaximumResults = 10
+        }).ConfigureAwait(true);
+        Require(crossNetwork.Results.Count == 2
+            && crossNetwork.Results.Select(result => result.NetworkId).Distinct().Count() == 2, "history-search did not isolate same-text results by network");
+
+        var historicalQuery = (QueryView)sessions.OpenHistoricalConversation(alpha.Id, DestinationKind.Query, "Alicia", aliceKey);
+        var aliceSearch = await logs.SearchDetailedAsync(new ConversationLogQuery
+        {
+            Scope = ConversationLogSearchScope.AllHistory,
+            Text = "Alice account alice123",
+            Sender = "Alice",
+            MaximumResults = 10
+        }).ConfigureAwait(true);
+        var aliceResult = AssertSingle(aliceSearch.Results, "history-search Alice result");
+        var queryOpened = await viewModel.RouteLogSearchResultAsync(aliceResult).ConfigureAwait(true);
+        Require(queryOpened && ReferenceEquals(viewModel.ActiveView, historicalQuery) && historicalQuery.Nickname == "Alicia", "history-search did not preserve the durable query identity");
+
+        var target = crossNetwork.Results.Single(result => result.NetworkId == alpha.Id);
+        var channel = (ChannelView)sessions.OpenHistoricalConversation(alpha.Id, DestinationKind.Channel, "#alpha", alphaKey);
+        var trafficBeforeNavigation = demo.AlphaTransport.OutboundLines.Count;
+        var opened = await viewModel.RouteLogSearchResultAsync(target).ConfigureAwait(true);
+        Require(opened
+            && ReferenceEquals(viewModel.ActiveView, channel)
+            && channel.NavigationAnchor?.ServerMessageId == target.ServerMessageId
+            && channel.EntryCount is > 0 and <= 101,
+            "history-search did not navigate a trimmed transcript through the canonical anchor");
+        Require(demo.AlphaTransport.OutboundLines.Count == trafficBeforeNavigation, "history-search local result navigation issued IRC traffic");
+
+        var topicBefore = channel.Topic;
+        var eventSearch = await logs.SearchDetailedAsync(new ConversationLogQuery
+        {
+            Scope = ConversationLogSearchScope.CurrentConversation,
+            HistoryScopeId = alphaScope,
+            NetworkId = alpha.Id,
+            ConversationKind = LogConversationKind.Channel,
+            ConversationName = "#alpha",
+            ConversationKey = alphaKey,
+            Text = "phase twenty three unique event",
+            MaximumResults = 5
+        }).ConfigureAwait(true);
+        var eventResult = AssertSingle(eventSearch.Results, "history-search event result");
+        Require(eventResult.EventType == LogMessageKind.Topic, "history-search did not classify the historical event");
+        Require(await viewModel.RouteLogSearchResultAsync(eventResult).ConfigureAwait(true)
+            && channel.NavigationAnchor?.ServerMessageId == "phase23-topic"
+            && channel.Topic == topicBefore, "historical event navigation changed current channel state");
+
+        var messageJump = await viewModel.NavigateHistoryMessageAsync(
+            alpha.Id,
+            LogConversationKind.Channel,
+            "#alpha",
+            alphaKey,
+            "  phase23-alpha-unique  ").ConfigureAwait(true);
+        Require(messageJump.Outcome == HistoryNavigationOutcome.ExactLocalMatch
+            && demo.AlphaTransport.OutboundLines.Count == trafficBeforeNavigation, "history-search msgid jump did not remain local and exact");
+
+        var timestampJump = await viewModel.NavigateHistoryTimestampAsync(
+            alpha.Id,
+            LogConversationKind.Channel,
+            "#alpha",
+            alphaKey,
+            target.Timestamp).ConfigureAwait(true);
+        Require(timestampJump.IsExact, "history-search UTC timestamp jump did not resolve the exact anchor");
+
+        var latest = await sessions.ReturnToLatestAsync(alpha, channel).ConfigureAwait(true);
+        Require(latest.Outcome == HistoryNavigationOutcome.LocalEndReached && channel.IsFollowingLive, "history-search did not restore Return to Latest");
+        Console.WriteLine($"HISTORY_SEARCH_UI_TRACE common_results={current.Results.Count} common_truncated={current.Statistics.ResultsTruncated} cross_network_results={crossNetwork.Results.Count} trimmed_context={channel.EntryCount} local_irc_requests=0 durable_query_continuity=true historical_event_firewall=true return_to_latest=true");
+
+        static ConversationLogSearchResult AssertSingle(IReadOnlyList<ConversationLogSearchResult> results, string label) =>
+            results.Count == 1 ? results[0] : throw new InvalidOperationException($"{label} expected one result but received {results.Count}.");
+    }
+
+    private static void StaleSearchAsync()
+    {
+        var generations = new HistorySearchGeneration();
+        var first = generations.Begin();
+        var second = generations.Begin();
+        Require(!generations.IsCurrent(first) && generations.IsCurrent(second), "stale-search allowed an older completion to own the result surface");
+        generations.Invalidate();
+        Require(!generations.IsCurrent(second), "stale-search allowed a completion after surface invalidation");
+        Console.WriteLine("STALE_SEARCH_UI_TRACE first_completion_ignored=true second_completion_owned=true close_invalidation=true");
+    }
+
+    private static async Task IndexRecoveryAsync()
+    {
+        var root = Directory.CreateTempSubdirectory("nexirc-phase23-index-recovery-");
+        try
+        {
+            var network = Guid.NewGuid();
+            await using var logs = new JsonlConversationLogStore(root.FullName, maximumSegmentBytes: 64 * 1024 * 1024);
+            var scope = Guid.NewGuid();
+            var conversation = "#recovery";
+            var conversationKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, conversation);
+            for (var index = 0; index < 5_000; index++)
+            {
+                await logs.AppendAsync(new ConversationLogRecord
+                {
+                    Timestamp = DateTimeOffset.UnixEpoch.AddMinutes(index),
+                    NetworkId = network,
+                    ScopeId = scope,
+                    ProfileId = scope,
+                    ConversationKind = LogConversationKind.Channel,
+                    ConversationName = conversation,
+                    ConversationKey = conversationKey,
+                    Sender = "Recovery",
+                    MessageKind = LogMessageKind.Message,
+                    Direction = LogDirection.Incoming,
+                    Text = $"index recovery canonical marker {index:0000} {new string('x', 240)}",
+                    ServerMessageId = $"index-recovery-{index:0000}"
+                }).ConfigureAwait(true);
+            }
+
+            await logs.FlushAsync().ConfigureAwait(true);
+            var query = new ConversationLogQuery
+            {
+                Scope = ConversationLogSearchScope.CurrentConversation,
+                HistoryScopeId = scope,
+                NetworkId = network,
+                ConversationKind = LogConversationKind.Channel,
+                ConversationName = conversation,
+                ConversationKey = conversationKey,
+                Text = "index recovery canonical marker",
+                MaximumResults = 10
+            };
+            var baseline = await logs.SearchDetailedAsync(query).ConfigureAwait(true);
+            var sourceLengths = Directory.EnumerateFiles(logs.RootPath, "*.jsonl", SearchOption.AllDirectories)
+                .ToDictionary(path => path, path => new FileInfo(path).Length, StringComparer.OrdinalIgnoreCase);
+            var sidecars = Directory.EnumerateFiles(logs.RootPath, "*.hsidx", SearchOption.AllDirectories).ToArray();
+            foreach (var sidecar in sidecars)
+            {
+                File.Delete(sidecar);
+            }
+
+            await using var reopened = new JsonlConversationLogStore(logs.RootPath, maximumSegmentBytes: 64 * 1024 * 1024);
+            var recovered = await reopened.SearchDetailedAsync(query).ConfigureAwait(true);
+            var unchanged = sourceLengths.All(item => File.Exists(item.Key) && new FileInfo(item.Key).Length == item.Value);
+            Require(
+                baseline.Results.Count > 0 && recovered.Results.Count > 0 && recovered.Statistics.IndexFilesBuilt > 0 && unchanged,
+                $"index-recovery did not rebuild from unchanged canonical JSONL (baseline={baseline.Results.Count}, results={recovered.Results.Count}, built={recovered.Statistics.IndexFilesBuilt}, files={recovered.Statistics.FilesExamined}, skipped={recovered.Statistics.FilesSkipped}, unchanged={unchanged})");
+            Console.WriteLine($"INDEX_RECOVERY_UI_TRACE deleted_sidecars={sidecars.Length} rebuilt={recovered.Statistics.IndexFilesBuilt} canonical_sources_unchanged={unchanged}");
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(root.FullName, recursive: true);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
     }
 
     private static async Task HistoryDiscoveryAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)

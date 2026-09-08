@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Windows;
 using nexIRC.Application;
 using nexIRC.Core.State;
@@ -7,7 +6,9 @@ namespace nexIRC.Desktop;
 
 public sealed record LogResultListItem(ConversationLogSearchResult Result, string? NetworkDisplayName = null)
 {
-    public string DisplayText => $"{Result.Timestamp.ToLocalTime():g} · {NetworkDisplayName ?? Result.NetworkId.ToString("N")[..8]} · {Result.ConversationName} · {Result.Sender ?? "system"} · {Result.Preview}";
+    public string DisplayText => $"{Result.Timestamp.ToLocalTime():g} · {NetworkDisplayName ?? Result.NetworkId.ToString("N")[..8]} · {Result.ConversationName} · {Result.Sender ?? "system"} · {EventTypeText}{Result.Preview}";
+
+    private string EventTypeText => Result.MessageKind == LogMessageKind.Message ? string.Empty : $"[{Result.EventType}] · ";
 }
 
 public sealed record LogSearchScopeOption(ConversationLogSearchScope Scope, string DisplayName);
@@ -30,6 +31,7 @@ public partial class LogViewerWindow : Window
 
     private readonly MainWindowViewModel _viewModel;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
+    private readonly HistorySearchGeneration _searchGeneration = new();
     private CancellationTokenSource? _searchCancellation;
     private HistoryPageRequest? _historyRequest;
     private HistoryPage? _historyPage;
@@ -79,6 +81,7 @@ public partial class LogViewerWindow : Window
             return;
         }
 
+        var generation = _searchGeneration.Begin();
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
         var previous = Interlocked.Exchange(ref _searchCancellation, cancellation);
         previous?.Cancel();
@@ -87,7 +90,7 @@ public partial class LogViewerWindow : Window
         try
         {
             var page = await _viewModel.SearchLogsDetailedAsync(query, cancellation.Token);
-            if (!ReferenceEquals(_searchCancellation, cancellation))
+            if (!_searchGeneration.IsCurrent(generation) || !ReferenceEquals(_searchCancellation, cancellation))
             {
                 return;
             }
@@ -97,6 +100,12 @@ public partial class LogViewerWindow : Window
                 .ToArray();
             ResultsList.SelectedIndex = page.Results.Count > 0 ? 0 : -1;
             var statistics = page.Statistics;
+            if (statistics.ValidationError is { Length: > 0 } validationError)
+            {
+                StatusText.Text = $"Search not run: {validationError}";
+                return;
+            }
+
             var limited = statistics.ResultsTruncated ? " Result limit reached." : string.Empty;
             var fileLimit = statistics.FilesTruncated ? " File limit reached." : string.Empty;
             var index = statistics.IndexFilesUsed > 0
@@ -109,21 +118,22 @@ public partial class LogViewerWindow : Window
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
-            if (ReferenceEquals(_searchCancellation, cancellation))
+            if (_searchGeneration.IsCurrent(generation) && ReferenceEquals(_searchCancellation, cancellation))
             {
                 StatusText.Text = "Search cancelled.";
             }
         }
         catch (Exception exception)
         {
-            if (ReferenceEquals(_searchCancellation, cancellation))
+            if (_searchGeneration.IsCurrent(generation) && ReferenceEquals(_searchCancellation, cancellation))
             {
                 StatusText.Text = $"History search failed safely: {exception.Message}";
             }
         }
         finally
         {
-            if (ReferenceEquals(Interlocked.CompareExchange(ref _searchCancellation, null, cancellation), cancellation))
+            if (_searchGeneration.IsCurrent(generation)
+                && ReferenceEquals(Interlocked.CompareExchange(ref _searchCancellation, null, cancellation), cancellation))
             {
                 CancelSearchButton.IsEnabled = false;
             }
@@ -201,13 +211,62 @@ public partial class LogViewerWindow : Window
             return;
         }
 
-        if (!TryParseDate(JumpDateBox.Text, out var timestamp))
+        if (!HistorySearchInput.TryParseUtcDateTime(JumpDateBox.Text, out var timestamp, out var error))
         {
-            StatusText.Text = "Enter a valid local date and time.";
+            StatusText.Text = error;
             return;
         }
 
-        await LoadHistoryAsync(request with { Around = timestamp, Before = null, After = null, Oldest = false });
+        var network = (NetworkBox.SelectedItem as LogNetworkFilterOption)?.Network;
+        var kind = request.ConversationKind;
+        var name = request.ConversationName;
+        if (network is null || kind is LogConversationKind.Status || string.IsNullOrWhiteSpace(name))
+        {
+            StatusText.Text = "Choose one network and enter a channel or nickname first.";
+            return;
+        }
+
+        var result = await _viewModel.NavigateHistoryTimestampAsync(
+            network.Id,
+            kind,
+            name,
+            request.ConversationKey,
+            timestamp,
+            _lifetimeCancellation.Token);
+        StatusText.Text = result.Message;
+    }
+
+    private async void OnJumpMsgidClick(object sender, RoutedEventArgs e)
+    {
+        if (!TryCreateHistoryRequest(out var request))
+        {
+            StatusText.Text = "Choose one network and enter a channel or nickname first.";
+            return;
+        }
+
+        if (!HistorySearchInput.TryNormalizeServerMessageId(MsgidBox.Text, out var messageId, out var error))
+        {
+            StatusText.Text = error;
+            return;
+        }
+
+        var network = (NetworkBox.SelectedItem as LogNetworkFilterOption)?.Network;
+        var kind = request.ConversationKind;
+        var name = request.ConversationName;
+        if (network is null || kind is LogConversationKind.Status || string.IsNullOrWhiteSpace(name))
+        {
+            StatusText.Text = "Choose one network and enter a channel or nickname first.";
+            return;
+        }
+
+        var result = await _viewModel.NavigateHistoryMessageAsync(
+            network.Id,
+            kind,
+            name,
+            request.ConversationKey,
+            messageId,
+            _lifetimeCancellation.Token);
+        StatusText.Text = result.Message;
     }
 
     private async void OnOpenClick(object sender, RoutedEventArgs e)
@@ -312,7 +371,7 @@ public partial class LogViewerWindow : Window
 
         if (!TryParseOptionalDate(FromDateBox.Text, out var from) || !TryParseOptionalDate(ToDateBox.Text, out var to))
         {
-            StatusText.Text = "Enter valid local from/to dates or leave them blank.";
+            StatusText.Text = "Enter valid UTC from/to dates or leave them blank.";
             query = null!;
             return false;
         }
@@ -381,7 +440,7 @@ public partial class LogViewerWindow : Window
             return true;
         }
 
-        if (TryParseDate(value, out var parsed))
+        if (HistorySearchInput.TryParseUtcDateTime(value, out var parsed, out _))
         {
             timestamp = parsed;
             return true;
@@ -391,13 +450,11 @@ public partial class LogViewerWindow : Window
         return false;
     }
 
-    private static bool TryParseDate(string value, out DateTimeOffset timestamp) =>
-        DateTimeOffset.TryParse(value, CultureInfo.CurrentCulture, DateTimeStyles.AssumeLocal, out timestamp);
-
     protected override void OnClosed(EventArgs e)
     {
         _lifetimeCancellation.Cancel();
-        _searchCancellation?.Cancel();
+        _searchGeneration.Invalidate();
+        Interlocked.Exchange(ref _searchCancellation, null)?.Cancel();
         _lifetimeCancellation.Dispose();
         base.OnClosed(e);
     }

@@ -17,14 +17,16 @@
                 <Button x:Name="CancelSearchButton" Content="Cancel" Click="OnCancelSearchClick" Padding="14,4" Margin="0,0,8,8" IsEnabled="False" />
             </WrapPanel>
             <WrapPanel>
-                <TextBox x:Name="FromDateBox" Width="170" Margin="0,0,8,8" ToolTip="Optional from date/time" />
-                <TextBox x:Name="ToDateBox" Width="170" Margin="0,0,8,8" ToolTip="Optional to date/time" />
+                <TextBox x:Name="FromDateBox" Width="190" Margin="0,0,8,8" ToolTip="Optional UTC bound: yyyy-MM-ddTHH:mm:ssZ" />
+                <TextBox x:Name="ToDateBox" Width="190" Margin="0,0,8,8" ToolTip="Optional UTC bound: yyyy-MM-ddTHH:mm:ssZ" />
                 <Button Content="Newest" Click="OnNewestClick" Padding="14,4" Margin="0,0,8,8" />
                 <Button Content="Oldest" Click="OnOldestClick" Padding="14,4" Margin="0,0,8,8" />
                 <Button Content="Older" Click="OnOlderClick" Padding="14,4" Margin="0,0,8,8" />
                 <Button Content="Newer" Click="OnNewerClick" Padding="14,4" Margin="0,0,8,8" />
-                <TextBox x:Name="JumpDateBox" Width="170" Margin="0,0,8,8" ToolTip="Local date/time, for example 2026-08-30 14:30" />
-                <Button Content="Jump to date" Click="OnJumpDateClick" Padding="14,4" Margin="0,0,8,8" />
+                <TextBox x:Name="JumpDateBox" Width="190" Margin="0,0,8,8" ToolTip="UTC only: yyyy-MM-ddTHH:mm:ssZ, for example 2026-09-07T14:30:00Z" />
+                <Button Content="Go to UTC time" Click="OnJumpDateClick" Padding="14,4" Margin="0,0,8,8" AutomationProperties.AutomationId="GoToUtcTime" />
+                <TextBox x:Name="MsgidBox" Width="180" Margin="0,0,8,8" ToolTip="Opaque server message ID; surrounding whitespace is trimmed" />
+                <Button Content="Go to msgid" Click="OnJumpMsgidClick" Padding="14,4" Margin="0,0,8,8" AutomationProperties.AutomationId="GoToMsgid" />
                 <Button Content="Load history" Click="OnHistoryClick" Padding="14,4" Margin="0,0,8,8" />
             </WrapPanel>
             <TextBlock x:Name="StatusText" Foreground="#64748B" Margin="0,0,0,8" />
