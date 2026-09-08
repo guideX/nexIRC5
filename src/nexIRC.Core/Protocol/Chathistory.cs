@@ -155,6 +155,13 @@ public sealed record ChathistoryRequest
 
     public ChathistoryRequestPurpose Purpose { get; init; } = ChathistoryRequestPurpose.LoadOlder;
 
+    /// <summary>
+    /// Immutable application ownership for a bounded repair. It is never
+    /// serialized onto IRC; it lets the response validator bind playback to
+    /// the exact gap that created the request.
+    /// </summary>
+    public string? GapKey { get; init; }
+
     public bool IsDiscovery => Operation == ChathistoryOperation.Targets;
 
     public static ChathistoryRequest ForTargets(

@@ -3459,6 +3459,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     {
         entry.LastDisconnectAt = DateTimeOffset.UtcNow;
         entry.GapLedger.BeginReconnect();
+        entry.ReconnectSourceSession = entry.Session;
         foreach (var view in entry.Workspace.Views)
         {
             if (view is not ChannelView channel && view is not QueryView)
@@ -3559,9 +3560,20 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         if (view is null || conversation is null || target is null
-            || !entry.ReconnectBoundaries.ContainsKey(conversation)
+            || !entry.ReconnectBoundaries.TryGetValue(conversation, out var reconnectBoundary)
             || !entry.ReconnectBoundarySignals.TryGetValue(conversation, out var signal))
         {
+            return;
+        }
+
+        if (ReferenceEquals(entry.ReconnectSourceSession, session)
+            && snapshot.ConnectionGeneration <= reconnectBoundary.ConnectionGeneration)
+        {
+            // A projection callback from the old session can still be inside
+            // the serialized dispatcher when reconnect captures its boundary.
+            // Equal generations are possible when a replacement ServerSession
+            // starts at one again, so the session instance is part of the
+            // ownership fence rather than relying on generation alone.
             return;
         }
 
@@ -3686,7 +3698,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             gap.Target,
             gap.Older.Reference,
             gap.Newer.Reference,
-            Math.Min(session.MaximumChathistoryRequestSize, 50));
+            Math.Min(session.MaximumChathistoryRequestSize, 50)) with
+        {
+            GapKey = gap.Key
+        };
         ChathistoryResult result;
         try
         {
@@ -5056,6 +5071,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         public int HistoryPaginationCoalesced { get; set; }
 
         public DateTimeOffset? LastDisconnectAt { get; set; }
+
+        public ServerSession? ReconnectSourceSession { get; set; }
     }
 
     private sealed record ReconnectHistoryBoundary(

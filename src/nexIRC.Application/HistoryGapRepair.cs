@@ -219,6 +219,7 @@ public static class HistoryGapPolicy
             || result.Request.Operation != ChathistoryOperation.Between
             || !string.Equals(result.Request.Conversation, gap.Conversation, StringComparison.Ordinal)
             || !string.Equals(result.Request.Target, gap.Target, StringComparison.Ordinal)
+            || result.Request.GapKey is { Length: > 0 } requestGapKey && !string.Equals(requestGapKey, gap.Key, StringComparison.Ordinal)
             || result.BatchTarget is { Length: > 0 } batchTarget && !string.Equals(batchTarget, gap.Target, StringComparison.Ordinal)
             || !string.Equals(result.Request.Reference.SerializeWire(), gap.Older.Reference.SerializeWire(), StringComparison.Ordinal)
             || result.Request.SecondaryReference is not { } secondary

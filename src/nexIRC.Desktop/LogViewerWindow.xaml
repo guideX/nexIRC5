@@ -2,43 +2,52 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="IRC History and Search" Width="900" Height="620"
-        MinWidth="700" MinHeight="480" WindowStartupLocation="CenterOwner">
-    <DockPanel Margin="16">
+        MinWidth="700" MinHeight="480" WindowStartupLocation="CenterOwner"
+        AutomationProperties.AutomationId="HistorySearchWindow"
+        AutomationProperties.Name="IRC history and search"
+        PreviewKeyDown="OnWindowPreviewKeyDown">
+    <DockPanel Margin="16" KeyboardNavigation.TabNavigation="Continue">
         <StackPanel DockPanel.Dock="Top">
             <WrapPanel>
-                <TextBox x:Name="QueryBox" Width="250" Margin="0,0,8,8" ToolTip="Text to search" />
-                <ComboBox x:Name="ScopeBox" Width="170" Margin="0,0,8,8" DisplayMemberPath="DisplayName" ToolTip="Search scope" />
-                <ComboBox x:Name="NetworkBox" Width="180" Margin="0,0,8,8" DisplayMemberPath="DisplayName" ToolTip="Optional network filter" />
-                <TextBox x:Name="ConversationBox" Width="180" Margin="0,0,8,8" ToolTip="Optional channel or nickname" />
-                <ComboBox x:Name="ConversationKindBox" Width="145" Margin="0,0,8,8" DisplayMemberPath="DisplayName" ToolTip="Optional conversation kind" />
-                <TextBox x:Name="SenderBox" Width="130" Margin="0,0,8,8" ToolTip="Optional sender/nick" />
-                <ComboBox x:Name="MessageKindBox" Width="125" Margin="0,0,8,8" DisplayMemberPath="DisplayName" ToolTip="Optional event kind" />
-                <Button Content="Search" Click="OnSearchClick" Padding="14,4" Margin="0,0,8,8" />
-                <Button x:Name="CancelSearchButton" Content="Cancel" Click="OnCancelSearchClick" Padding="14,4" Margin="0,0,8,8" IsEnabled="False" />
+                <TextBox x:Name="QueryBox" Width="250" Margin="0,0,8,8" ToolTip="Text to search" TabIndex="0" AutomationProperties.AutomationId="HistorySearch.Query" AutomationProperties.Name="Search text" KeyDown="OnQueryBoxKeyDown" />
+                <ComboBox x:Name="ScopeBox" Width="170" Margin="0,0,8,8" DisplayMemberPath="DisplayName" ToolTip="Search scope" TabIndex="1" AutomationProperties.AutomationId="HistorySearch.Scope" AutomationProperties.Name="Search scope" />
+                <ComboBox x:Name="NetworkBox" Width="180" Margin="0,0,8,8" DisplayMemberPath="DisplayName" ToolTip="Optional network filter" TabIndex="2" AutomationProperties.AutomationId="HistorySearch.Network" AutomationProperties.Name="Network filter" />
+                <TextBox x:Name="ConversationBox" Width="180" Margin="0,0,8,8" ToolTip="Optional channel or nickname" TabIndex="3" AutomationProperties.AutomationId="HistorySearch.Conversation" AutomationProperties.Name="Conversation" />
+                <ComboBox x:Name="ConversationKindBox" Width="145" Margin="0,0,8,8" DisplayMemberPath="DisplayName" ToolTip="Optional conversation kind" TabIndex="4" AutomationProperties.AutomationId="HistorySearch.ConversationKind" AutomationProperties.Name="Conversation kind" />
+                <TextBox x:Name="SenderBox" Width="130" Margin="0,0,8,8" ToolTip="Optional sender/nick" TabIndex="5" AutomationProperties.AutomationId="HistorySearch.Sender" AutomationProperties.Name="Sender filter" />
+                <ComboBox x:Name="MessageKindBox" Width="125" Margin="0,0,8,8" DisplayMemberPath="DisplayName" ToolTip="Optional event kind" TabIndex="6" AutomationProperties.AutomationId="HistorySearch.MessageKind" AutomationProperties.Name="Message kind" />
+                <Button Content="Search" Click="OnSearchClick" Padding="14,4" Margin="0,0,8,8" TabIndex="7" AutomationProperties.AutomationId="HistorySearch.Execute" AutomationProperties.Name="Search history" />
+                <Button x:Name="CancelSearchButton" Content="Cancel" Click="OnCancelSearchClick" Padding="14,4" Margin="0,0,8,8" IsEnabled="False" TabIndex="8" AutomationProperties.AutomationId="HistorySearch.Cancel" AutomationProperties.Name="Cancel search" />
             </WrapPanel>
             <WrapPanel>
-                <TextBox x:Name="FromDateBox" Width="190" Margin="0,0,8,8" ToolTip="Optional UTC bound: yyyy-MM-ddTHH:mm:ssZ" />
-                <TextBox x:Name="ToDateBox" Width="190" Margin="0,0,8,8" ToolTip="Optional UTC bound: yyyy-MM-ddTHH:mm:ssZ" />
-                <Button Content="Newest" Click="OnNewestClick" Padding="14,4" Margin="0,0,8,8" />
-                <Button Content="Oldest" Click="OnOldestClick" Padding="14,4" Margin="0,0,8,8" />
-                <Button Content="Older" Click="OnOlderClick" Padding="14,4" Margin="0,0,8,8" />
-                <Button Content="Newer" Click="OnNewerClick" Padding="14,4" Margin="0,0,8,8" />
-                <TextBox x:Name="JumpDateBox" Width="190" Margin="0,0,8,8" ToolTip="UTC only: yyyy-MM-ddTHH:mm:ssZ, for example 2026-09-07T14:30:00Z" />
-                <Button Content="Go to UTC time" Click="OnJumpDateClick" Padding="14,4" Margin="0,0,8,8" AutomationProperties.AutomationId="GoToUtcTime" />
-                <TextBox x:Name="MsgidBox" Width="180" Margin="0,0,8,8" ToolTip="Opaque server message ID; surrounding whitespace is trimmed" />
-                <Button Content="Go to msgid" Click="OnJumpMsgidClick" Padding="14,4" Margin="0,0,8,8" AutomationProperties.AutomationId="GoToMsgid" />
-                <Button Content="Load history" Click="OnHistoryClick" Padding="14,4" Margin="0,0,8,8" />
+                <TextBox x:Name="FromDateBox" Width="190" Margin="0,0,8,8" ToolTip="Optional UTC bound: yyyy-MM-ddTHH:mm:ssZ" TabIndex="9" AutomationProperties.AutomationId="HistorySearch.FromUtc" AutomationProperties.Name="From UTC time" />
+                <TextBox x:Name="ToDateBox" Width="190" Margin="0,0,8,8" ToolTip="Optional UTC bound: yyyy-MM-ddTHH:mm:ssZ" TabIndex="10" AutomationProperties.AutomationId="HistorySearch.ToUtc" AutomationProperties.Name="To UTC time" />
+                <Button Content="Newest" Click="OnNewestClick" Padding="14,4" Margin="0,0,8,8" TabIndex="11" AutomationProperties.AutomationId="HistorySearch.Newest" AutomationProperties.Name="Load newest history" />
+                <Button Content="Oldest" Click="OnOldestClick" Padding="14,4" Margin="0,0,8,8" TabIndex="12" AutomationProperties.AutomationId="HistorySearch.Oldest" AutomationProperties.Name="Load oldest history" />
+                <Button Content="Older" Click="OnOlderClick" Padding="14,4" Margin="0,0,8,8" TabIndex="13" AutomationProperties.AutomationId="HistorySearch.Older" AutomationProperties.Name="Load older history" />
+                <Button Content="Newer" Click="OnNewerClick" Padding="14,4" Margin="0,0,8,8" TabIndex="14" AutomationProperties.AutomationId="HistorySearch.Newer" AutomationProperties.Name="Load newer history" />
+                <TextBox x:Name="JumpDateBox" Width="190" Margin="0,0,8,8" ToolTip="UTC only: yyyy-MM-ddTHH:mm:ssZ, for example 2026-09-07T14:30:00Z" TabIndex="15" AutomationProperties.AutomationId="HistorySearch.JumpUtcInput" AutomationProperties.Name="UTC time to find" />
+                <Button x:Name="GoToUtcTimeButton" Content="Go to UTC time" Click="OnJumpDateClick" Padding="14,4" Margin="0,0,8,8" TabIndex="16" AutomationProperties.AutomationId="GoToUtcTime" AutomationProperties.Name="Go to UTC time" />
+                <TextBox x:Name="MsgidBox" Width="180" Margin="0,0,8,8" ToolTip="Opaque server message ID; surrounding whitespace is trimmed" TabIndex="17" AutomationProperties.AutomationId="HistorySearch.MsgidInput" AutomationProperties.Name="Server message ID to find" />
+                <Button x:Name="GoToMsgidButton" Content="Go to msgid" Click="OnJumpMsgidClick" Padding="14,4" Margin="0,0,8,8" TabIndex="18" AutomationProperties.AutomationId="GoToMsgid" AutomationProperties.Name="Go to server message ID" />
+                <Button Content="Load history" Click="OnHistoryClick" Padding="14,4" Margin="0,0,8,8" TabIndex="19" AutomationProperties.AutomationId="HistorySearch.Load" AutomationProperties.Name="Load history" />
             </WrapPanel>
-            <TextBlock x:Name="StatusText" Foreground="#64748B" Margin="0,0,0,8" />
+            <TextBlock x:Name="StatusText" Foreground="#64748B" Margin="0,0,0,8" AutomationProperties.AutomationId="HistorySearch.Status" AutomationProperties.Name="History search status" />
         </StackPanel>
         <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
-            <Button Content="Previous result" Click="OnPreviousResultClick" Padding="14,6" Margin="0,0,8,0" />
-            <Button Content="Next result" Click="OnNextResultClick" Padding="14,6" Margin="0,0,8,0" />
-            <Button Content="Open selected conversation" Click="OnOpenClick" Padding="14,6" Margin="0,0,8,0" />
-            <Button Content="Export…" Click="OnExportClick" Padding="14,6" Margin="0,0,8,0" />
-            <Button Content="Copy selected" Click="OnCopyClick" Padding="14,6" Margin="0,0,8,0" />
-            <Button Content="Close" IsCancel="True" Padding="14,6" />
+            <Button Content="Previous result" Click="OnPreviousResultClick" Padding="14,6" Margin="0,0,8,0" TabIndex="21" AutomationProperties.AutomationId="HistorySearch.Previous" AutomationProperties.Name="Previous result" />
+            <Button Content="Next result" Click="OnNextResultClick" Padding="14,6" Margin="0,0,8,0" TabIndex="22" AutomationProperties.AutomationId="HistorySearch.Next" AutomationProperties.Name="Next result" />
+            <Button Content="Open selected conversation" Click="OnOpenClick" Padding="14,6" Margin="0,0,8,0" TabIndex="23" AutomationProperties.AutomationId="HistorySearch.Open" AutomationProperties.Name="Open selected conversation" />
+            <Button Content="Export…" Click="OnExportClick" Padding="14,6" Margin="0,0,8,0" TabIndex="24" AutomationProperties.AutomationId="HistorySearch.Export" AutomationProperties.Name="Export history" />
+            <Button Content="Copy selected" Click="OnCopyClick" Padding="14,6" Margin="0,0,8,0" TabIndex="25" AutomationProperties.AutomationId="HistorySearch.Copy" AutomationProperties.Name="Copy selected result" />
+            <Button Content="Close" IsCancel="True" Padding="14,6" TabIndex="26" AutomationProperties.AutomationId="HistorySearch.Close" AutomationProperties.Name="Close history search" />
         </StackPanel>
-        <ListBox x:Name="ResultsList" DisplayMemberPath="DisplayText" />
+        <ListBox x:Name="ResultsList" DisplayMemberPath="DisplayText" TabIndex="20" AutomationProperties.AutomationId="HistorySearch.Results" AutomationProperties.Name="History search results" KeyDown="OnResultsListKeyDown">
+            <ListBox.ItemContainerStyle>
+                <Style TargetType="ListBoxItem">
+                    <Setter Property="AutomationProperties.Name" Value="{Binding DisplayText}" />
+                </Style>
+            </ListBox.ItemContainerStyle>
+        </ListBox>
     </DockPanel>
 </Window>

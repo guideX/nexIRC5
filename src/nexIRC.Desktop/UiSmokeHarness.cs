@@ -36,7 +36,10 @@ internal static class UiSmokeHarness
         "history-search",
         "stale-search",
         "index-recovery",
+        "index-fingerprint",
+        "accessibility",
         "history-gap-repair",
+        "history-integrity",
         "history-discovery",
         "history-identity",
         "contextual-actions",
@@ -132,8 +135,17 @@ internal static class UiSmokeHarness
             case "index-recovery":
                 await IndexRecoveryAsync().ConfigureAwait(true);
                 break;
+            case "index-fingerprint":
+                await IndexFingerprintAsync().ConfigureAwait(true);
+                break;
+            case "accessibility":
+                await AccessibilityAsync(window, state.Alpha).ConfigureAwait(true);
+                break;
             case "history-gap-repair":
                 await HistoryGapRepairAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "history-integrity":
+                await HistoryIntegrityAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
             case "history-discovery":
                 await HistoryDiscoveryAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -628,6 +640,89 @@ internal static class UiSmokeHarness
         Console.WriteLine($"HISTORY_GAP_REPAIR_UI_TRACE state=repaired between_requests=1 chronology=A,B,C,D,E,F unread_unchanged=true");
     }
 
+    private static async Task HistoryIntegrityAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var viewModel = window.ViewModel;
+        var sessions = viewModel.Sessions;
+        var logs = sessions.LogStore ?? throw new InvalidOperationException("The history-integrity smoke requires the durable log store.");
+        var query = sessions.EnsureQuery(network.Id, "Alice");
+        var aliceKey = query.HistoryConversationKey;
+        viewModel.SelectView(network.StatusView);
+
+        demo.AlphaTransport.EnqueueInboundLine("@account=alice123;msgid=integrity-b;time=2026-09-07T12:01:00.000Z :Alice!u@alpha PRIVMSG nexAlpha :B");
+        await WaitForAsync(sessions, () => query.IdentityEvidence.HasAccount("alice123") && query.EntriesSnapshot.Any(entry => entry.ServerMessageId == "integrity-b"), "account-backed pre-disconnect query evidence did not arrive").ConfigureAwait(true);
+        await logs.FlushAsync().ConfigureAwait(true);
+        var beforeSearch = await logs.SearchDetailedAsync(new ConversationLogQuery
+        {
+            Scope = ConversationLogSearchScope.CurrentConversation,
+            HistoryScopeId = network.ProfileId ?? network.Id,
+            NetworkId = network.Id,
+            ConversationKind = LogConversationKind.PrivateConversation,
+            ConversationName = "Alice",
+            ConversationKey = aliceKey,
+            Text = "B",
+            MaximumResults = 10
+        }).ConfigureAwait(true);
+        Require(beforeSearch.Results.Count == 1, "history-integrity could not search the pre-disconnect durable query");
+
+        var replacement = demo.AddAlphaReconnectTransport();
+        demo.AlphaTransport.EnqueueRemoteDisconnect();
+        await WaitForAsync(sessions, () => replacement.ConnectCount == 1, "history-integrity reconnect did not establish a replacement session").ConfigureAwait(true);
+        demo.EnqueuePhase1YRegistration(replacement);
+        replacement.EnqueueInboundLine("@account=alice123;msgid=integrity-f;time=2026-09-07T12:05:00.000Z :Alicia!u@alpha PRIVMSG nexAlpha :F");
+        await WaitForPollingAsync(() => replacement.OutboundLines.Any(line => line.StartsWith("CHATHISTORY BETWEEN Alicia msgid=integrity-b msgid=integrity-f ", StringComparison.Ordinal)), "history-integrity did not bind the safe current Alicia target to the durable Alice query").ConfigureAwait(true);
+        replacement.EnqueueInboundLine("@draft/chathistory-end :alpha.server BATCH +integrity-gap chathistory Alicia");
+        replacement.EnqueueInboundLine("@batch=integrity-gap;msgid=integrity-c;time=2026-09-07T12:03:00.000Z :Alicia!u@alpha PRIVMSG nexAlpha :C");
+        replacement.EnqueueInboundLine("@batch=integrity-gap;msgid=integrity-d;time=2026-09-07T12:03:30.000Z :Alicia!u@alpha PRIVMSG nexAlpha :D");
+        replacement.EnqueueInboundLine("@batch=integrity-gap;msgid=integrity-e;time=2026-09-07T12:04:00.000Z :Alicia!u@alpha PRIVMSG nexAlpha :E");
+        replacement.EnqueueInboundLine("@batch=integrity-gap;msgid=integrity-b;time=2026-09-07T12:01:00.000Z :Alice!u@alpha PRIVMSG nexAlpha :B");
+        replacement.EnqueueInboundLine(":alpha.server BATCH -integrity-gap");
+
+        await WaitForAsync(sessions, () => query.Nickname == "Alicia"
+            && query.EntriesSnapshot.Where(entry => entry.ServerMessageId is not null).Select(entry => entry.Text).SequenceEqual(["B", "C", "D", "E", "F"]), "history-integrity did not converge the account-backed exact gap once").ConfigureAwait(true);
+        await WaitForPollingAsync(() => sessions.GetHistoryGaps(network.Id).SingleOrDefault()?.State == HistoryGapRepairState.Repaired, "history-integrity exact gap was not marked repaired").ConfigureAwait(true);
+        Require(query.HistoryConversationKey == aliceKey && sessions.GetHistoryGaps(network.Id).Count == 1, "history-integrity changed durable ownership or created duplicate gap state");
+
+        await logs.FlushAsync().ConfigureAwait(true);
+        var trafficBeforeNavigation = replacement.OutboundLines.Count;
+        var dSearch = await logs.SearchDetailedAsync(new ConversationLogQuery
+        {
+            Scope = ConversationLogSearchScope.CurrentConversation,
+            HistoryScopeId = network.ProfileId ?? network.Id,
+            NetworkId = network.Id,
+            ConversationKind = LogConversationKind.PrivateConversation,
+            ConversationName = "Alicia",
+            ConversationKey = aliceKey,
+            Text = "D",
+            MaximumResults = 10
+        }).ConfigureAwait(true);
+        var dResult = dSearch.Results.SingleOrDefault() ?? throw new InvalidOperationException("history-integrity search did not find repaired D");
+        Require(await viewModel.RouteLogSearchResultAsync(dResult).ConfigureAwait(true)
+            && ReferenceEquals(viewModel.ActiveView, query)
+            && query.NavigationAnchor?.Text == "D"
+            && query.EntriesSnapshot.Any(entry => entry.Text == "D")
+            && replacement.OutboundLines.Count == trafficBeforeNavigation,
+            "history-integrity search-to-navigation did not remain on the durable query or local path");
+
+        var betweenCount = replacement.OutboundLines.Count(line => line.StartsWith("CHATHISTORY BETWEEN", StringComparison.Ordinal));
+        replacement.EnqueueInboundLine("@account=other;msgid=integrity-conflict;time=2026-09-07T12:06:00.000Z :Alice!u@alpha PRIVMSG nexAlpha :conflicting Alice");
+        await WaitForAsync(sessions, () => network.Queries.Count == 2, "history-integrity did not isolate the conflicting current Alice").ConfigureAwait(true);
+        Require(!query.EntriesSnapshot.Any(entry => entry.Text == "conflicting Alice")
+            && replacement.OutboundLines.Count(line => line.StartsWith("CHATHISTORY BETWEEN", StringComparison.Ordinal)) == betweenCount,
+            "history-integrity let a conflicting account contaminate the repaired query");
+
+        await logs.FlushAsync().ConfigureAwait(true);
+        var oldSearch = await logs.SearchAsync(new ConversationLogQuery { Text = "B", NetworkId = network.Id, ConversationKey = aliceKey });
+        var oldResult = oldSearch.Single(result => result.ServerMessageId == "integrity-b");
+        Require(await viewModel.RouteLogSearchResultAsync(oldResult).ConfigureAwait(true)
+            && ReferenceEquals(viewModel.ActiveView, query)
+            && query.Nickname == "Alicia", "history-integrity historical Alice result did not reopen Alicia continuity");
+
+        var latest = await sessions.ReturnToLatestAsync(network, query).ConfigureAwait(true);
+        Require(latest.Outcome == HistoryNavigationOutcome.LocalEndReached && query.IsFollowingLive, "history-integrity Return to Latest did not restore live follow state");
+        Console.WriteLine($"HISTORY_INTEGRITY_UI_TRACE durable_key={aliceKey} chronology=B,C,D,E,F between_requests={betweenCount} search_d_local=true navigation_same_query=true conflicting_account_isolated=true return_to_latest=true irc_after_repair={(replacement.OutboundLines.Count - trafficBeforeNavigation)}");
+    }
+
     private static async Task HistorySearchAsync(
         MainWindow window,
         DemoScenario demo,
@@ -889,6 +984,190 @@ internal static class UiSmokeHarness
                 baseline.Results.Count > 0 && recovered.Results.Count > 0 && recovered.Statistics.IndexFilesBuilt > 0 && unchanged,
                 $"index-recovery did not rebuild from unchanged canonical JSONL (baseline={baseline.Results.Count}, results={recovered.Results.Count}, built={recovered.Statistics.IndexFilesBuilt}, files={recovered.Statistics.FilesExamined}, skipped={recovered.Statistics.FilesSkipped}, unchanged={unchanged})");
             Console.WriteLine($"INDEX_RECOVERY_UI_TRACE deleted_sidecars={sidecars.Length} rebuilt={recovered.Statistics.IndexFilesBuilt} canonical_sources_unchanged={unchanged}");
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(root.FullName, recursive: true);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
+    }
+
+    private static async Task AccessibilityAsync(MainWindow owner, NetworkWorkspace network)
+    {
+        var historyWindow = new LogViewerWindow(owner.ViewModel, RequiredChannel(network)) { Owner = owner };
+        try
+        {
+            historyWindow.Show();
+            historyWindow.UpdateLayout();
+
+            var query = (System.Windows.Controls.TextBox)historyWindow.FindName("QueryBox")!;
+            var scope = (System.Windows.Controls.ComboBox)historyWindow.FindName("ScopeBox")!;
+            var networkBox = (System.Windows.Controls.ComboBox)historyWindow.FindName("NetworkBox")!;
+            var conversation = (System.Windows.Controls.TextBox)historyWindow.FindName("ConversationBox")!;
+            var from = (System.Windows.Controls.TextBox)historyWindow.FindName("FromDateBox")!;
+            var to = (System.Windows.Controls.TextBox)historyWindow.FindName("ToDateBox")!;
+            var jumpDate = (System.Windows.Controls.TextBox)historyWindow.FindName("JumpDateBox")!;
+            var msgid = (System.Windows.Controls.TextBox)historyWindow.FindName("MsgidBox")!;
+            var results = (System.Windows.Controls.ListBox)historyWindow.FindName("ResultsList")!;
+            var goToMsgid = (System.Windows.Controls.Button)historyWindow.FindName("GoToMsgidButton")!;
+
+            Require(System.Windows.Automation.AutomationProperties.GetAutomationId(historyWindow) == "HistorySearchWindow"
+                && System.Windows.Automation.AutomationProperties.GetName(historyWindow) == "IRC history and search",
+                "history search window accessibility identity is incomplete");
+            Require(
+                new (System.Windows.FrameworkElement Element, string Id)[]
+                {
+                    (query, "HistorySearch.Query"),
+                    (scope, "HistorySearch.Scope"),
+                    (networkBox, "HistorySearch.Network"),
+                    (conversation, "HistorySearch.Conversation"),
+                    (from, "HistorySearch.FromUtc"),
+                    (to, "HistorySearch.ToUtc"),
+                    (jumpDate, "HistorySearch.JumpUtcInput"),
+                    (msgid, "HistorySearch.MsgidInput"),
+                    (results, "HistorySearch.Results")
+                }.All(item => System.Windows.Automation.AutomationProperties.GetAutomationId(item.Element) == item.Id),
+                "history search controls are missing stable accessibility identities");
+            Require(
+                new System.Windows.FrameworkElement[] { query, scope, networkBox, conversation, from, to, jumpDate, msgid, results }
+                    .Select(element => System.Windows.Input.KeyboardNavigation.GetTabIndex(element))
+                    .SequenceEqual(new[] { 0, 1, 2, 3, 9, 10, 15, 17, 20 }),
+                "history search keyboard tab order is not deterministic");
+
+            var record = new ConversationLogRecord
+            {
+                Timestamp = DateTimeOffset.UnixEpoch,
+                NetworkId = network.Id,
+                ScopeId = network.ProfileId ?? network.Id,
+                ProfileId = network.ProfileId,
+                ConversationKind = LogConversationKind.Channel,
+                ConversationName = RequiredChannel(network).Channel,
+                ConversationKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, RequiredChannel(network).Channel),
+                Text = "accessibility result"
+            };
+            var resultItem = new LogResultListItem(new ConversationLogSearchResult(record, record.Text), network.DisplayName);
+            results.ItemsSource = new[] { resultItem };
+            historyWindow.UpdateLayout();
+            var container = (System.Windows.Controls.ListBoxItem)results.ItemContainerGenerator.ContainerFromIndex(0)!;
+            Require(System.Windows.Automation.AutomationProperties.GetName(container) == resultItem.DisplayText, "history search result item is not exposed as a named list item");
+
+            msgid.Text = " ";
+            goToMsgid.RaiseEvent(new RoutedEventArgs(System.Windows.Controls.Button.ClickEvent));
+            await owner.ViewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+            Require(ReferenceEquals(System.Windows.Input.Keyboard.FocusedElement, msgid), "invalid msgid input did not return focus to the editable field");
+            Console.WriteLine("ACCESSIBILITY_UI_TRACE automation_ids=true tab_order=true result_item_named=true invalid_msgid_focus=true deterministic_wpf_properties=true");
+        }
+        finally
+        {
+            historyWindow.Close();
+        }
+    }
+
+    private static async Task IndexFingerprintAsync()
+    {
+        var root = Directory.CreateTempSubdirectory("nexirc-phase24-index-fingerprint-");
+        try
+        {
+            var network = Guid.NewGuid();
+            var scope = Guid.NewGuid();
+            const string conversation = "#fingerprint";
+            const string oldMarker = "phase24-old-anchor";
+            const string newMarker = "phase24-new-anchor";
+            var conversationKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, conversation);
+            long coldBuildMilliseconds;
+            await using (var logs = new JsonlConversationLogStore(root.FullName, maximumSegmentBytes: 64 * 1024 * 1024))
+            {
+                for (var index = 0; index < 50_000; index++)
+                {
+                    await logs.AppendAsync(new ConversationLogRecord
+                    {
+                        Timestamp = DateTimeOffset.UnixEpoch.AddMinutes(index),
+                        NetworkId = network,
+                        ScopeId = scope,
+                        ProfileId = scope,
+                        ConversationKind = LogConversationKind.Channel,
+                        ConversationName = conversation,
+                        ConversationKey = conversationKey,
+                        Sender = "Fingerprint",
+                        MessageKind = LogMessageKind.Message,
+                        Direction = LogDirection.Incoming,
+                        Text = index == 49_123 ? oldMarker : $"fingerprint fixture row {index:00000}",
+                        ServerMessageId = $"fingerprint-{index:00000}"
+                    }).ConfigureAwait(true);
+                }
+
+                await logs.FlushAsync().ConfigureAwait(true);
+                var baselineWatch = Stopwatch.StartNew();
+                var baseline = await logs.SearchDetailedAsync(new ConversationLogQuery
+                {
+                    Scope = ConversationLogSearchScope.CurrentConversation,
+                    HistoryScopeId = scope,
+                    NetworkId = network,
+                    ConversationKind = LogConversationKind.Channel,
+                    ConversationName = conversation,
+                    ConversationKey = conversationKey,
+                    Text = oldMarker,
+                    MaximumResults = 10
+                }).ConfigureAwait(true);
+                baselineWatch.Stop();
+                coldBuildMilliseconds = baselineWatch.ElapsedMilliseconds;
+                Require(baseline.Results.Count == 1 && baseline.Statistics.IndexFilesBuilt > 0, "index-fingerprint could not build its baseline sidecar");
+            }
+
+            var source = Directory.EnumerateFiles(root.FullName, "*.jsonl", SearchOption.AllDirectories).Single();
+            var sourceLength = new FileInfo(source).Length;
+            var sourceMtime = File.GetLastWriteTimeUtc(source);
+            var replacement = (await File.ReadAllTextAsync(source).ConfigureAwait(true)).Replace(oldMarker, newMarker, StringComparison.Ordinal);
+            Require(oldMarker.Length == newMarker.Length
+                && !replacement.Contains(oldMarker, StringComparison.Ordinal)
+                && replacement.Contains(newMarker, StringComparison.Ordinal),
+                "index-fingerprint replacement changed fixture shape unexpectedly");
+            await File.WriteAllTextAsync(source, replacement).ConfigureAwait(true);
+            File.SetLastWriteTimeUtc(source, sourceMtime);
+
+            await using var reopened = new JsonlConversationLogStore(root.FullName, maximumSegmentBytes: 64 * 1024 * 1024);
+            var oldWatch = Stopwatch.StartNew();
+            var oldResults = await reopened.SearchDetailedAsync(new ConversationLogQuery
+            {
+                Scope = ConversationLogSearchScope.CurrentConversation,
+                HistoryScopeId = scope,
+                NetworkId = network,
+                ConversationKind = LogConversationKind.Channel,
+                ConversationName = conversation,
+                ConversationKey = conversationKey,
+                Text = oldMarker,
+                MaximumResults = 10
+            }).ConfigureAwait(true);
+            oldWatch.Stop();
+            var newWatch = Stopwatch.StartNew();
+            var newResults = await reopened.SearchDetailedAsync(new ConversationLogQuery
+            {
+                Scope = ConversationLogSearchScope.CurrentConversation,
+                HistoryScopeId = scope,
+                NetworkId = network,
+                ConversationKind = LogConversationKind.Channel,
+                ConversationName = conversation,
+                ConversationKey = conversationKey,
+                Text = newMarker,
+                MaximumResults = 10
+            }).ConfigureAwait(true);
+            newWatch.Stop();
+            Require(oldResults.Results.Count == 0
+                && oldResults.Statistics.IndexFilesBuilt > 0
+                && newResults.Results.Count == 1
+                && newResults.Results[0].Preview.Contains(newMarker, StringComparison.Ordinal)
+                && newResults.Statistics.IndexFilesUsed > 0
+                && new FileInfo(source).Length == sourceLength,
+                "index-fingerprint accepted stale canonical offsets or changed the JSONL source");
+            Console.WriteLine($"INDEX_FINGERPRINT_UI_TRACE rows=50000 cold_build_ms={coldBuildMilliseconds} replacement_rebuild_ms={oldWatch.ElapsedMilliseconds} warm_new_ms={newWatch.ElapsedMilliseconds} old_results=0 new_results=1 preserved_mtime=true canonical_length_unchanged=true");
         }
         finally
         {
@@ -1378,13 +1657,15 @@ internal static class UiSmokeHarness
         const int noisyTrafficCount = 3_600;
         const int quietTrafficCount = 360;
         var trafficStart = Stopwatch.GetTimestamp();
+        var trafficRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var noisyTraffic = ProduceTrafficAsync(
             demo.AlphaTransport,
             "#general",
             "phase1s-alpha",
             noisyTrafficCount,
             batchSize: 32,
-            pacingMilliseconds: 1);
+            pacingMilliseconds: 1,
+            releaseAfterFirstBatch: trafficRelease.Task);
         var quietTraffic = ProduceTrafficAsync(
             demo.BetaTransport,
             "#general",
@@ -1395,40 +1676,43 @@ internal static class UiSmokeHarness
         await Task.Yield();
 
         var measurements = new List<InteractionMeasurement>();
-        measurements.Add(await MeasureInteractionAsync(
+        var quietUnreadObserved = false;
+        try
+        {
+            measurements.Add(await MeasureInteractionAsync(
             window,
             "conversation-selection",
             () => viewModel.SelectView(alphaChannel),
             () => ReferenceEquals(viewModel.ActiveView, alphaChannel),
             () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
-        measurements.Add(await MeasureInteractionAsync(
+            measurements.Add(await MeasureInteractionAsync(
             window,
             "network-selection",
             () => viewModel.SelectView(betaChannel),
             () => ReferenceEquals(viewModel.ActiveView, betaChannel) && ReferenceEquals(viewModel.Sessions.ActiveNetwork, beta),
             () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
 
-        var navigatorTarget = viewModel.ConversationNavigator.FirstOrDefault(item =>
+            var navigatorTarget = viewModel.ConversationNavigator.FirstOrDefault(item =>
             item.Identity.NetworkId == alpha.Id
             && item.Kind == WorkspaceViewKind.Channel
             && item.Name == alphaChannel.Channel);
-        Require(navigatorTarget is not null, "sustained smoke did not expose the Alpha conversation in the navigator");
-        measurements.Add(await MeasureInteractionAsync(
+            Require(navigatorTarget is not null, "sustained smoke did not expose the Alpha conversation in the navigator");
+            measurements.Add(await MeasureInteractionAsync(
             window,
             "navigator-selection",
             () => viewModel.ActivateConversationCommand.Execute(navigatorTarget),
             () => ReferenceEquals(viewModel.ActiveView, alphaChannel),
             () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
 
-        const string draft = "phase1s draft input";
-        measurements.Add(await MeasureInteractionAsync(
+            const string draft = "phase1s draft input";
+            measurements.Add(await MeasureInteractionAsync(
             window,
             "draft-edit",
             () => viewModel.PrepareInput(draft),
             () => viewModel.InputText == draft,
             () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
 
-        measurements.Add(await MeasureInteractionAsync(
+            measurements.Add(await MeasureInteractionAsync(
             window,
             "draft-switch-and-restore",
             () =>
@@ -1439,12 +1723,11 @@ internal static class UiSmokeHarness
             () => ReferenceEquals(viewModel.ActiveView, alphaChannel) && viewModel.InputText == draft,
             () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
 
-        viewModel.SelectView(alphaChannel);
-        Require(ReferenceEquals(viewModel.ActiveView, alphaChannel) && ReferenceEquals(viewModel.Sessions.ActiveView, alphaChannel), "sustained smoke could not leave the quiet conversation before measuring unread selection");
-        demo.BetaTransport.EnqueueInboundLine(":QuietMarker!u@beta PRIVMSG #general :phase1s-quiet-selection-marker");
-        await WaitForAsync(viewModel.Sessions, () => betaChannel.UnreadCount > 0, $"quiet network did not accumulate the selection unread marker (active={viewModel.ActiveView?.Title}, betaActive={betaChannel.IsActive}, entries={betaChannel.EntryCount})").ConfigureAwait(true);
-        var quietUnreadObserved = false;
-        measurements.Add(await MeasureInteractionAsync(
+            viewModel.SelectView(alphaChannel);
+            Require(ReferenceEquals(viewModel.ActiveView, alphaChannel) && ReferenceEquals(viewModel.Sessions.ActiveView, alphaChannel), "sustained smoke could not leave the quiet conversation before measuring unread selection");
+            demo.BetaTransport.EnqueueInboundLine(":QuietMarker!u@beta PRIVMSG #general :phase1s-quiet-selection-marker");
+            await WaitForAsync(viewModel.Sessions, () => betaChannel.UnreadCount > 0, $"quiet network did not accumulate the selection unread marker (active={viewModel.ActiveView?.Title}, betaActive={betaChannel.IsActive}, entries={betaChannel.EntryCount})").ConfigureAwait(true);
+            measurements.Add(await MeasureInteractionAsync(
             window,
             "unread-selection",
             () =>
@@ -1455,14 +1738,14 @@ internal static class UiSmokeHarness
             () => quietUnreadObserved && betaChannel.UnreadCount == 0 && betaChannel.Activity == WorkspaceActivity.None,
             () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
 
-        measurements.Add(await MeasureInteractionAsync(
+            measurements.Add(await MeasureInteractionAsync(
             window,
             "existing-query-destination",
             () => viewModel.SelectView(existingQuery),
             () => ReferenceEquals(viewModel.ActiveView, existingQuery) && existingQuery.IsViewOpen,
             () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
 
-        measurements.Add(await MeasureInteractionAsync(
+            measurements.Add(await MeasureInteractionAsync(
             window,
             "rapid-conversation-switch",
             () =>
@@ -1474,31 +1757,36 @@ internal static class UiSmokeHarness
             () => ReferenceEquals(viewModel.ActiveView, alphaQuery),
             () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
 
-        var secondNavigatorTarget = viewModel.ConversationNavigator.FirstOrDefault(item =>
+            var secondNavigatorTarget = viewModel.ConversationNavigator.FirstOrDefault(item =>
             item.Identity.NetworkId == beta.Id
             && item.Kind == WorkspaceViewKind.Channel
             && item.Name == betaChannel.Channel);
-        Require(secondNavigatorTarget is not null, "sustained smoke did not retain the quiet network navigator item");
-        measurements.Add(await MeasureInteractionAsync(
+            Require(secondNavigatorTarget is not null, "sustained smoke did not retain the quiet network navigator item");
+            measurements.Add(await MeasureInteractionAsync(
             window,
             "navigator-restore",
             () => viewModel.ActivateConversationCommand.Execute(secondNavigatorTarget),
             () => ReferenceEquals(viewModel.ActiveView, betaChannel),
             () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
 
-        measurements.Add(await MeasureInteractionAsync(
+            measurements.Add(await MeasureInteractionAsync(
             window,
             "draft-input-after-navigation",
             () => viewModel.PrepareInput("phase1s post-navigation input"),
             () => viewModel.InputText == "phase1s post-navigation input",
             () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
 
-        measurements.Add(await MeasureInteractionAsync(
+            measurements.Add(await MeasureInteractionAsync(
             window,
             "conversation-selection-final",
             () => viewModel.SelectView(alphaChannel),
             () => ReferenceEquals(viewModel.ActiveView, alphaChannel) && ReferenceEquals(viewModel.Sessions.ActiveNetwork, alpha),
             () => !noisyTraffic.IsCompleted || !quietTraffic.IsCompleted).ConfigureAwait(true));
+        }
+        finally
+        {
+            trafficRelease.TrySetResult();
+        }
 
         await Task.WhenAll(noisyTraffic, quietTraffic).ConfigureAwait(true);
         var trafficElapsedMilliseconds = TicksToMilliseconds(Stopwatch.GetTimestamp() - trafficStart);
@@ -1615,6 +1903,7 @@ internal static class UiSmokeHarness
         int count,
         int batchSize,
         int pacingMilliseconds,
+        Task? releaseAfterFirstBatch = null,
         CancellationToken cancellationToken = default)
     {
         for (var index = 0; index < count; index++)
@@ -1623,6 +1912,11 @@ internal static class UiSmokeHarness
             transport.EnqueueInboundLine($":{prefix}!stream@demo PRIVMSG {channel} :{prefix}-{index:00000}");
             if ((index + 1) % batchSize == 0)
             {
+                if (index + 1 == batchSize && releaseAfterFirstBatch is not null)
+                {
+                    await releaseAfterFirstBatch.ConfigureAwait(true);
+                }
+
                 await Task.Delay(pacingMilliseconds, cancellationToken).ConfigureAwait(true);
             }
         }
@@ -1678,8 +1972,8 @@ internal static class UiSmokeHarness
                 break;
             case "close-sustained":
                 traffic = Task.WhenAll(
-                    ProduceTrafficAsync(demo.AlphaTransport, "#general", "phase1s-close-alpha", 6_000, 32, 1, trafficCancellation.Token),
-                    ProduceTrafficAsync(demo.BetaTransport, "#general", "phase1s-close-beta", 600, 24, 2, trafficCancellation.Token));
+                    ProduceTrafficAsync(demo.AlphaTransport, "#general", "phase1s-close-alpha", 6_000, 32, 1, cancellationToken: trafficCancellation.Token),
+                    ProduceTrafficAsync(demo.BetaTransport, "#general", "phase1s-close-beta", 600, 24, 2, cancellationToken: trafficCancellation.Token));
                 await Task.Yield();
                 break;
             case "close-backlog":

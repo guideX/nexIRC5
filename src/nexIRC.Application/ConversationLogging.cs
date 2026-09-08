@@ -2018,13 +2018,10 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                     && cached.SourceLastWriteTicks == sourceInfo.LastWriteTimeUtc.Ticks
                     && JsonlSearchIndex.IsSidecarCurrent(JsonlSearchIndex.GetSidecarPath(path), cached))
                 {
-                    if (JsonlSearchIndex.TryLoad(path, out var validated) && validated is not null)
-                    {
-                        _searchIndexes[path] = validated;
-                        return new SearchIndexLoadResult(validated, 0);
-                    }
-
-                    _searchIndexes.Remove(path);
+                    // The sidecar and every source block were validated when
+                    // this snapshot entered the cache. Metadata checks keep
+                    // the warm search path free of a full source rehash.
+                    return new SearchIndexLoadResult(cached, 0);
                 }
             }
 

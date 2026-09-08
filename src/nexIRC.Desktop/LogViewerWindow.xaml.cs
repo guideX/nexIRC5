@@ -1,4 +1,5 @@
 using System.Windows;
+using System.Windows.Input;
 using nexIRC.Application;
 using nexIRC.Core.State;
 
@@ -144,6 +145,43 @@ public partial class LogViewerWindow : Window
 
     private void OnCancelSearchClick(object sender, RoutedEventArgs e) => _searchCancellation?.Cancel();
 
+    private void OnQueryBoxKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter)
+        {
+            e.Handled = true;
+            OnSearchClick(sender, e);
+        }
+    }
+
+    private void OnResultsListKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter && ResultsList.SelectedItem is LogResultListItem)
+        {
+            e.Handled = true;
+            OnOpenClick(sender, e);
+        }
+    }
+
+    private void OnWindowPreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key != Key.Escape)
+        {
+            return;
+        }
+
+        if (_searchCancellation is not null)
+        {
+            _searchCancellation.Cancel();
+        }
+        else
+        {
+            Close();
+        }
+
+        e.Handled = true;
+    }
+
     private void OnPreviousResultClick(object sender, RoutedEventArgs e) => MoveResultSelection(-1);
 
     private void OnNextResultClick(object sender, RoutedEventArgs e) => MoveResultSelection(1);
@@ -208,12 +246,14 @@ public partial class LogViewerWindow : Window
         if (!TryCreateHistoryRequest(out var request))
         {
             StatusText.Text = "Choose a saved network and enter a channel or nickname first.";
+            ConversationBox.Focus();
             return;
         }
 
         if (!HistorySearchInput.TryParseUtcDateTime(JumpDateBox.Text, out var timestamp, out var error))
         {
             StatusText.Text = error;
+            FocusAndSelect(JumpDateBox);
             return;
         }
 
@@ -223,6 +263,7 @@ public partial class LogViewerWindow : Window
         if (network is null || kind is LogConversationKind.Status || string.IsNullOrWhiteSpace(name))
         {
             StatusText.Text = "Choose one network and enter a channel or nickname first.";
+            NetworkBox.Focus();
             return;
         }
 
@@ -241,12 +282,14 @@ public partial class LogViewerWindow : Window
         if (!TryCreateHistoryRequest(out var request))
         {
             StatusText.Text = "Choose one network and enter a channel or nickname first.";
+            ConversationBox.Focus();
             return;
         }
 
         if (!HistorySearchInput.TryNormalizeServerMessageId(MsgidBox.Text, out var messageId, out var error))
         {
             StatusText.Text = error;
+            FocusAndSelect(MsgidBox);
             return;
         }
 
@@ -256,6 +299,7 @@ public partial class LogViewerWindow : Window
         if (network is null || kind is LogConversationKind.Status || string.IsNullOrWhiteSpace(name))
         {
             StatusText.Text = "Choose one network and enter a channel or nickname first.";
+            NetworkBox.Focus();
             return;
         }
 
@@ -289,6 +333,10 @@ public partial class LogViewerWindow : Window
         catch (Exception exception)
         {
             StatusText.Text = $"Could not open history result: {exception.Message}";
+        }
+        finally
+        {
+            ResultsList.Focus();
         }
     }
 
@@ -358,6 +406,7 @@ public partial class LogViewerWindow : Window
         if (scope is ConversationLogSearchScope.CurrentConversation or ConversationLogSearchScope.CurrentNetwork && network is null)
         {
             StatusText.Text = "Select a network for the current conversation or current network scope.";
+            NetworkBox.Focus();
             query = null!;
             return false;
         }
@@ -365,13 +414,23 @@ public partial class LogViewerWindow : Window
         if (scope == ConversationLogSearchScope.CurrentConversation && conversation is null)
         {
             StatusText.Text = "Enter a channel or nickname for the current conversation scope.";
+            ConversationBox.Focus();
             query = null!;
             return false;
         }
 
-        if (!TryParseOptionalDate(FromDateBox.Text, out var from) || !TryParseOptionalDate(ToDateBox.Text, out var to))
+        if (!TryParseOptionalDate(FromDateBox.Text, out var from))
         {
             StatusText.Text = "Enter valid UTC from/to dates or leave them blank.";
+            FocusAndSelect(FromDateBox);
+            query = null!;
+            return false;
+        }
+
+        if (!TryParseOptionalDate(ToDateBox.Text, out var to))
+        {
+            StatusText.Text = "Enter valid UTC from/to dates or leave them blank.";
+            FocusAndSelect(ToDateBox);
             query = null!;
             return false;
         }
@@ -379,6 +438,7 @@ public partial class LogViewerWindow : Window
         if (from is not null && to is not null && from > to)
         {
             StatusText.Text = "The from date must not be later than the to date.";
+            FocusAndSelect(FromDateBox);
             query = null!;
             return false;
         }
@@ -418,6 +478,14 @@ public partial class LogViewerWindow : Window
         if (network is null || conversation.Length == 0)
         {
             request = null!;
+            if (network is null)
+            {
+                NetworkBox.Focus();
+            }
+            else
+            {
+                ConversationBox.Focus();
+            }
             return false;
         }
 
@@ -448,6 +516,12 @@ public partial class LogViewerWindow : Window
 
         timestamp = null;
         return false;
+    }
+
+    private static void FocusAndSelect(System.Windows.Controls.TextBox textBox)
+    {
+        textBox.Focus();
+        textBox.SelectAll();
     }
 
     protected override void OnClosed(EventArgs e)

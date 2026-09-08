@@ -11,7 +11,8 @@ internal sealed record JsonlSearchIndexBlock(
     long MinimumTimestampTicks,
     long MaximumTimestampTicks,
     int RecordCount,
-    byte[] Bloom);
+    byte[] Bloom,
+    byte[] SourceFingerprint);
 
 internal sealed record JsonlSearchIndexSnapshot(
     long SourceLength,
@@ -35,12 +36,13 @@ internal static class JsonlSearchIndex
         Converters = { new JsonStringEnumConverter() }
     };
     private static readonly byte[] Magic = "NEXSIDX1"u8.ToArray();
-    private const int FormatVersion = 2;
+    private const int FormatVersion = 3;
     private const int HashCount = 3;
     private const int SidecarHashBytes = 32;
+    private const int SourceFingerprintBytes = 32;
     private static readonly int BloomBits = ConfigurationLimits.HistorySearchIndexBloomBytes * 8;
     private static readonly int HeaderBytes = Magic.Length + sizeof(int) + sizeof(long) + sizeof(long) + sizeof(int) + sizeof(int) + sizeof(int);
-    private static readonly int BlockBytes = sizeof(long) + sizeof(long) + sizeof(long) + sizeof(long) + sizeof(int) + ConfigurationLimits.HistorySearchIndexBloomBytes;
+    private static readonly int BlockBytes = sizeof(long) + sizeof(long) + sizeof(long) + sizeof(long) + sizeof(int) + SourceFingerprintBytes + ConfigurationLimits.HistorySearchIndexBloomBytes;
 
     public static string GetSidecarPath(string sourcePath) => $"{sourcePath}.hsidx";
 
@@ -49,7 +51,7 @@ internal static class JsonlSearchIndex
         var sourceInfo = new FileInfo(sourcePath);
         snapshot = null;
         return IsEligibleSource(sourceInfo)
-            && TryRead(GetSidecarPath(sourcePath), sourceInfo.Length, sourceInfo.LastWriteTimeUtc.Ticks, out snapshot);
+            && TryRead(GetSidecarPath(sourcePath), sourcePath, sourceInfo.Length, sourceInfo.LastWriteTimeUtc.Ticks, out snapshot);
     }
 
     internal static async Task<JsonlSearchIndexSnapshot?> WriteBuiltAsync(
@@ -65,7 +67,17 @@ internal static class JsonlSearchIndex
             return null;
         }
 
-        var snapshot = new JsonlSearchIndexSnapshot(sourceLength, sourceLastWriteTicks, blocks);
+        IReadOnlyList<JsonlSearchIndexBlock> fingerprintedBlocks;
+        try
+        {
+            fingerprintedBlocks = AddSourceFingerprints(sourcePath, sourceLength, sourceLastWriteTicks, blocks);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or EndOfStreamException)
+        {
+            return null;
+        }
+
+        var snapshot = new JsonlSearchIndexSnapshot(sourceLength, sourceLastWriteTicks, fingerprintedBlocks);
         try
         {
             await WriteAsync(GetSidecarPath(sourcePath), snapshot, cancellationToken).ConfigureAwait(false);
@@ -137,7 +149,8 @@ internal static class JsonlSearchIndex
         var blocks = previous.Blocks.ToList();
         if (last.RecordCount < ConfigurationLimits.HistorySearchIndexBlockRecords)
         {
-            blocks[^1] = AppendToBlock(last, record, sourceLength);
+            var updatedLength = checked(last.Length + sourceLength);
+            blocks[^1] = AppendToBlock(last, record, sourceLength, HashSourceRange(sourcePath, last.Offset, updatedLength));
         }
         else
         {
@@ -148,7 +161,7 @@ internal static class JsonlSearchIndex
 
             var builder = new BlockBuilder();
             builder.Add(offset, record);
-            blocks.Add(builder.Complete(sourceLength));
+            blocks.Add(builder.Complete(sourceLength, HashSourceRange(sourcePath, offset, sourceLength)));
         }
 
         var snapshot = new JsonlSearchIndexSnapshot(
@@ -224,6 +237,7 @@ internal static class JsonlSearchIndex
 
     private static bool TryRead(
         string path,
+        string sourcePath,
         long sourceLength,
         long sourceLastWriteTicks,
         out JsonlSearchIndexSnapshot? snapshot)
@@ -302,13 +316,19 @@ internal static class JsonlSearchIndex
                     return false;
                 }
 
-                var bloom = blockBuffer.AsSpan(36, ConfigurationLimits.HistorySearchIndexBloomBytes).ToArray();
-                blocks.Add(new JsonlSearchIndexBlock(offset, length, minimum, maximum, recordCount, bloom));
+                var sourceFingerprint = blockBuffer.AsSpan(36, SourceFingerprintBytes).ToArray();
+                var bloom = blockBuffer.AsSpan(36 + SourceFingerprintBytes, ConfigurationLimits.HistorySearchIndexBloomBytes).ToArray();
+                blocks.Add(new JsonlSearchIndexBlock(offset, length, minimum, maximum, recordCount, bloom, sourceFingerprint));
                 previousOffset = offset;
                 previousEnd = offset + length;
             }
 
             if (blocks.Count > 0 && blocks[^1].Offset + blocks[^1].Length != sourceLength)
+            {
+                return false;
+            }
+
+            if (!ValidateSourceFingerprints(sourcePath, sourceLength, sourceLastWriteTicks, blocks))
             {
                 return false;
             }
@@ -348,7 +368,13 @@ internal static class JsonlSearchIndex
                 BinaryPrimitives.WriteInt64LittleEndian(blockBuffer.AsSpan(16), block.MinimumTimestampTicks);
                 BinaryPrimitives.WriteInt64LittleEndian(blockBuffer.AsSpan(24), block.MaximumTimestampTicks);
                 BinaryPrimitives.WriteInt32LittleEndian(blockBuffer.AsSpan(32), block.RecordCount);
-                block.Bloom.CopyTo(blockBuffer.AsSpan(36));
+                if (block.SourceFingerprint.Length != SourceFingerprintBytes || block.Bloom.Length != ConfigurationLimits.HistorySearchIndexBloomBytes)
+                {
+                    throw new InvalidDataException("The search index block fingerprint or Bloom filter has an invalid size.");
+                }
+
+                block.SourceFingerprint.CopyTo(blockBuffer.AsSpan(36, SourceFingerprintBytes));
+                block.Bloom.CopyTo(blockBuffer.AsSpan(36 + SourceFingerprintBytes, ConfigurationLimits.HistorySearchIndexBloomBytes));
                 blockBuffer.CopyTo(payload, HeaderBytes + index * BlockBytes);
             }
 
@@ -374,6 +400,96 @@ internal static class JsonlSearchIndex
         }
     }
 
+    private static JsonlSearchIndexBlock[] AddSourceFingerprints(
+        string sourcePath,
+        long sourceLength,
+        long sourceLastWriteTicks,
+        IReadOnlyList<JsonlSearchIndexBlock> blocks)
+    {
+        using var source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.SequentialScan);
+        if (source.Length != sourceLength)
+        {
+            throw new IOException("The canonical history changed while its search index was being built.");
+        }
+
+        var fingerprinted = blocks
+            .Select(block => block with { SourceFingerprint = HashSourceRange(source, block.Offset, block.Length) })
+            .ToArray();
+        var after = new FileInfo(sourcePath);
+        if (!IsSameSource(after, sourceLength, sourceLastWriteTicks))
+        {
+            throw new IOException("The canonical history changed while its search index was being built.");
+        }
+
+        return fingerprinted;
+    }
+
+    private static bool ValidateSourceFingerprints(
+        string sourcePath,
+        long sourceLength,
+        long sourceLastWriteTicks,
+        IReadOnlyList<JsonlSearchIndexBlock> blocks)
+    {
+        try
+        {
+            using var source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 64 * 1024, FileOptions.SequentialScan);
+            if (source.Length != sourceLength)
+            {
+                return false;
+            }
+
+            foreach (var block in blocks)
+            {
+                if (block.SourceFingerprint.Length != SourceFingerprintBytes
+                    || !CryptographicOperations.FixedTimeEquals(
+                        block.SourceFingerprint,
+                        HashSourceRange(source, block.Offset, block.Length)))
+                {
+                    return false;
+                }
+            }
+
+            var after = new FileInfo(sourcePath);
+            return IsSameSource(after, sourceLength, sourceLastWriteTicks);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or EndOfStreamException)
+        {
+            return false;
+        }
+    }
+
+    private static byte[] HashSourceRange(FileStream source, long offset, long length)
+    {
+        if (offset < 0 || length <= 0 || offset > source.Length || length > source.Length - offset)
+        {
+            throw new EndOfStreamException("The search index block is outside the canonical history source.");
+        }
+
+        source.Position = offset;
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[64 * 1024];
+        var remaining = length;
+        while (remaining > 0)
+        {
+            var read = source.Read(buffer, 0, (int)Math.Min(buffer.Length, remaining));
+            if (read <= 0)
+            {
+                throw new EndOfStreamException("The canonical history ended while hashing a search index block.");
+            }
+
+            hash.AppendData(buffer, 0, read);
+            remaining -= read;
+        }
+
+        return hash.GetHashAndReset();
+    }
+
+    private static byte[] HashSourceRange(string sourcePath, long offset, long length)
+    {
+        using var source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 64 * 1024, FileOptions.SequentialScan);
+        return HashSourceRange(source, offset, length);
+    }
+
     private static bool IsEligibleSource(FileInfo sourceInfo) => sourceInfo.Exists
         && sourceInfo.Length >= ConfigurationLimits.MinimumHistoryIndexFileBytes
         && sourceInfo.Length <= ConfigurationLimits.MaximumHistoryFileBytes;
@@ -385,7 +501,8 @@ internal static class JsonlSearchIndex
     private static JsonlSearchIndexBlock AppendToBlock(
         JsonlSearchIndexBlock block,
         ConversationLogRecord record,
-        int sourceLength)
+        int sourceLength,
+        byte[] sourceFingerprint)
     {
         var bloom = (byte[])block.Bloom.Clone();
         AddText(bloom, record.Text);
@@ -397,7 +514,8 @@ internal static class JsonlSearchIndex
             Math.Min(block.MinimumTimestampTicks, record.Timestamp.UtcTicks),
             Math.Max(block.MaximumTimestampTicks, record.Timestamp.UtcTicks),
             checked(block.RecordCount + 1),
-            bloom);
+            bloom,
+            sourceFingerprint);
     }
 
     private static void AddText(byte[] bloom, string value)
@@ -480,7 +598,14 @@ internal static class JsonlSearchIndex
             AddText(_bloom, record.ConversationName);
         }
 
-        public JsonlSearchIndexBlock Complete(long length) => new(Offset, length, _minimumTimestampTicks, _maximumTimestampTicks, RecordCount, _bloom);
+        public JsonlSearchIndexBlock Complete(long length, byte[]? sourceFingerprint = null) => new(
+            Offset,
+            length,
+            _minimumTimestampTicks,
+            _maximumTimestampTicks,
+            RecordCount,
+            _bloom,
+            sourceFingerprint ?? Array.Empty<byte>());
 
         private static void AddText(byte[] bloom, string value)
         {
