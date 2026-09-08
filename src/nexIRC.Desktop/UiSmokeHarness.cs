@@ -29,6 +29,7 @@ internal static class UiSmokeHarness
         "query-nick",
         "ircv3-metadata",
         "chathistory",
+        "history-gap-repair",
         "history-discovery",
         "history-identity",
         "contextual-actions",
@@ -105,6 +106,9 @@ internal static class UiSmokeHarness
                 break;
             case "chathistory":
                 await ChathistoryAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "history-gap-repair":
+                await HistoryGapRepairAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
             case "history-discovery":
                 await HistoryDiscoveryAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -281,6 +285,58 @@ internal static class UiSmokeHarness
         Console.WriteLine($"CHATHISTORY_UI_TRACE entries={channel.EntryCount} unread={channel.UnreadCount} members={channel.Members.Count}");
     }
 
+    private static async Task HistoryGapRepairAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var sessions = window.ViewModel.Sessions;
+        var channel = RequiredChannel(network);
+        demo.AlphaTransport.EnqueueInboundLine("@msgid=gap-a;time=2026-09-07T12:00:00.000Z :Alex!u@alpha PRIVMSG #general :A");
+        demo.AlphaTransport.EnqueueInboundLine("@msgid=gap-b;time=2026-09-07T12:01:00.000Z :Alex!u@alpha PRIVMSG #general :B");
+        await WaitForAsync(sessions, () => channel.EntriesSnapshot.Count(entry => entry.ServerMessageId is "gap-a" or "gap-b") == 2, "history gap pre-disconnect anchors did not arrive").ConfigureAwait(true);
+
+        var replacement = demo.AddAlphaReconnectTransport();
+        demo.AlphaTransport.EnqueueRemoteDisconnect();
+        await WaitForAsync(sessions, () => replacement.ConnectCount == 1 && channel.IsStale, "history gap reconnect did not establish a new generation").ConfigureAwait(true);
+        demo.EnqueuePhase1YRegistration(replacement);
+        replacement.EnqueueInboundLine(":nexAlpha!demo@alpha.server JOIN #general");
+        replacement.EnqueueInboundLine("@msgid=gap-f;time=2026-09-07T12:05:00.000Z :Alex!u@alpha PRIVMSG #general :F");
+        try
+        {
+            await WaitForPollingAsync(() => replacement.OutboundLines.Any(line => line.StartsWith("CHATHISTORY BETWEEN #general msgid=gap-b msgid=gap-f ", StringComparison.Ordinal)), "exact BETWEEN gap repair was not sent").ConfigureAwait(true);
+        }
+        catch (TimeoutException exception)
+        {
+            var gaps = string.Join(" | ", sessions.GetHistoryGaps(network.Id).Select(gap => $"{gap.State}:{gap.LastReason}"));
+            throw new TimeoutException($"{exception.Message}; outbound={string.Join(" | ", replacement.OutboundLines)}; gaps={gaps}", exception);
+        }
+
+        var unreadBeforeHistory = channel.UnreadCount;
+
+        replacement.EnqueueInboundLine("@draft/chathistory-end :alpha.server BATCH +gap-repair chathistory #general");
+        replacement.EnqueueInboundLine("@batch=gap-repair;msgid=gap-c;time=2026-09-07T12:02:00.000Z :Alex!u@alpha PRIVMSG #general :C");
+        replacement.EnqueueInboundLine("@batch=gap-repair;msgid=gap-d;time=2026-09-07T12:03:00.000Z :Alex!u@alpha PRIVMSG #general :D");
+        replacement.EnqueueInboundLine("@batch=gap-repair;msgid=gap-e;time=2026-09-07T12:04:00.000Z :Alex!u@alpha PRIVMSG #general :E");
+        replacement.EnqueueInboundLine("@batch=gap-repair;msgid=gap-b;time=2026-09-07T12:01:00.000Z :Alex!u@alpha PRIVMSG #general :B");
+        replacement.EnqueueInboundLine(":alpha.server BATCH -gap-repair");
+
+        await WaitForAsync(
+            sessions,
+            () =>
+            {
+                var texts = channel.EntriesSnapshot
+                    .Where(entry => entry.ServerMessageId is not null)
+                    .Select(entry => entry.Text)
+                    .ToHashSet(StringComparer.Ordinal);
+                return new[] { "A", "B", "C", "D", "E", "F" }.All(texts.Contains);
+            },
+            "exact gap history did not converge in canonical chronology").ConfigureAwait(true);
+        await WaitForPollingAsync(() => sessions.GetHistoryGaps(network.Id).SingleOrDefault()?.State == HistoryGapRepairState.Repaired, "exact gap repair did not reach repaired state").ConfigureAwait(true);
+        Require(channel.EntriesSnapshot.Count(entry => entry.ServerMessageId == "gap-b") == 1, "the repeated older boundary was projected twice");
+        Require(channel.EntriesSnapshot.Count(entry => entry.ServerMessageId == "gap-f") == 1, "the newer live boundary was projected twice");
+        Require(channel.UnreadCount == unreadBeforeHistory, "historical gap playback changed unread state");
+        Require(replacement.OutboundLines.Count(line => line.StartsWith("CHATHISTORY BETWEEN #general", StringComparison.Ordinal)) == 1, "the repaired gap triggered more than one exact network request");
+        Console.WriteLine($"HISTORY_GAP_REPAIR_UI_TRACE state=repaired between_requests=1 chronology=A,B,C,D,E,F unread_unchanged=true");
+    }
+
     private static async Task HistoryDiscoveryAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
     {
         var sessions = window.ViewModel.Sessions;
@@ -381,6 +437,11 @@ internal static class UiSmokeHarness
 
         replacement.EnqueueInboundLine("@account=alice-account;msgid=identity-4;time=2026-09-07T12:01:00.000Z :Alicia!u@alpha PRIVMSG nexAlpha :same account after reconnect");
         await WaitForAsync(sessions, () => query.Nickname == "Alicia" && network.Queries.Count == 1 && query.EntryCount == 4, "strong account evidence did not reuse the query after reconnect").ConfigureAwait(true);
+        await WaitForPollingAsync(
+            () => replacement.OutboundLines.Any(line => line.StartsWith("CHATHISTORY BETWEEN Alicia msgid=identity-3 msgid=identity-4 ", StringComparison.Ordinal)),
+            "identity exact reconnect request was not sent").ConfigureAwait(true);
+        replacement.EnqueueInboundLine("@draft/chathistory-end :alpha.server BATCH +identity-gap chathistory Alicia");
+        replacement.EnqueueInboundLine(":alpha.server BATCH -identity-gap");
 
         replacement.EnqueueInboundLine("@account=other-account;msgid=identity-5;time=2026-09-07T12:02:00.000Z :Alice!other@alpha PRIVMSG nexAlpha :conflicting account");
         await WaitForAsync(sessions, () => network.Queries.Count == 2 && network.Queries.Any(item => item.EntryCount == 1), "conflicting account was incorrectly merged").ConfigureAwait(true);

@@ -20,7 +20,8 @@ public enum ChathistoryRequestPurpose
     ReconnectGap,
     LoadOlder,
     ReconnectDiscovery,
-    LoadContext
+    LoadContext,
+    ExactGapRepair
 }
 
 public enum ChathistoryReferenceType
@@ -48,6 +49,8 @@ public sealed record ChathistoryReference
     public string Value { get; }
 
     public bool IsWildcard { get; }
+
+    public bool IsConcrete => !IsWildcard;
 
     public static ChathistoryReference MessageId(string value)
     {
@@ -89,6 +92,13 @@ public sealed record ChathistoryReference
         : Type == ChathistoryReferenceType.MessageId
             ? $"msgid={Value}"
             : $"timestamp={Value}";
+
+    public static bool AreCompatible(ChathistoryReference left, ChathistoryReference right) =>
+        left is not null
+        && right is not null
+        && left.IsConcrete
+        && right.IsConcrete
+        && left.Type == right.Type;
 
     private static ChathistoryReference Create(ChathistoryReferenceType type, string value)
     {
@@ -157,6 +167,27 @@ public sealed record ChathistoryRequest
             Operation = ChathistoryOperation.Targets,
             Reference = from,
             SecondaryReference = to,
+            Limit = limit,
+            Purpose = purpose
+        };
+
+    public static ChathistoryRequest ForBetween(
+        Guid networkId,
+        int connectionGeneration,
+        string conversation,
+        string target,
+        ChathistoryReference older,
+        ChathistoryReference newer,
+        int limit,
+        ChathistoryRequestPurpose purpose = ChathistoryRequestPurpose.ExactGapRepair) => new()
+        {
+            NetworkId = networkId,
+            ConnectionGeneration = connectionGeneration,
+            Conversation = conversation,
+            Target = target,
+            Operation = ChathistoryOperation.Between,
+            Reference = older,
+            SecondaryReference = newer,
             Limit = limit,
             Purpose = purpose
         };
@@ -401,6 +432,20 @@ public sealed record ChathistoryResult(
     bool Exhausted = false)
 {
     public IReadOnlyList<ChathistoryTarget> Targets { get; init; } = Array.Empty<ChathistoryTarget>();
+
+    /// <summary>Batch identity and shape retained for conservative callers.</summary>
+    public string? BatchId { get; init; }
+
+    public string? BatchType { get; init; }
+
+    public string? BatchTarget { get; init; }
+
+    /// <summary>
+    /// True only when the server supplied explicit end-of-history evidence on
+    /// the opening history batch.  It is intentionally distinct from an
+    /// empty result, which is valid evidence only for the requested interval.
+    /// </summary>
+    public bool HistoryEndSignaled => Exhausted;
 
     public bool Succeeded => Completion == ChathistoryRequestCompletion.Succeeded;
 

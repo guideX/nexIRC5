@@ -158,6 +158,16 @@ public sealed class IrcMessage
     /// <summary>The IRCv3 batch association tag, when present.</summary>
     public string? BatchId { get; }
 
+    /// <summary>
+    /// Explicit CHATHISTORY pagination evidence.  The draft uses a valueless
+    /// <c>draft/chathistory-end</c> message tag on the opening BATCH line.
+    /// The unprefixed spelling is accepted defensively for servers which have
+    /// adopted the final tag name early.
+    /// </summary>
+    public bool HasChathistoryEnd =>
+        TagValues.ContainsKey("draft/chathistory-end")
+        || TagValues.ContainsKey("chathistory-end");
+
     public bool IsNumeric => NumericCommand.HasValue;
 
     private static bool IsNumericCommand(string command) => command.Length == 3 && command.All(static c => c is >= '0' and <= '9');

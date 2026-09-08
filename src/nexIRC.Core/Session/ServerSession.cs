@@ -1712,7 +1712,9 @@ public sealed class ServerSession : IAsyncDisposable
 
                 if (isDiscovery)
                 {
-                    pending.EndMarker = message.TagValues.ContainsKey("draft/chathistory-end");
+                    pending.EndMarker = message.HasChathistoryEnd;
+                    pending.BatchType = type;
+                    pending.BatchTarget = target;
                     pending.BatchId = batchId;
                     _acceptedHistoryBatches.Add(batchId);
 
@@ -1731,7 +1733,9 @@ public sealed class ServerSession : IAsyncDisposable
                 else
                 {
                     pending.BatchId = batchId;
-                    pending.EndMarker = message.TagValues.ContainsKey("draft/chathistory-end");
+                    pending.EndMarker = message.HasChathistoryEnd;
+                    pending.BatchType = type;
+                    pending.BatchTarget = target;
                     _acceptedHistoryBatches.Add(batchId);
                 }
             }
@@ -1872,6 +1876,9 @@ public sealed class ServerSession : IAsyncDisposable
             failure,
             exhausted)
         {
+            BatchId = pending.BatchId,
+            BatchType = pending.BatchType,
+            BatchTarget = pending.BatchTarget,
             Targets = pending.Targets
                 .GroupBy(target => NormalizeTarget(target.Target), StringComparer.Ordinal)
                 .Select(group => group.OrderByDescending(target => target.LatestTimestamp).First())
@@ -2097,6 +2104,10 @@ public sealed class ServerSession : IAsyncDisposable
         public List<ChathistoryTarget> Targets { get; } = [];
 
         public string? BatchId { get; set; }
+
+        public string? BatchType { get; set; }
+
+        public string? BatchTarget { get; set; }
 
         public bool EndMarker { get; set; }
     }

@@ -39,6 +39,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private const int MaximumRecoveredQueries = 8;
     private static readonly TimeSpan MaximumDiscoveryAge = TimeSpan.FromHours(24);
     private static readonly TimeSpan DiscoveryClockFuzz = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan ReconnectBoundaryObservationWindow = TimeSpan.FromMilliseconds(500);
 
     public NetworkSessionManager(
         nexIRC.Core.Networking.IIrcTransportFactory transportFactory,
@@ -93,6 +94,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         Interlocked.Read(ref _staleGenerationEventsDiscarded),
         Interlocked.Read(ref _duplicateSemanticEventsDiscarded),
         Interlocked.Read(ref _resynchronizationEventsSuppressed));
+
+    public HistoryGapRepairDiagnostics GetHistoryGapDiagnostics(Guid networkId) => GetEntry(networkId).GapLedger.Diagnostics;
+
+    public IReadOnlyList<HistoryGap> GetHistoryGaps(Guid networkId) => GetEntry(networkId).GapLedger.Snapshot;
 
     /// <summary>
     /// Number of manager-owned dispatch tasks that have not retired yet.
@@ -1292,6 +1297,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         var entry = GetEntry(networkId);
         var currentSnapshot = entry.Session.Snapshot;
         var desiredChannels = currentSnapshot.DesiredChannels.ToHashSet(IrcCaseMappingComparer.For(currentSnapshot.Features.CaseMapping));
+        CaptureReconnectBoundaries(entry, currentSnapshot.ConnectionGeneration);
         await StopEntryAsync(entry, "nexIRC reconnect").ConfigureAwait(false);
         entry.Options = entry.Options with { DesiredChannels = desiredChannels };
         entry.NeedsReplacement = true;
@@ -2348,7 +2354,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
         if (change.Current == ServerSessionState.ReconnectWaiting)
         {
-            CaptureReconnectBoundaries(entry);
+            CaptureReconnectBoundaries(entry, change.ConnectionGeneration);
         }
 
         var snapshot = session.Snapshot;
@@ -2405,9 +2411,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }, WorkspaceDispatchActionCategory.Lifecycle);
     }
 
-    private void CaptureReconnectBoundaries(SessionEntry entry)
+    private void CaptureReconnectBoundaries(SessionEntry entry, int connectionGeneration)
     {
         entry.LastDisconnectAt = DateTimeOffset.UtcNow;
+        entry.GapLedger.BeginReconnect();
         foreach (var view in entry.Workspace.Views)
         {
             if (view is not ChannelView channel && view is not QueryView)
@@ -2446,8 +2453,332 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 boundary.Timestamp,
                 boundary.TimestampSource,
                 IsChannel: view is ChannelView,
-                view.Id);
+                view.Id,
+                connectionGeneration,
+                boundary.Sequence);
+            entry.ReconnectBoundarySignals[HistoryConversation(view)] = new(TaskCreationOptions.RunContinuationsAsynchronously);
         }
+    }
+
+    private void SignalReconnectBoundary(
+        SessionEntry entry,
+        ServerSession session,
+        IrcSemanticEvent semanticEvent,
+        ServerSessionSnapshot snapshot,
+        DateTimeOffset? receivedAt)
+    {
+        if (semanticEvent.IsHistorical
+            || semanticEvent.Message.ServerMessageId is null && semanticEvent.Message.ServerTimestamp is null
+            || snapshot.ConnectionGeneration < 1)
+        {
+            return;
+        }
+
+        WorkspaceView? view = null;
+        string? conversation = null;
+        string? target = null;
+        switch (semanticEvent)
+        {
+            case IrcPrivmsgEvent message when snapshot.Features.ChannelTypes.Contains(message.Target.FirstOrDefault()):
+                view = entry.Workspace.Channels.FirstOrDefault(channel => IrcCaseMappingComparer.Equals(channel.Channel, message.Target, snapshot.Features.CaseMapping));
+                if (view is ChannelView channel)
+                {
+                    conversation = HistoryConversation(channel);
+                    target = channel.Channel;
+                }
+
+                break;
+            case IrcQueryMessageEvent queryMessage:
+                foreach (var candidate in entry.ReconnectBoundaries.Values.Where(static boundary => !boundary.IsChannel))
+                {
+                    if (entry.Workspace.FindQueryByHistoryKey(candidate.Conversation) is not { } query)
+                    {
+                        continue;
+                    }
+
+                    var routedToQuery = query.EntriesSnapshot.Any(item =>
+                        semanticEvent.Message.ServerMessageId is { Length: > 0 } serverId
+                            ? string.Equals(item.ServerMessageId, serverId, StringComparison.Ordinal)
+                            : item.Timestamp == (semanticEvent.Message.ServerTimestamp ?? DateTimeOffset.MinValue)
+                                && string.Equals(item.Text, queryMessage.Text, StringComparison.Ordinal)
+                                && IrcCaseMappingComparer.Equals(item.Sender ?? string.Empty, semanticEvent.Message.Prefix?.Name ?? string.Empty, snapshot.Features.CaseMapping));
+                    if (routedToQuery)
+                    {
+                        view = query;
+                        conversation = candidate.Conversation;
+                        target = query.Nickname;
+                        break;
+                    }
+                }
+
+                break;
+        }
+
+        if (view is null || conversation is null || target is null
+            || !entry.ReconnectBoundaries.ContainsKey(conversation)
+            || !entry.ReconnectBoundarySignals.TryGetValue(conversation, out var signal))
+        {
+            return;
+        }
+
+        var newer = new ReconnectHistoryBoundary(
+            conversation,
+            target,
+            semanticEvent.Message.ServerMessageId,
+            semanticEvent.Message.ServerTimestamp ?? receivedAt ?? DateTimeOffset.UtcNow,
+            semanticEvent.Message.ServerTimestamp is null
+                ? ConversationTimestampSource.LegacyOrLocalReceiveTime
+                : ConversationTimestampSource.ServerTime,
+            IsChannel: view is ChannelView,
+            view.Id,
+            snapshot.ConnectionGeneration,
+            view.EntriesSnapshot.FirstOrDefault(item => string.Equals(item.ServerMessageId, semanticEvent.Message.ServerMessageId, StringComparison.Ordinal))?.Sequence ?? 0);
+        signal.TrySetResult(newer);
+    }
+
+    private async Task<ReconnectHistoryBoundary?> WaitForReconnectBoundaryAsync(
+        SessionEntry entry,
+        string conversation,
+        int generation)
+    {
+        if (!entry.ReconnectBoundarySignals.TryGetValue(conversation, out var signal))
+        {
+            return null;
+        }
+
+        if (signal.Task.IsCompletedSuccessfully)
+        {
+            var completed = await signal.Task.ConfigureAwait(false);
+            return completed.ConnectionGeneration == generation ? completed : null;
+        }
+
+        var winner = await Task.WhenAny(signal.Task, Task.Delay(ReconnectBoundaryObservationWindow)).ConfigureAwait(false);
+        if (winner != signal.Task || entry.Session.Snapshot.ConnectionGeneration != generation)
+        {
+            return null;
+        }
+
+        var result = await signal.Task.ConfigureAwait(false);
+        return result.ConnectionGeneration == generation ? result : null;
+    }
+
+    private async Task<ReconnectRepairSummary> RepairReconnectGapAsync(
+        SessionEntry entry,
+        ServerSession session,
+        ReconnectHistoryBoundary olderSource,
+        ReconnectHistoryBoundary newerSource,
+        int generation)
+    {
+        if (session.Snapshot.ConnectionGeneration != generation)
+        {
+            return ReconnectRepairSummary.NotAttempted;
+        }
+
+        var support = session.ChathistorySupport;
+        var olderReference = SelectExactGapReference(support, olderSource.ServerMessageId, olderSource.Timestamp, olderSource.TimestampSource);
+        var newerReference = SelectExactGapReference(support, newerSource.ServerMessageId, newerSource.Timestamp, newerSource.TimestampSource);
+        if (olderReference is null || newerReference is null)
+        {
+            return ReconnectRepairSummary.NotAttempted;
+        }
+
+        var older = new HistoryGapBoundary
+        {
+            NetworkId = entry.Workspace.Id,
+            Conversation = olderSource.Conversation,
+            Reference = olderReference,
+            Timestamp = olderSource.Timestamp,
+            TimestampSource = olderSource.TimestampSource,
+            ServerMessageId = olderSource.ServerMessageId,
+            DurableSequence = olderSource.DurableSequence,
+            Provenance = HistoryGapBoundaryProvenance.PreDisconnectCanonical,
+            ConnectionGeneration = olderSource.ConnectionGeneration
+        };
+        var newer = new HistoryGapBoundary
+        {
+            NetworkId = entry.Workspace.Id,
+            Conversation = newerSource.Conversation,
+            Reference = newerReference,
+            Timestamp = newerSource.Timestamp,
+            TimestampSource = newerSource.TimestampSource,
+            ServerMessageId = newerSource.ServerMessageId,
+            DurableSequence = newerSource.DurableSequence,
+            Provenance = HistoryGapBoundaryProvenance.PostReconnectCanonical,
+            ConnectionGeneration = newerSource.ConnectionGeneration
+        };
+
+        if (!entry.GapLedger.TryDiscover(older, newer, newerSource.Target, support, generation, out var gap, out var validation))
+        {
+            return new ReconnectRepairSummary(false, 0, 0, validation.Reason ?? "The exact gap is not eligible.");
+        }
+
+        if (gap.IsTerminal)
+        {
+            return new ReconnectRepairSummary(true, 0, gap.RecoveredEntries, gap.LastReason);
+        }
+
+        if (!entry.GapLedger.IsWithinLifetime(gap))
+        {
+            entry.GapLedger.MarkTerminal(gap, HistoryGapRepairState.Exhausted, "The exact gap exceeded its bounded lifetime.");
+            return new ReconnectRepairSummary(true, 0, 0, "The exact gap exceeded its bounded lifetime.");
+        }
+
+        if (await IsGapFilledLocallyAsync(entry, gap).ConfigureAwait(false))
+        {
+            entry.GapLedger.MarkLocallyFilled(gap, "Canonical indexed history already spans both trusted anchors.");
+            return new ReconnectRepairSummary(true, 0, 0, "Local history already filled the gap.");
+        }
+
+        if (!entry.GapLedger.TryQueue(gap, out gap))
+        {
+            return new ReconnectRepairSummary(true, 0, gap.RecoveredEntries, gap.LastReason);
+        }
+
+        gap = entry.GapLedger.MarkRequesting(gap);
+        var request = ChathistoryRequest.ForBetween(
+            entry.Workspace.Id,
+            generation,
+            gap.Conversation,
+            gap.Target,
+            gap.Older.Reference,
+            gap.Newer.Reference,
+            Math.Min(session.MaximumChathistoryRequestSize, 50));
+        ChathistoryResult result;
+        try
+        {
+            result = await session.RequestHistoryAsync(request).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException exception)
+        {
+            entry.GapLedger.MarkTerminal(gap, HistoryGapRepairState.Failed, exception.Message);
+            return new ReconnectRepairSummary(true, 1, 0, exception.Message);
+        }
+
+        if (result.Request.ConnectionGeneration != generation || session.Snapshot.ConnectionGeneration != generation)
+        {
+            entry.GapLedger.MarkTerminal(gap, HistoryGapRepairState.Stale, "The connection generation changed during exact repair.");
+            return new ReconnectRepairSummary(true, 1, 0, "Stale generation.");
+        }
+
+        if (result.Completion is ChathistoryRequestCompletion.Disconnected or ChathistoryRequestCompletion.Cancelled or ChathistoryRequestCompletion.StaleGeneration)
+        {
+            entry.GapLedger.MarkTerminal(gap, result.Completion == ChathistoryRequestCompletion.Disconnected ? HistoryGapRepairState.Cancelled : HistoryGapRepairState.Stale, result.Failure ?? "The connection ended during exact repair.");
+            return new ReconnectRepairSummary(true, 1, 0, result.Failure);
+        }
+
+        if (!result.Succeeded)
+        {
+            entry.GapLedger.MarkTerminal(gap, result.Completion == ChathistoryRequestCompletion.TimedOut ? HistoryGapRepairState.Exhausted : HistoryGapRepairState.Failed, result.Failure ?? "The exact history request failed.");
+            return new ReconnectRepairSummary(true, 1, 0, result.Failure);
+        }
+
+        var batch = HistoryGapPolicy.ValidateBatch(gap, result);
+        if (!batch.IsSafe)
+        {
+            entry.GapLedger.MarkTerminal(gap, HistoryGapRepairState.Failed, batch.Failure ?? "The exact history response was unsafe.");
+            return new ReconnectRepairSummary(true, 1, 0, batch.Failure);
+        }
+
+        if (result.IsEmpty || result.HistoryEndSignaled)
+        {
+            entry.GapLedger.MarkProgress(gap, batch.Interior.Count, complete: true, result.IsEmpty ? "The exact BETWEEN interval is empty." : "The server supplied explicit end-of-history evidence.");
+            return new ReconnectRepairSummary(true, 1, batch.Interior.Count, null);
+        }
+
+        if (!entry.GapLedger.HasEntryBudget(gap) || !entry.GapLedger.HasRoundBudget(gap))
+        {
+            entry.GapLedger.MarkTerminal(gap, HistoryGapRepairState.Exhausted, "The exact repair budget was reached.");
+            return new ReconnectRepairSummary(true, 1, batch.Interior.Count, "The exact repair budget was reached.");
+        }
+
+        // The draft deliberately leaves response ordering implementation
+        // defined.  Without an explicit end marker, selecting an edge from an
+        // unordered page could skip content.  Retain the valid canonical
+        // playback, but stop unresolved rather than issuing an unsafe repeat.
+        entry.GapLedger.MarkTerminal(gap, HistoryGapRepairState.Exhausted, "The response made progress but supplied no safe pagination evidence.");
+        return new ReconnectRepairSummary(true, 1, batch.Interior.Count, "No explicit pagination evidence.");
+    }
+
+    private async Task<bool> IsGapFilledLocallyAsync(SessionEntry entry, HistoryGap gap)
+    {
+        if (_logStore is null)
+        {
+            return false;
+        }
+
+        var address = new HistoryConversationAddress
+        {
+            NetworkId = gap.NetworkId,
+            ScopeId = entry.Workspace.ProfileId ?? entry.Workspace.Id,
+            ConversationKind = gap.Conversation.StartsWith($"{LogConversationKind.PrivateConversation}:", StringComparison.Ordinal)
+                ? LogConversationKind.PrivateConversation
+                : LogConversationKind.Channel,
+            ConversationName = gap.Target,
+            ConversationKey = gap.Conversation
+        };
+        var contextRequest = gap.Older.ServerMessageId is { Length: > 0 } olderId
+            ? new HistoryContextRequest
+            {
+                Conversation = address,
+                ServerMessageId = olderId,
+                BeforeCount = 0,
+                AfterCount = ConfigurationLimits.MaximumHistoryContextEntries
+            }
+            : gap.Older.Reference.Type == ChathistoryReferenceType.Timestamp
+                && gap.Older.TimestampSource == ConversationTimestampSource.ServerTime
+                ? new HistoryContextRequest
+                {
+                    Conversation = address,
+                    Timestamp = gap.Older.Timestamp,
+                    TimestampDirection = HistoryAnchorDirection.AtOrAfter,
+                    BeforeCount = 0,
+                    AfterCount = ConfigurationLimits.MaximumHistoryContextEntries
+                }
+                : null;
+        if (contextRequest is null)
+        {
+            return false;
+        }
+
+        var context = await _logStore.ReadContextAroundAsync(contextRequest).ConfigureAwait(false);
+        if (!context.IsCompleteLocally)
+        {
+            return false;
+        }
+
+        var ordered = ConversationHistoryOrdering.OrderAscending(context.Records).ToArray();
+        var olderIndex = gap.Older.ServerMessageId is { Length: > 0 } olderMessageId
+            ? Array.FindIndex(ordered, record => string.Equals(record.ServerMessageId, olderMessageId, StringComparison.Ordinal))
+            : Array.FindIndex(ordered, record => record.Timestamp == gap.Older.Timestamp);
+        var newerIndex = gap.Newer.ServerMessageId is { Length: > 0 } newerMessageId
+            ? Array.FindIndex(ordered, record => string.Equals(record.ServerMessageId, newerMessageId, StringComparison.Ordinal))
+            : Array.FindIndex(ordered, record => record.Timestamp == gap.Newer.Timestamp);
+        if (olderIndex < 0 || newerIndex <= olderIndex)
+        {
+            return false;
+        }
+
+        var interior = ordered[(olderIndex + 1)..newerIndex];
+        return interior.Length > 0
+            && interior.All(record =>
+                record.Provenance == ConversationEntryProvenance.ServerPlayback
+                && record.BatchId is { Length: > 0 });
+    }
+
+    private static ChathistoryReference? SelectExactGapReference(
+        ChathistorySupport support,
+        string? serverMessageId,
+        DateTimeOffset timestamp,
+        ConversationTimestampSource timestampSource)
+    {
+        if (support.Supports(ChathistoryReferenceType.MessageId) && serverMessageId is { Length: > 0 })
+        {
+            return ChathistoryReference.MessageId(serverMessageId);
+        }
+
+        return support.Supports(ChathistoryReferenceType.Timestamp) && timestampSource == ConversationTimestampSource.ServerTime
+            ? ChathistoryReference.Timestamp(timestamp)
+            : null;
     }
 
     private async Task RecoverReconnectHistoryAsync(SessionEntry entry, ServerSession session, int generation)
@@ -2465,6 +2796,25 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             if (requests >= MaximumReconnectHistoryRequests || recovered >= MaximumReconnectMessages || session.Snapshot.ConnectionGeneration != generation)
             {
                 break;
+            }
+
+            // A precise reconnect repair needs the first canonical message in
+            // this same conversation.  Give the live path a short bounded
+            // observation window before retaining the old LATEST fallback.
+            var newerBoundary = await WaitForReconnectBoundaryAsync(entry, boundary.Conversation, generation).ConfigureAwait(false);
+            if (newerBoundary is not null)
+            {
+                var exact = await RepairReconnectGapAsync(entry, session, boundary, newerBoundary, generation).ConfigureAwait(false);
+                if (exact.Attempted)
+                {
+                    if (exact.RecoveredEntries > 0)
+                    {
+                        recovered = Math.Min(MaximumReconnectMessages, recovered + exact.RecoveredEntries);
+                    }
+
+                    requests += exact.Requests;
+                    continue;
+                }
             }
 
             var reference = SelectHistoryReference(
@@ -2501,6 +2851,34 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             {
                 break;
             }
+        }
+
+        // Known query identities do not need TARGETS to prove the newer
+        // boundary.  If a routed live message already completed the identity
+        // continuity path, repair that durable query before discovery can
+        // widen the request.
+        var knownQueryBoundaries = entry.ReconnectBoundaries.Values.Where(static boundary => !boundary.IsChannel).Take(MaximumRecoveredQueries).ToArray();
+        foreach (var boundary in knownQueryBoundaries)
+        {
+            if (requests >= MaximumReconnectHistoryRequests || recovered >= MaximumReconnectMessages || session.Snapshot.ConnectionGeneration != generation)
+            {
+                break;
+            }
+
+            var newerBoundary = await WaitForReconnectBoundaryAsync(entry, boundary.Conversation, generation).ConfigureAwait(false);
+            if (newerBoundary is null)
+            {
+                continue;
+            }
+
+            var exact = await RepairReconnectGapAsync(entry, session, boundary, newerBoundary, generation).ConfigureAwait(false);
+            if (!exact.Attempted)
+            {
+                continue;
+            }
+
+            recovered = Math.Min(MaximumReconnectMessages, recovered + exact.RecoveredEntries);
+            requests += exact.Requests;
         }
 
         if (entry.LastDisconnectAt is not null
@@ -2613,6 +2991,36 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                             continue;
                         }
 
+                        // A known query identity is repaired only after a
+                        // canonical post-reconnect message proves that the
+                        // current target still belongs to this durable query.
+                        // TARGETS alone is discovery evidence, not a BETWEEN
+                        // boundary.  If no such live evidence arrives, retain
+                        // the existing bounded LATEST fallback.
+                        if (matchingBoundary is not null)
+                        {
+                            if (entry.GapLedger.Snapshot.Any(gap => string.Equals(gap.Conversation, matchingBoundary.Conversation, StringComparison.Ordinal) && gap.IsTerminal))
+                            {
+                                continue;
+                            }
+
+                            var newerBoundary = await WaitForReconnectBoundaryAsync(entry, matchingBoundary.Conversation, generation).ConfigureAwait(false);
+                            if (newerBoundary is not null)
+                            {
+                                var exact = await RepairReconnectGapAsync(entry, session, matchingBoundary, newerBoundary, generation).ConfigureAwait(false);
+                                if (exact.Attempted)
+                                {
+                                    if (exact.RecoveredEntries > 0)
+                                    {
+                                        recovered = Math.Min(MaximumReconnectMessages, recovered + exact.RecoveredEntries);
+                                    }
+
+                                    requests += exact.Requests;
+                                    continue;
+                                }
+                            }
+                        }
+
                         var isKnownContinuity = matchingBoundary is not null && continuity == QueryContinuityOutcome.ReuseExistingQuery;
                         var reference = isKnownContinuity
                             ? SelectHistoryReference(session.ChathistorySupport, matchingBoundary!.ServerMessageId, matchingBoundary.Timestamp, matchingBoundary.TimestampSource)
@@ -2663,7 +3071,6 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             }
         }
 
-        entry.ReconnectBoundaries.Clear();
         if (recovered > 0 && session.Snapshot.ConnectionGeneration == generation)
         {
             Dispatch(() =>
@@ -2711,6 +3118,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
             entry.Workspace.ApplySnapshot(snapshot);
             RouteSemanticEvent(entry.Workspace, item.Event, snapshot, item.ReceivedAt);
+            SignalReconnectBoundary(entry, session, item.Event, snapshot, item.ReceivedAt);
         }, DispatchCategory(item.Event));
     }
 
@@ -3558,6 +3966,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
         public Dictionary<string, ReconnectHistoryBoundary> ReconnectBoundaries { get; } = new(StringComparer.Ordinal);
 
+        public Dictionary<string, TaskCompletionSource<ReconnectHistoryBoundary>> ReconnectBoundarySignals { get; } = new(StringComparer.Ordinal);
+
+        public HistoryGapLedger GapLedger { get; } = new();
+
         public DateTimeOffset? LastDisconnectAt { get; set; }
     }
 
@@ -3568,5 +3980,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         DateTimeOffset Timestamp,
         ConversationTimestampSource TimestampSource,
         bool IsChannel,
-        Guid ViewId);
+        Guid ViewId,
+        int ConnectionGeneration,
+        long DurableSequence);
+
+    private sealed record ReconnectRepairSummary(bool Attempted, int Requests, int RecoveredEntries, string? Reason)
+    {
+        public static ReconnectRepairSummary NotAttempted { get; } = new(false, 0, 0, null);
+    }
 }
