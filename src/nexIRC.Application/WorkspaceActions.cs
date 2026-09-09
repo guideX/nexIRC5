@@ -23,7 +23,8 @@ public enum WorkspaceActionId
     ReturnToLatest,
     GoToHistoryTimestamp,
     JumpToHistoryMessage,
-    LoadContextAround
+    LoadContextAround,
+    Reply
 }
 
 public enum WorkspaceActionTargetKind
@@ -380,12 +381,158 @@ public sealed class WorkspaceActionRouter
         }
 
         await network.Session.SendCommandAsync("PRIVMSG", [target], text, cancellationToken).ConfigureAwait(false);
-        _sessions.AppendLocal(view, IrcEventPresentation.CreateLocalMessage(
-            network.Session.Snapshot.Nickname,
-            text,
-            isChannel ? OutgoingMessageKind.ChannelMessage : OutgoingMessageKind.PrivateMessage));
+        if (!network.Snapshot.Capabilities.IsEnabled(IrcCapabilityCatalog.EchoMessage))
+        {
+            _sessions.AppendLocal(view, IrcEventPresentation.CreateLocalMessage(
+                network.Session.Snapshot.Nickname,
+                text,
+                isChannel ? OutgoingMessageKind.ChannelMessage : OutgoingMessageKind.PrivateMessage));
+        }
         return CommandDispatchResult.Success($"Message sent to {target}.", view);
     }
+
+    public bool CanReplyTo(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        TranscriptEntry entry,
+        out string? disabledReason)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(view);
+        ArgumentNullException.ThrowIfNull(entry);
+        disabledReason = null;
+        if (network.Id != view.NetworkId || view is not (ChannelView or QueryView))
+        {
+            disabledReason = "The message is not in this network conversation.";
+        }
+        else if (!IsRegistered(network))
+        {
+            disabledReason = "The network is not registered.";
+        }
+        else if (!network.Snapshot.Capabilities.IsEnabled(IrcCapabilityCatalog.MessageTags))
+        {
+            disabledReason = "The server did not negotiate message-tags.";
+        }
+        else if (view is ChannelView channel
+            && (!channel.IsJoined || channel.LifecycleState is ConversationLifecycleState.Parted or ConversationLifecycleState.Kicked or ConversationLifecycleState.Disconnected))
+        {
+            disabledReason = "Join the channel before replying.";
+        }
+        else if (view is QueryView query && !query.IsIdentityBoundToCurrentSession)
+        {
+            disabledReason = "The private-message identity is not bound in the current connection.";
+        }
+        else if (!IrcReplyReference.TryParse(entry.ServerMessageId, out _))
+        {
+            disabledReason = "This message has no valid server msgid.";
+        }
+
+        return disabledReason is null;
+    }
+
+    public bool TryCreateReplyComposer(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        TranscriptEntry entry,
+        out ReplyComposerState? state,
+        out string? disabledReason)
+    {
+        if (!CanReplyTo(network, view, entry, out disabledReason))
+        {
+            state = null;
+            return false;
+        }
+
+        var target = view switch
+        {
+            ChannelView channel => channel.Channel,
+            QueryView query => query.Nickname,
+            _ => string.Empty
+        };
+        state = new ReplyComposerState
+        {
+            NetworkId = network.Id,
+            ViewId = view.Id,
+            ConversationKey = HistoryConversationKey(view),
+            ParentMessageId = entry.ServerMessageId!,
+            ParentSender = entry.Sender,
+            ParentPreview = ReplyText.BoundedPreview(entry.Text),
+            ConnectionGeneration = network.Snapshot.ConnectionGeneration,
+            Target = target
+        };
+        return true;
+    }
+
+    public async ValueTask<CommandDispatchResult> SendReplyAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        ReplyComposerState state,
+        string text,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(view);
+        ArgumentNullException.ThrowIfNull(state);
+        ValidateText(text, "reply");
+        if (state.NetworkId != network.Id
+            || state.ViewId != view.Id
+            || view is not (ChannelView or QueryView)
+            || !string.Equals(state.ConversationKey, HistoryConversationKey(view), StringComparison.Ordinal)
+            || !IrcReplyReference.TryParse(state.ParentMessageId, out var parent))
+        {
+            return CommandDispatchResult.Failure("The reply composer is no longer scoped to this conversation.", view);
+        }
+
+        if (view is ChannelView channel && (!channel.IsJoined || channel.LifecycleState is ConversationLifecycleState.Parted or ConversationLifecycleState.Kicked or ConversationLifecycleState.Disconnected))
+        {
+            return CommandDispatchResult.Failure("Join the channel before replying.", view);
+        }
+
+        if (view is QueryView query && !query.IsIdentityBoundToCurrentSession)
+        {
+            return CommandDispatchResult.Failure("The private-message identity is not bound in the current connection.", view);
+        }
+
+        if (!IsRegistered(network) || !network.Snapshot.Capabilities.IsEnabled(IrcCapabilityCatalog.MessageTags))
+        {
+            return CommandDispatchResult.Failure("Replies are unavailable until the registered server negotiates message-tags.", view);
+        }
+
+        var target = view is ChannelView channelView ? channelView.Channel : ((QueryView)view).Nickname;
+        try
+        {
+            await network.Session.SendReplyAsync(
+                target,
+                text,
+                parent!.MessageId,
+                network.Snapshot.ConnectionGeneration,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException exception)
+        {
+            return CommandDispatchResult.Failure(exception.Message, view);
+        }
+
+        if (!network.Snapshot.Capabilities.IsEnabled(IrcCapabilityCatalog.EchoMessage))
+        {
+            _sessions.AppendLocal(
+                view,
+                IrcEventPresentation.CreateLocalReply(
+                    network.Session.Snapshot.Nickname,
+                    text,
+                    view is ChannelView ? OutgoingMessageKind.ChannelMessage : OutgoingMessageKind.PrivateMessage,
+                    parent.MessageId));
+        }
+
+        return CommandDispatchResult.Success($"Reply sent to {target}.", view);
+    }
+
+    private static string HistoryConversationKey(WorkspaceView view) => view switch
+    {
+        QueryView query => query.HistoryConversationKey,
+        ChannelView channel => ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, channel.Channel),
+        _ => string.Empty
+    };
 
     public async ValueTask<CommandDispatchResult> SendNoticeAsync(NetworkWorkspace network, string target, string text, CancellationToken cancellationToken = default)
     {

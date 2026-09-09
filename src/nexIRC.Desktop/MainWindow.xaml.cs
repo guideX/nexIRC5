@@ -9,6 +9,7 @@ using nexIRC.Application;
 using nexIRC.Core.Networking;
 using nexIRC.Core.State;
 using ContextMenu = System.Windows.Controls.ContextMenu;
+using Button = System.Windows.Controls.Button;
 using ListBox = System.Windows.Controls.ListBox;
 using MenuItem = System.Windows.Controls.MenuItem;
 using MessageBox = System.Windows.MessageBox;
@@ -301,6 +302,13 @@ public partial class MainWindow : Window
 
     private async void OnInputKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
+        if (Keyboard.Modifiers == ModifierKeys.None && e.Key == Key.Escape && ViewModel.IsReplying)
+        {
+            ViewModel.CancelReply();
+            e.Handled = true;
+            return;
+        }
+
         if (Keyboard.Modifiers == ModifierKeys.None && e.Key is Key.Up or Key.Down)
         {
             ViewModel.NavigateInputHistory(e.Key == Key.Up ? InputHistoryDirection.Older : InputHistoryDirection.Newer);
@@ -323,6 +331,14 @@ public partial class MainWindow : Window
 
         e.Handled = true;
         await SubmitInputAsync();
+    }
+
+    private async void OnReplyParentClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: TranscriptEntry entry })
+        {
+            await ViewModel.NavigateReplyParentAsync(entry).ConfigureAwait(true);
+        }
     }
 
     private async Task SubmitInputAsync()
@@ -520,6 +536,35 @@ public partial class MainWindow : Window
         }
 
         var source = e.OriginalSource as DependencyObject;
+
+        var transcriptItem = FindAncestor<ListBoxItem>(source);
+        if (transcriptItem?.DataContext is TranscriptEntry transcriptEntry
+            && FindAncestor<ListBox>(transcriptItem)?.DataContext is WorkspaceView transcriptView
+            && transcriptView is ChannelView or QueryView
+            && ViewModel.Sessions.TryGet(transcriptView.NetworkId, out var transcriptNetwork)
+            && transcriptNetwork is not null)
+        {
+            ViewModel.SelectView(transcriptView);
+            var canReply = ViewModel.Actions.CanReplyTo(transcriptNetwork, transcriptView, transcriptEntry, out var replyReason);
+            var canShowOriginal = transcriptEntry.ReplyResolution == ReplyResolutionState.ResolvedLocally
+                || ViewModel.Sessions.CanRecoverReplyParent(transcriptNetwork, transcriptView);
+            var originalReason = canShowOriginal
+                ? null
+                : "The parent message is not in local history and remote history is unavailable.";
+            var actions = new List<ContextMenuAction>
+            {
+                new("Reply", () =>
+                {
+                    ViewModel.BeginReply(transcriptEntry);
+                    return Task.CompletedTask;
+                }, canReply, replyReason),
+                new("Show original", () => ViewModel.NavigateReplyParentAsync(transcriptEntry), transcriptEntry.HasReplyRelationship && canShowOriginal, originalReason)
+            };
+            OpenContextMenu(transcriptItem, actions, "MessageContextMenu");
+            e.Handled = true;
+            return;
+        }
+
         var treeItem = FindAncestor<TreeViewItem>(source);
         if (treeItem?.DataContext is NetworkWorkspace network)
         {

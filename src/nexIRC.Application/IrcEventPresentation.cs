@@ -1,4 +1,5 @@
 using nexIRC.Core.Session;
+using nexIRC.Core.Protocol;
 
 namespace nexIRC.Application;
 
@@ -32,6 +33,10 @@ public static class IrcEventPresentation
             IrcCtcpEvent ctcp => Entry(TranscriptEntryKind.Ctcp, ctcp.Message.Prefix?.Name, FormatCtcp(ctcp.Command, ctcp.Arguments)),
             IrcPrivmsgEvent message when message.IsNotice => Entry(TranscriptEntryKind.Notice, message.Message.Prefix?.Name, message.Text),
             IrcPrivmsgEvent message => Entry(TranscriptEntryKind.Message, message.Message.Prefix?.Name, message.Text),
+            IrcQueryMessageEvent query when IrcIdentity.Equals(query.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping)
+                && query.IsNotice => Entry(TranscriptEntryKind.OutgoingNotice, query.Nickname, query.Text),
+            IrcQueryMessageEvent query when IrcIdentity.Equals(query.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping)
+                => Entry(TranscriptEntryKind.OutgoingPrivateMessage, query.Nickname, query.Text),
             IrcQueryMessageEvent query when query.IsNotice => Entry(TranscriptEntryKind.Notice, query.Nickname, query.Text),
             IrcQueryMessageEvent query => Entry(TranscriptEntryKind.Message, query.Nickname, query.Text),
             IrcTopicEvent topic => Entry(TranscriptEntryKind.Topic, topic.Setter ?? topic.Message.Prefix?.Name, $"set topic in {topic.Channel}: {topic.Topic}"),
@@ -73,7 +78,8 @@ public static class IrcEventPresentation
                 TimestampSource = semanticEvent.Message.ServerTimestamp.HasValue
                     ? ConversationTimestampSource.ServerTime
                     : ConversationTimestampSource.LegacyOrLocalReceiveTime,
-                BatchId = semanticEvent.Message.BatchId
+                BatchId = semanticEvent.Message.BatchId,
+                ReplyParentMessageId = semanticEvent.Message.ReplyParentMessageId
             };
     }
 
@@ -88,6 +94,9 @@ public static class IrcEventPresentation
             OutgoingMessageKind.Notice => TranscriptEntryKind.OutgoingNotice,
             _ => TranscriptEntryKind.OutgoingMessage
         }, sender, text);
+
+    public static TranscriptEntry CreateLocalReply(string sender, string text, OutgoingMessageKind kind, string parentMessageId) =>
+        CreateLocalMessage(sender, text, kind) with { ReplyParentMessageId = IrcReplyReference.Create(parentMessageId).MessageId };
 
     public static TranscriptEntry CreateLocalCommand(string text) => Entry(TranscriptEntryKind.System, null, text);
 

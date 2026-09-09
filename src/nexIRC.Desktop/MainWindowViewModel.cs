@@ -26,6 +26,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private readonly Dictionary<Guid, MemorySaslCredentialProvider> _sessionCredentials = [];
     private readonly Dictionary<Guid, MemoryServerPasswordProvider> _sessionServerPasswords = [];
     private readonly Dictionary<(Guid NetworkId, Guid ViewId), string> _drafts = [];
+    private ReplyComposerState? _replyComposer;
 
     public MainWindowViewModel(
         IIrcTransportFactory transportFactory,
@@ -76,6 +77,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         PreviousHighlightCommand = new RelayCommand(() => { Sessions.NavigatePreviousHighlight(); }, () => Sessions.Networks.Count > 0);
         BackConversationCommand = new RelayCommand(() => { Sessions.NavigateBack(); }, () => Sessions.Networks.Count > 0);
         ForwardConversationCommand = new RelayCommand(() => { Sessions.NavigateForward(); }, () => Sessions.Networks.Count > 0);
+        CancelReplyCommand = new RelayCommand(() => CancelReply(), () => IsReplying);
         ExitCommand = new RelayCommand(() => ExitRequested?.Invoke());
 
         HighlightPolicy.PropertyChanged += (_, _) => SavePreferencesInBackground();
@@ -87,6 +89,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 foreach (var oldNetwork in args.OldItems.OfType<NetworkWorkspace>())
                 {
                     RemoveDraftsForNetwork(oldNetwork.Id);
+                    if (_replyComposer?.NetworkId == oldNetwork.Id)
+                    {
+                        ClearReplyComposer(updateStatus: false);
+                    }
                 }
             }
 
@@ -152,6 +158,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         get => _statusText;
         internal set => SetProperty(ref _statusText, value);
     }
+
+    public ReplyComposerState? ReplyComposer => _replyComposer;
+
+    public bool IsReplying => _replyComposer is not null;
+
+    public string ReplyBannerText => _replyComposer?.AccessibleText ?? string.Empty;
 
     public bool IsNetworkTreeVisible
     {
@@ -224,6 +236,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public ICommand BackConversationCommand { get; }
 
     public ICommand ForwardConversationCommand { get; }
+
+    public ICommand CancelReplyCommand { get; }
 
     public ICommand ExitCommand { get; }
 
@@ -705,6 +719,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
 
         SaveDraft();
+        if (_replyComposer is { } reply
+            && (reply.NetworkId != view.NetworkId || reply.ViewId != view.Id))
+        {
+            ClearReplyComposer(updateStatus: false);
+        }
         Sessions.ActivateView(view.Id);
         if (!ReferenceEquals(Sessions.ActiveView, view))
         {
@@ -730,6 +749,30 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
+        var reply = _replyComposer;
+        if (reply is not null && input[0] != '/')
+        {
+            InputText = string.Empty;
+            InputHistory.Submit(input);
+            if (ActiveView is null || !Sessions.TryGet(reply.NetworkId, out var replyNetwork) || replyNetwork is null)
+            {
+                StatusText = "The reply conversation is no longer available.";
+                return;
+            }
+
+            var replyResult = await Actions.SendReplyAsync(replyNetwork, ActiveView, reply, input).ConfigureAwait(true);
+            StatusText = replyResult.Message;
+            if (replyResult.Succeeded)
+            {
+                ClearReplyComposer(updateStatus: false);
+            }
+            if (replyResult.View is not null)
+            {
+                SelectView(replyResult.View);
+            }
+            return;
+        }
+
         InputText = string.Empty;
         InputHistory.Submit(input);
         var result = await _commands.DispatchAsync(Sessions.ActiveNetwork, ActiveView, input).ConfigureAwait(true);
@@ -747,6 +790,54 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     }
 
     public void PrepareInput(string text) => InputText = text;
+
+    public bool BeginReply(TranscriptEntry entry)
+    {
+        string? reason = null;
+        if (ActiveView is null)
+        {
+            StatusText = "Replies are unavailable without an active conversation.";
+            return false;
+        }
+
+        if (!Sessions.TryGet(ActiveView.NetworkId, out var network) || network is null
+            || !Actions.TryCreateReplyComposer(network, ActiveView, entry, out var state, out reason))
+        {
+            StatusText = reason ?? "Replies are unavailable for this message.";
+            return false;
+        }
+
+        _replyComposer = state;
+        OnPropertyChanged(nameof(ReplyComposer));
+        OnPropertyChanged(nameof(IsReplying));
+        OnPropertyChanged(nameof(ReplyBannerText));
+        RefreshCommandStates();
+        StatusText = state!.BannerText;
+        return true;
+    }
+
+    public void CancelReply()
+    {
+        if (_replyComposer is not null)
+        {
+            ClearReplyComposer(updateStatus: true);
+        }
+    }
+
+    public async Task<HistoryNavigationResult?> NavigateReplyParentAsync(TranscriptEntry entry, CancellationToken cancellationToken = default)
+    {
+        if (ActiveView is null
+            || !Sessions.TryGet(ActiveView.NetworkId, out var network)
+            || network is null)
+        {
+            StatusText = "The reply conversation is no longer available.";
+            return null;
+        }
+
+        var result = await Sessions.NavigateReplyParentAsync(network, ActiveView, entry, cancellationToken).ConfigureAwait(true);
+        StatusText = result.Message;
+        return result;
+    }
 
     public ParticipantActionContext CreateParticipantContext(NetworkWorkspace network, ChannelView channel, ChannelMemberView member) =>
         new(network, channel, member, network.Channels.Where(candidate => candidate.IsJoined).ToArray());
@@ -916,6 +1007,24 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         _drafts[(ActiveView.NetworkId, ActiveView.Id)] = InputText[..Math.Min(InputText.Length, ConfigurationLimits.MaximumDraftLength)];
     }
 
+    private void ClearReplyComposer(bool updateStatus)
+    {
+        if (_replyComposer is null)
+        {
+            return;
+        }
+
+        _replyComposer = null;
+        OnPropertyChanged(nameof(ReplyComposer));
+        OnPropertyChanged(nameof(IsReplying));
+        OnPropertyChanged(nameof(ReplyBannerText));
+        if (updateStatus)
+        {
+            StatusText = "Reply canceled.";
+        }
+        RefreshCommandStates();
+    }
+
     private void RemoveDraftsForNetwork(Guid networkId)
     {
         foreach (var key in _drafts.Keys.Where(key => key.NetworkId == networkId).ToArray())
@@ -1064,6 +1173,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         (PreviousHighlightCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
         (BackConversationCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
         (ForwardConversationCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
+        (CancelReplyCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
     }
 
     private abstract class RelayCommandBase : ICommand

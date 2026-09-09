@@ -22,7 +22,7 @@ public enum ConversationTimestampSource
 
 public static class ConversationHistorySchema
 {
-    public const int CurrentVersion = 2;
+    public const int CurrentVersion = 3;
 }
 
 /// <summary>
@@ -227,6 +227,7 @@ public static class ConversationHistoryProjection
             record.ReceivedAt)
         {
             ServerMessageId = record.ServerMessageId,
+            ReplyParentMessageId = record.ReplyParentMessageId,
             Provenance = provenance,
             TimestampSource = record.TimestampSource,
             BatchId = record.BatchId

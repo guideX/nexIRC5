@@ -81,6 +81,64 @@ public sealed class IrcMessageTag
     public bool HasValue => RawValue is not null;
 }
 
+/// <summary>
+/// The opaque server message id carried by the ratified IRCv3 <c>+reply</c>
+/// client tag.  It is deliberately not normalized: ids are case-sensitive,
+/// network-scoped, and have no ordering semantics.
+/// </summary>
+public sealed record IrcReplyReference
+{
+    public const int MaximumMessageIdLength = 256;
+
+    private IrcReplyReference(string messageId)
+    {
+        MessageId = messageId;
+    }
+
+    public string MessageId { get; }
+
+    public static IrcReplyReference Create(string messageId)
+    {
+        if (!TryParse(messageId, out var reference, out var error))
+        {
+            throw new ArgumentException(error ?? "The reply parent msgid is invalid.", nameof(messageId));
+        }
+
+        return reference!;
+    }
+
+    public static bool TryParse(string? messageId, out IrcReplyReference? reference, out string? error)
+    {
+        if (string.IsNullOrEmpty(messageId))
+        {
+            reference = null;
+            error = "The +reply tag must contain a non-empty parent msgid.";
+            return false;
+        }
+
+        if (messageId.Length > MaximumMessageIdLength)
+        {
+            reference = null;
+            error = $"The +reply parent msgid exceeds {MaximumMessageIdLength} characters.";
+            return false;
+        }
+
+        if (messageId.Any(static character => char.IsWhiteSpace(character) || char.IsControl(character) || character == '\0'))
+        {
+            reference = null;
+            error = "The +reply parent msgid contains whitespace or a control character.";
+            return false;
+        }
+
+        reference = new IrcReplyReference(messageId);
+        error = null;
+        return true;
+    }
+
+    public static bool TryParse(string? messageId, out IrcReplyReference? reference) =>
+        TryParse(messageId, out reference, out _);
+}
+
 public sealed class IrcMessage
 {
     internal IrcMessage(
@@ -112,6 +170,18 @@ public sealed class IrcMessage
                 ? parsedTimestamp
                 : null;
         ServerMessageId = IrcMessageIdentity.FindServerMessageId(TagValues);
+        HasReplyTag = TagValues.ContainsKey("+reply");
+        if (TagValues.TryGetValue("+reply", out var replyValue))
+        {
+            if (IrcReplyReference.TryParse(replyValue, out var replyReference, out var replyError))
+            {
+                ReplyReference = replyReference;
+            }
+            else
+            {
+                ReplyValidationError = replyError;
+            }
+        }
         BatchId = TagValues.TryGetValue("batch", out var batch)
             && !string.IsNullOrWhiteSpace(batch)
             && batch.Length <= 65
@@ -154,6 +224,20 @@ public sealed class IrcMessage
     /// must not manufacture an authoritative identity from message content.
     /// </summary>
     public string? ServerMessageId { get; }
+
+    /// <summary>Whether the message carried the exact <c>+reply</c> tag.</summary>
+    public bool HasReplyTag { get; }
+
+    /// <summary>
+    /// A validated opaque parent msgid. Invalid metadata does not invalidate
+    /// the IRC message; callers can inspect <see cref="ReplyValidationError" />
+    /// for a diagnostic instead.
+    /// </summary>
+    public IrcReplyReference? ReplyReference { get; }
+
+    public string? ReplyValidationError { get; }
+
+    public string? ReplyParentMessageId => ReplyReference?.MessageId;
 
     /// <summary>The IRCv3 batch association tag, when present.</summary>
     public string? BatchId { get; }

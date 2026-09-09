@@ -110,6 +110,7 @@ public enum CapabilityNegotiationStatus
 public static class IrcCapabilityCatalog
 {
     public const string MessageTags = "message-tags";
+    public const string EchoMessage = "echo-message";
     public const string Batch = "batch";
     public const string ServerTime = "server-time";
     public const string Chathistory = "draft/chathistory";
@@ -123,7 +124,7 @@ public static class IrcCapabilityCatalog
     public const string Sasl = "sasl";
 
     public static IReadOnlyList<string> PreferredPhase1V { get; } =
-    [MessageTags, ServerTime, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
+    [MessageTags, EchoMessage, ServerTime, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
 
     /// <summary>
     /// Phase 1X's history path is opt-in as a group: a server must ACK the
@@ -131,10 +132,10 @@ public static class IrcCapabilityCatalog
     /// the application can issue a history request.
     /// </summary>
     public static IReadOnlyList<string> PreferredPhase1X { get; } =
-    [MessageTags, ServerTime, Batch, Chathistory, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
+    [MessageTags, EchoMessage, ServerTime, Batch, Chathistory, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
 
     public static IReadOnlyList<string> PreferredPhase1Y { get; } =
-    [MessageTags, ServerTime, Batch, Chathistory, EventPlayback, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
+    [MessageTags, EchoMessage, ServerTime, Batch, Chathistory, EventPlayback, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
 
     public static IReadOnlySet<string> Known { get; } =
         new HashSet<string>(PreferredPhase1Y.Concat([AccountTag, Sasl]), StringComparer.Ordinal);

@@ -53,6 +53,8 @@ public sealed record ConversationLogRecord
     /// hash of message content because repeated no-id messages are valid.
     /// </summary>
     public string? ServerMessageId { get; init; }
+    /// <summary>Opaque, case-sensitive server msgid referenced by +reply.</summary>
+    public string? ReplyParentMessageId { get; init; }
     /// <summary>
     /// Locally allocated ordering value, scoped to NetworkId and conversation.
     /// It is not a server identity and is never used to claim replay equality.
@@ -74,6 +76,7 @@ internal static class ConversationLogRecordValidation
         && record.ConversationName is not null
         && record.ConversationKey is not null
         && (record.ServerMessageId is null || record.ServerMessageId.Length <= 256)
+        && (record.ReplyParentMessageId is null || record.ReplyParentMessageId.Length <= 256)
         && (record.BatchId is null || record.BatchId.Length <= 256);
 }
 
@@ -204,6 +207,8 @@ public sealed record ConversationLogSearchResult
     public string Snippet => Preview;
 
     public string? ServerMessageId => Record.ServerMessageId;
+
+    public string? ReplyParentMessageId => Record.ReplyParentMessageId;
 
     public long DurableSequence => Record.DurableSequence;
 
@@ -379,6 +384,7 @@ public sealed class ConversationLoggingService
             Text = text,
             IsHighlight = entry.IsHighlight,
             ServerMessageId = entry.ServerMessageId,
+            ReplyParentMessageId = entry.ReplyParentMessageId,
             Provenance = entry.Provenance,
             TimestampSource = entry.TimestampSource,
             BatchId = entry.BatchId

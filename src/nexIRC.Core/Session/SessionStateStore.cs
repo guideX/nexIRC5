@@ -583,15 +583,18 @@ internal sealed class SessionStateStore
         {
             events.Add(new IrcPrivmsgEvent(message, target, text, isNotice));
         }
-        if (!IsChannelTarget(target, features.ChannelTypes) && !string.IsNullOrEmpty(message.Prefix?.Name) && !NamesEqual(message.Prefix.Name, _nickname, features.CaseMapping))
+        if (!IsChannelTarget(target, features.ChannelTypes) && !string.IsNullOrEmpty(message.Prefix?.Name))
         {
-            var query = _queries.TryGetValue(NameKey(message.Prefix.Name), out var existing)
+            var queryNickname = NamesEqual(message.Prefix.Name, _nickname, features.CaseMapping)
+                ? target
+                : message.Prefix.Name;
+            var query = _queries.TryGetValue(NameKey(queryNickname), out var existing)
                 ? existing
-                : (_queries[NameKey(message.Prefix.Name)] = new MutableQuery(message.Prefix.Name, _connectionGeneration));
+                : (_queries[NameKey(queryNickname)] = new MutableQuery(queryNickname, _connectionGeneration));
             query.Messages.Add(TryParseCtcp(text, out var command, out var arguments) ? $"[CTCP {command}{(arguments.Length == 0 ? string.Empty : $" {arguments}")}]" : text);
             if (!TryParseCtcp(text, out _, out _))
             {
-                events.Add(new IrcQueryMessageEvent(message, message.Prefix.Name, text, isNotice));
+                events.Add(new IrcQueryMessageEvent(message, queryNickname, text, isNotice));
             }
         }
     }

@@ -24,6 +24,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private readonly bool _ownsLogStore;
     private readonly IrcOperationTimeoutPolicy _operationTimeouts;
     private readonly object _disposeGate = new();
+    private readonly object _replyNavigationGate = new();
+    private readonly Dictionary<string, Task<HistoryNavigationResult>> _replyNavigationTasks = new(StringComparer.Ordinal);
     private long _operationSequence;
     private long _activitySequence;
     private long _staleGenerationEventsDiscarded;
@@ -445,6 +447,101 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 HistoryNavigationOutcome.Failed,
                 error));
 
+    /// <summary>
+    /// Resolves a reply parent through the same exact local-index and bounded
+    /// CHATHISTORY AROUND path used by ordinary history navigation. The task
+    /// key includes network, durable conversation, and the opaque parent id.
+    /// </summary>
+    public ValueTask<HistoryNavigationResult> NavigateReplyParentAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        TranscriptEntry reply,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(view);
+        ArgumentNullException.ThrowIfNull(reply);
+        if (network.Id != view.NetworkId
+            || view is not (ChannelView or QueryView)
+            || !IrcReplyReference.TryParse(reply.ReplyParentMessageId, out _))
+        {
+            var invalidRequest = new HistoryNavigationRequest
+            {
+                Conversation = new HistoryConversationAddress
+                {
+                    NetworkId = network.Id,
+                    ScopeId = network.ProfileId ?? network.Id,
+                    ConversationKind = LogConversationKind.PrivateConversation,
+                    ConversationName = view.Title,
+                    ConversationKey = view.Id.ToString("N", System.Globalization.CultureInfo.InvariantCulture)
+                },
+                ServerMessageId = reply.ReplyParentMessageId
+            };
+            return ValueTask.FromResult(HistoryNavigationResult.Create(
+                invalidRequest,
+                HistoryNavigationOutcome.Failed,
+                "This message does not contain a valid reply parent reference."));
+        }
+
+        var request = HistoryNavigationRequest.ForMessage(
+            HistoryAddress(network, view),
+            reply.ReplyParentMessageId!);
+
+        var key = string.Create(
+            System.Globalization.CultureInfo.InvariantCulture,
+            $"{network.Id:N}\0{HistoryConversation(view)}\0{reply.ReplyParentMessageId}");
+        lock (_replyNavigationGate)
+        {
+            if (_replyNavigationTasks.TryGetValue(key, out var existing) && !existing.IsCompleted)
+            {
+                return new ValueTask<HistoryNavigationResult>(existing);
+            }
+
+            var task = NavigateHistoryAsync(network, view, request, cancellationToken).AsTask();
+            _replyNavigationTasks[key] = task;
+            _ = RetireReplyNavigationAsync(key, task);
+            return new ValueTask<HistoryNavigationResult>(task);
+        }
+    }
+
+    public bool CanRecoverReplyParent(NetworkWorkspace network, WorkspaceView view)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(view);
+        if (network.Id != view.NetworkId || view is not (ChannelView or QueryView))
+        {
+            return false;
+        }
+
+        if (_logStore is not null)
+        {
+            return true;
+        }
+
+        return network.Snapshot.Registration == RegistrationState.Registered
+            && network.Session.ChathistorySupport.IsUsable
+            && SelectHistoryTarget(view) is not null;
+    }
+
+    private async Task RetireReplyNavigationAsync(string key, Task<HistoryNavigationResult> task)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        catch
+        {
+        }
+
+        lock (_replyNavigationGate)
+        {
+            if (_replyNavigationTasks.TryGetValue(key, out var current) && ReferenceEquals(current, task))
+            {
+                _replyNavigationTasks.Remove(key);
+            }
+        }
+    }
+
     public ValueTask<HistoryNavigationResult> JumpToHistoryTimestampAsync(
         NetworkWorkspace network,
         WorkspaceView view,
@@ -845,6 +942,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             () =>
             {
                 view.ReplaceHistoryWindow(context.Records, ConversationEntryProvenance.LocalHistory, context.Anchor.Anchor?.Record);
+                view.RefreshReplyRelationships(CanRecoverReplyParent(network, view));
                 view.EnterHistoryView();
                 var key = HistoryCoverageKey.Create(network.Id, HistoryConversation(view));
                 var ledger = GetEntry(network.Id).CoverageLedger;
@@ -2424,6 +2522,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         {
             entry = entry with { Provenance = ConversationEntryProvenance.Live };
             view.AppendConversationEntry(entry, updateLastActivity: false);
+            view.RefreshReplyRelationships(CanRecoverReplyParent(workspace, view));
             _logging?.Record(workspace.Id, workspace.ProfileId, view, entry);
         }
 
@@ -4567,7 +4666,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         var isOwnMessage = semanticEvent switch
         {
             IrcPrivmsgEvent message => IrcIdentity.Equals(message.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping),
-            IrcQueryMessageEvent query => IrcIdentity.Equals(query.Nickname, snapshot.Nickname, snapshot.Features.CaseMapping),
+            IrcQueryMessageEvent query => IrcIdentity.Equals(query.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping),
             IrcCtcpEvent ctcp => IrcIdentity.Equals(ctcp.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping),
             _ => false
         };
@@ -4611,6 +4710,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         {
             return;
         }
+        view.RefreshReplyRelationships(CanRecoverReplyParent(workspace, view));
         if (entry.IsHighlight && !isResynchronization && !isHistorical)
         {
             view.MarkHighlight();
@@ -4755,6 +4855,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             Text = entry.Text,
             IsHighlight = entry.IsHighlight,
             ServerMessageId = entry.ServerMessageId,
+            ReplyParentMessageId = entry.ReplyParentMessageId,
             Provenance = entry.Provenance,
             TimestampSource = entry.TimestampSource,
             BatchId = entry.BatchId

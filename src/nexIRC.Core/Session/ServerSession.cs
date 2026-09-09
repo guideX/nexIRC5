@@ -416,6 +416,48 @@ public sealed class ServerSession : IAsyncDisposable
         await QueueOutboundAsync(message, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Sends a PRIVMSG carrying the IRCv3 +reply relationship. The capability
+    /// and connection-generation checks happen at the same boundary as the
+    /// outbound writer selection, so a reconnect cannot leak a stale reply.
+    /// </summary>
+    public async ValueTask SendReplyAsync(
+        string target,
+        string text,
+        string parentMessageId,
+        int? expectedConnectionGeneration = null,
+        CancellationToken cancellationToken = default)
+    {
+        IrcOutboundMessage message;
+        ConnectionEpoch epoch;
+        lock (_gate)
+        {
+            if (_registration != RegistrationState.Registered || _activeEpoch is not { IsActive: true } currentEpoch)
+            {
+                throw new InvalidOperationException("The IRC session is not registered.");
+            }
+
+            if (expectedConnectionGeneration is int expected && expected != currentEpoch.Generation)
+            {
+                throw new InvalidOperationException("The reply belongs to a stale connection generation.");
+            }
+
+            if (!_capabilities.Snapshot.IsEnabled(IrcCapabilityCatalog.MessageTags))
+            {
+                throw new InvalidOperationException("The server did not negotiate message-tags; replies are unavailable.");
+            }
+
+            message = IrcReplyCommandBuilder.Build(
+                new IrcCommandBuilder(_options.MaximumOutboundLineBytes),
+                target,
+                text,
+                parentMessageId);
+            epoch = currentEpoch;
+        }
+
+        await QueueOutboundAsync(message, cancellationToken, epoch).ConfigureAwait(false);
+    }
+
     public async ValueTask DisconnectAsync(string? reason = null)
     {
         Task? runTask;

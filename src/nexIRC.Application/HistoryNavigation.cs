@@ -55,7 +55,7 @@ public sealed record HistoryNavigationRequest
     public static HistoryNavigationRequest ForMessage(HistoryConversationAddress conversation, string serverMessageId) => new()
     {
         Conversation = conversation,
-        ServerMessageId = serverMessageId?.Trim()
+        ServerMessageId = serverMessageId
     };
 
     public static HistoryNavigationRequest ForTimestamp(

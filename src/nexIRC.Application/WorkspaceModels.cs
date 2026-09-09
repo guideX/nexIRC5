@@ -113,6 +113,28 @@ public sealed record TranscriptEntry(
     /// <summary>Durable server identity when IRC supplied one.</summary>
     public string? ServerMessageId { get; init; }
 
+    /// <summary>Opaque server msgid referenced by the IRCv3 +reply tag.</summary>
+    public string? ReplyParentMessageId { get; init; }
+
+    public bool HasReplyRelationship => ReplyParentMessageId is not null;
+
+    public ReplyResolutionState ReplyResolution { get; init; } = ReplyResolutionState.Unresolved;
+
+    public string? ReplyParentSender { get; init; }
+
+    public string? ReplyParentPreview { get; init; }
+
+    public string ReplyIndicatorText => ReplyResolution switch
+    {
+        ReplyResolutionState.ResolvedLocally => $"↪ {ReplyParentSender}: {ReplyParentPreview}",
+        ReplyResolutionState.RecoverableRemotely => "↪ Show original",
+        ReplyResolutionState.Unavailable => "↪ Original unavailable",
+        ReplyResolutionState.AmbiguousOrInvalid => "↪ Invalid reply reference",
+        _ => "↪ Reply to an earlier message"
+    };
+
+    public bool CanRecoverReplyParent => ReplyResolution == ReplyResolutionState.RecoverableRemotely;
+
     /// <summary>Origin used by the shared history/transcript boundary.</summary>
     public ConversationEntryProvenance Provenance { get; init; } = ConversationEntryProvenance.Live;
 
@@ -603,6 +625,7 @@ public abstract class WorkspaceView : ObservableObject
                     HasNewerLiveMessages = true;
                 }
 
+                RefreshReplyRelationships();
                 return true;
             }
 
@@ -635,6 +658,8 @@ public abstract class WorkspaceView : ObservableObject
         {
             HasNewerLiveMessages = true;
         }
+
+        RefreshReplyRelationships();
 
         return true;
     }
@@ -717,6 +742,7 @@ public abstract class WorkspaceView : ObservableObject
                 }
             }
 
+            RefreshReplyRelationships();
             return accepted.Length;
         }
     }
@@ -745,6 +771,7 @@ public abstract class WorkspaceView : ObservableObject
         }
 
         NavigationAnchor = anchorEntry is null ? null : anchorEntry with { IsNavigationAnchor = true };
+        RefreshReplyRelationships();
     }
 
     internal void SetNavigationAnchor(ConversationLogRecord? anchor)
@@ -821,6 +848,61 @@ public abstract class WorkspaceView : ObservableObject
 
         OnPropertyChanged(nameof(HistoryCoverage));
         OnPropertyChanged(nameof(OlderHistoryStatus));
+    }
+
+    internal void RefreshReplyRelationships(bool canRecoverRemotely = false)
+    {
+        lock (_entriesGate)
+        {
+            var parents = Entries
+                .Where(entry => entry.ServerMessageId is { Length: > 0 })
+                .ToDictionary(entry => entry.ServerMessageId!, StringComparer.Ordinal);
+            for (var index = 0; index < Entries.Count; index++)
+            {
+                var entry = Entries[index];
+                if (entry.ReplyParentMessageId is not { } parentId)
+                {
+                    continue;
+                }
+
+                var state = ReplyResolutionState.Unresolved;
+                string? sender = null;
+                string? preview = null;
+                if (!IrcReplyReference.TryParse(parentId, out _))
+                {
+                    state = ReplyResolutionState.AmbiguousOrInvalid;
+                }
+                else if (string.Equals(entry.ServerMessageId, parentId, StringComparison.Ordinal))
+                {
+                    state = ReplyResolutionState.AmbiguousOrInvalid;
+                }
+                else if (parents.TryGetValue(parentId, out var parent))
+                {
+                    state = ReplyResolutionState.ResolvedLocally;
+                    sender = parent.Sender;
+                    preview = ReplyText.BoundedPreview(parent.Text);
+                }
+                else if (canRecoverRemotely)
+                {
+                    state = ReplyResolutionState.RecoverableRemotely;
+                }
+                else
+                {
+                    state = ReplyResolutionState.Unavailable;
+                }
+
+                var updated = entry with
+                {
+                    ReplyResolution = state,
+                    ReplyParentSender = sender,
+                    ReplyParentPreview = preview
+                };
+                if (!Equals(updated, entry))
+                {
+                    Entries[index] = updated;
+                }
+            }
+        }
     }
 
     private static int CompareTranscriptEntries(TranscriptEntry left, TranscriptEntry right)

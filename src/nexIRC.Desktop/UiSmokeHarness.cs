@@ -42,6 +42,8 @@ internal static class UiSmokeHarness
         "history-integrity",
         "history-discovery",
         "history-identity",
+        "message-reply",
+        "missing-parent",
         "contextual-actions",
         "sustained-interactivity",
         "close-idle",
@@ -152,6 +154,12 @@ internal static class UiSmokeHarness
                 break;
             case "history-identity":
                 await HistoryIdentityAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "message-reply":
+                await MessageReplyAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "missing-parent":
+                await MissingParentAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
             case "contextual-actions":
                 await ContextualActionsAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -1367,6 +1375,88 @@ internal static class UiSmokeHarness
         Console.WriteLine($"HISTORY_IDENTITY_UI_METRICS queries={network.Queries.Count} context={query.HistoryContext.Count} account_reuse=true conflict_separate=true historical_firewall=true unread_unchanged=true");
     }
 
+    private static async Task MessageReplyAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var viewModel = window.ViewModel;
+        var sessions = viewModel.Sessions;
+        var channel = RequiredChannel(network);
+        viewModel.SelectView(channel);
+
+        demo.AlphaTransport.EnqueueInboundLine("@msgid=A :Alex!demo@alpha.server PRIVMSG #general :Original message");
+        await WaitForAsync(sessions, () => channel.EntriesSnapshot.Any(entry => entry.ServerMessageId == "A"), "reply smoke parent did not arrive").ConfigureAwait(true);
+        var parent = channel.EntriesSnapshot.Single(entry => entry.ServerMessageId == "A");
+        Require(viewModel.BeginReply(parent), "Reply action was not enabled for a canonical channel message");
+        Require(viewModel.IsReplying && viewModel.ReplyBannerText.Contains("Alex", StringComparison.Ordinal) && viewModel.ReplyBannerText.Contains("Original message", StringComparison.Ordinal), "reply composer banner did not expose the bounded parent context");
+
+        viewModel.InputText = "This is my reply";
+        await viewModel.SubmitInputAsync().ConfigureAwait(true);
+        await WaitForPollingAsync(
+            () => demo.AlphaTransport.OutboundLines.Count(line => line.Contains("+reply=A", StringComparison.Ordinal) && line.Contains("PRIVMSG #general", StringComparison.Ordinal)) == 1,
+            "reply smoke did not send exactly one tagged PRIVMSG").ConfigureAwait(true);
+        Require(!viewModel.IsReplying, "reply mode did not clear after the send was accepted");
+
+        demo.AlphaTransport.EnqueueInboundLine("@msgid=B;+reply=A :nexAlpha!demo@alpha.server PRIVMSG #general :This is my reply");
+        await WaitForAsync(sessions, () => channel.EntriesSnapshot.Any(entry => entry.ServerMessageId == "B"), "reply smoke canonical echo did not arrive").ConfigureAwait(true);
+        var reply = channel.EntriesSnapshot.Single(entry => entry.ServerMessageId == "B");
+        Require(reply.ReplyParentMessageId == "A" && reply.ReplyResolution == ReplyResolutionState.ResolvedLocally, "canonical echo did not preserve and resolve B to A");
+        Require(channel.EntriesSnapshot.Count(entry => entry.ServerMessageId is "A" or "B") == 2, "canonical echo produced a duplicate visible reply");
+
+        var outboundBeforeNavigation = demo.AlphaTransport.OutboundLines.Count;
+        var navigation = await viewModel.NavigateReplyParentAsync(reply).ConfigureAwait(true);
+        Require(navigation?.IsExact == true && channel.NavigationAnchor?.ServerMessageId == "A", "resolved reply parent did not use canonical local navigation");
+        Require(demo.AlphaTransport.OutboundLines.Count == outboundBeforeNavigation, "local reply parent navigation issued IRC traffic");
+
+        await sessions.LogStore!.FlushAsync().ConfigureAwait(true);
+        var search = await viewModel.SearchLogsDetailedAsync(new ConversationLogQuery
+        {
+            Scope = ConversationLogSearchScope.CurrentConversation,
+            HistoryScopeId = network.ProfileId ?? network.Id,
+            NetworkId = network.Id,
+            ConversationKind = LogConversationKind.Channel,
+            ConversationName = channel.Channel,
+            ConversationKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, channel.Channel),
+            Text = "This is my reply",
+            MaximumResults = 4
+        }).ConfigureAwait(true);
+        var replyResult = AssertSingleSearchResult(search.Results, "reply search result");
+        Require(replyResult.Record.ReplyParentMessageId == "A", "search result dropped reply metadata");
+        channel.ClearEntries();
+        Require(await viewModel.RouteLogSearchResultAsync(replyResult).ConfigureAwait(true), "search result could not reopen the canonical reply");
+        await sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+        var reopenedReply = channel.EntriesSnapshot.SingleOrDefault(entry => entry.ServerMessageId == "B");
+        Require(reopenedReply is not null && reopenedReply.ReplyParentMessageId == "A", "reopened history did not reconstruct the reply relationship");
+        Console.WriteLine($"MESSAGE_REPLY_UI_METRICS parent=A child=B tagged_send_count=1 visible_canonical_count={channel.EntriesSnapshot.Count(entry => entry.ServerMessageId is "A" or "B")} local_parent_navigation=true search_preserved=true");
+    }
+
+    private static async Task MissingParentAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var viewModel = window.ViewModel;
+        var sessions = viewModel.Sessions;
+        var channel = RequiredChannel(network);
+        viewModel.SelectView(channel);
+        demo.AlphaTransport.EnqueueInboundLine("@msgid=R25;+reply=P25 :Alex!demo@alpha.server PRIVMSG #general :Reply whose parent is not local");
+        await WaitForAsync(sessions, () => channel.EntriesSnapshot.Any(entry => entry.ServerMessageId == "R25"), "missing-parent reply did not arrive").ConfigureAwait(true);
+        var reply = channel.EntriesSnapshot.Single(entry => entry.ServerMessageId == "R25");
+        Require(reply.ReplyResolution == ReplyResolutionState.RecoverableRemotely, "missing-parent reply was not marked remotely recoverable");
+
+        var pending = viewModel.NavigateReplyParentAsync(reply);
+        await WaitForPollingAsync(
+            () => demo.AlphaTransport.OutboundLines.Any(line => line.StartsWith("CHATHISTORY AROUND #general msgid=P25 ", StringComparison.Ordinal)),
+            "missing-parent smoke did not issue one bounded AROUND msgid request").ConfigureAwait(true);
+        demo.AlphaTransport.EnqueueInboundLine(":alpha.server BATCH +phase25-parent chathistory #general");
+        demo.AlphaTransport.EnqueueInboundLine("@batch=phase25-parent;msgid=P25;time=2026-09-07T12:30:00.000Z :Alex!demo@alpha.server PRIVMSG #general :Recovered parent");
+        demo.AlphaTransport.EnqueueInboundLine(":alpha.server BATCH -phase25-parent");
+        var first = await pending.ConfigureAwait(true);
+        await sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+        Require(first?.IsExact == true && channel.NavigationAnchor?.ServerMessageId == "P25", "missing-parent recovery did not navigate to the recovered parent");
+        Require(channel.EntriesSnapshot.Single(entry => entry.ServerMessageId == "R25").ReplyResolution == ReplyResolutionState.ResolvedLocally, "missing-parent recovery did not re-resolve the child relationship");
+
+        var outboundAfterRecovery = demo.AlphaTransport.OutboundLines.Count;
+        var second = await viewModel.NavigateReplyParentAsync(reply).ConfigureAwait(true);
+        Require(second?.IsExact == true && demo.AlphaTransport.OutboundLines.Count == outboundAfterRecovery, "repeat missing-parent navigation did not use local history without another IRC request");
+        Console.WriteLine("MISSING_PARENT_UI_METRICS child=R25 parent=P25 around_requests=1 repeat_requests=0 resolved_after_recovery=true");
+    }
+
     private static async Task ModerationAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
     {
         var viewModel = window.ViewModel;
@@ -2120,6 +2210,11 @@ internal static class UiSmokeHarness
 
     private static ChannelView RequiredChannel(NetworkWorkspace network) =>
         network.Channels.Single(channel => channel.Channel == "#general");
+
+    private static ConversationLogSearchResult AssertSingleSearchResult(IReadOnlyList<ConversationLogSearchResult> results, string label) =>
+        results.Count == 1
+            ? results[0]
+            : throw new InvalidOperationException($"{label} expected one result but received {results.Count}.");
 
     private static ChannelMemberView RequiredMember(ChannelView channel, string nickname) =>
         channel.Members.Single(member => member.Nickname == nickname);

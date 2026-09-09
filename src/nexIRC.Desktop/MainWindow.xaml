@@ -32,42 +32,48 @@
         <DataTemplate x:Key="TranscriptEntryTemplate">
             <DockPanel LastChildFill="True" Margin="2,1">
                 <TextBlock DockPanel.Dock="Left" Text="{Binding DisplayTime}" Width="62" Foreground="#94A3B8" />
-                <TextBlock Text="{Binding DisplayLine}" TextWrapping="Wrap">
-                    <TextBlock.Style>
-                        <Style TargetType="TextBlock">
-                            <Setter Property="Foreground" Value="#1E293B" />
-                            <Style.Triggers>
-                                <DataTrigger Binding="{Binding IsOutgoing}" Value="True">
-                                    <Setter Property="Foreground" Value="#2563EB" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.OutgoingAction}">
-                                    <Setter Property="Foreground" Value="#7C3AED" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.Error}">
-                                    <Setter Property="Foreground" Value="#B91C1C" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding IsHighlight}" Value="True">
-                                    <Setter Property="Background" Value="#FEF3C7" />
-                                    <Setter Property="Foreground" Value="#92400E" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding IsNavigationAnchor}" Value="True">
-                                    <Setter Property="Background" Value="#DBEAFE" />
-                                    <Setter Property="Foreground" Value="#1D4ED8" />
-                                    <Setter Property="FontWeight" Value="SemiBold" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.Capability}">
-                                    <Setter Property="Foreground" Value="#047857" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.Authentication}">
-                                    <Setter Property="Foreground" Value="#7C3AED" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.Reconnect}">
-                                    <Setter Property="Foreground" Value="#B45309" />
-                                </DataTrigger>
-                            </Style.Triggers>
-                        </Style>
-                    </TextBlock.Style>
-                </TextBlock>
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Visibility="{Binding HasReplyRelationship, Converter={StaticResource BooleanToVisibility}}">
+                        <Button Content="{Binding ReplyIndicatorText}" Tag="{Binding}" Click="OnReplyParentClick" Padding="2,0" Margin="0,0,6,0" BorderThickness="0" Background="Transparent" Foreground="#2563EB" ToolTip="Navigate to the referenced parent message" AutomationProperties.AutomationId="MessageReply.Parent" />
+                        <Button Content="Show original" Tag="{Binding}" Click="OnReplyParentClick" Padding="2,0" BorderThickness="0" Background="Transparent" Foreground="#64748B" Visibility="{Binding CanRecoverReplyParent, Converter={StaticResource BooleanToVisibility}}" AutomationProperties.AutomationId="MessageReply.ShowOriginal" />
+                    </StackPanel>
+                    <TextBlock Text="{Binding DisplayLine}" TextWrapping="Wrap">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Foreground" Value="#1E293B" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsOutgoing}" Value="True">
+                                        <Setter Property="Foreground" Value="#2563EB" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.OutgoingAction}">
+                                        <Setter Property="Foreground" Value="#7C3AED" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.Error}">
+                                        <Setter Property="Foreground" Value="#B91C1C" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding IsHighlight}" Value="True">
+                                        <Setter Property="Background" Value="#FEF3C7" />
+                                        <Setter Property="Foreground" Value="#92400E" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding IsNavigationAnchor}" Value="True">
+                                        <Setter Property="Background" Value="#DBEAFE" />
+                                        <Setter Property="Foreground" Value="#1D4ED8" />
+                                        <Setter Property="FontWeight" Value="SemiBold" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.Capability}">
+                                        <Setter Property="Foreground" Value="#047857" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.Authentication}">
+                                        <Setter Property="Foreground" Value="#7C3AED" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding Kind}" Value="{x:Static app:TranscriptEntryKind.Reconnect}">
+                                        <Setter Property="Foreground" Value="#B45309" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </StackPanel>
             </DockPanel>
         </DataTemplate>
         <DataTemplate x:Key="HistoryContextEntryTemplate">
@@ -455,6 +461,12 @@
                 </Grid>
                 <Border Grid.Row="1" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="0,1,0,0" Padding="10,8">
                     <DockPanel>
+                        <Border DockPanel.Dock="Top" Background="#EFF6FF" BorderBrush="#BFDBFE" BorderThickness="1" Padding="8,5" Margin="0,0,0,6" Visibility="{Binding IsReplying, Converter={StaticResource BooleanToVisibility}}">
+                            <DockPanel>
+                                <Button DockPanel.Dock="Right" Content="Cancel reply" Command="{Binding CancelReplyCommand}" Padding="8,2" AutomationProperties.AutomationId="Reply.Cancel" />
+                                <TextBlock Text="{Binding ReplyBannerText}" VerticalAlignment="Center" Foreground="#1D4ED8" AutomationProperties.AutomationId="Reply.Banner" />
+                            </DockPanel>
+                        </Border>
                         <Button DockPanel.Dock="Right" Content="Send" Click="OnSendClick" Padding="18,5" Margin="8,0,0,0" IsDefault="True" />
                         <TextBox x:Name="InputBox" Text="{Binding InputText, UpdateSourceTrigger=PropertyChanged}" MinHeight="28" VerticalContentAlignment="Center" KeyDown="OnInputKeyDown" ToolTip="Type a message or /command" />
                     </DockPanel>
