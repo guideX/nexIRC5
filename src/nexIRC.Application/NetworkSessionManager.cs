@@ -746,7 +746,16 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         if (_logStore is not null)
         {
             await _logStore.FlushAsync(cancellationToken).ConfigureAwait(false);
+            var reactionRecords = await ReadReactionStateAsync(network, view, cancellationToken).ConfigureAwait(false);
             records = await ReadLatestHistoryWindowAsync(network, view, cancellationToken).ConfigureAwait(false);
+            await InvokeOnDispatcherAsync(
+                () =>
+                {
+                    view.SetCurrentReactionActor(ReactionActorIdentity.ForLocal(network.Id, network.Snapshot.Nickname));
+                    view.ApplyReactionRecords(reactionRecords);
+                    return true;
+                },
+                WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
         }
         else
         {
@@ -810,6 +819,25 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 ConversationHistoryMerge.DeduplicateExact(records))
             .TakeLast(WorkspaceView.MaximumEntries)
             .ToArray();
+    }
+
+    private async ValueTask<ConversationLogRecord[]> ReadReactionStateAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        CancellationToken cancellationToken)
+    {
+        if (_logStore is null || view is not (ChannelView or QueryView))
+        {
+            return Array.Empty<ConversationLogRecord>();
+        }
+
+        return (await _logStore.ReadReactionEventsAsync(
+                network.Id,
+                network.ProfileId ?? network.Id,
+                HistoryKind(view),
+                HistoryName(view),
+                HistoryConversation(view),
+                cancellationToken: cancellationToken).ConfigureAwait(false)).ToArray();
     }
 
     private async ValueTask<HistoryContextResult?> ReadLocalNavigationContextAsync(
@@ -938,9 +966,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         WorkspaceView view,
         HistoryContextResult context)
     {
+        var reactionRecords = await ReadReactionStateAsync(network, view, CancellationToken.None).ConfigureAwait(false);
         await InvokeOnDispatcherAsync(
             () =>
             {
+                view.SetCurrentReactionActor(ReactionActorIdentity.ForLocal(network.Id, network.Snapshot.Nickname));
+                view.ApplyReactionRecords(reactionRecords);
                 view.ReplaceHistoryWindow(context.Records, ConversationEntryProvenance.LocalHistory, context.Anchor.Anchor?.Record);
                 view.RefreshReplyRelationships(CanRecoverReplyParent(network, view));
                 view.EnterHistoryView();
@@ -1170,10 +1201,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                     && string.Equals(item.HistoricalConversation, conversation, StringComparison.Ordinal))
                 .ToArray();
             var ordinaryHistoryMessages = historyMessages
-                .Where(static item => !ChathistoryContext.IsContextRow(item.Message))
+                .Where(static item => item is not IrcReactionEvent && !ChathistoryContext.IsContextRow(item.Message))
                 .ToArray();
             var frontierMessages = historyMessages
-                .Where(static item => !ChathistoryContext.IsContextRow(item.Message)
+                .Where(static item => item is not IrcReactionEvent && !ChathistoryContext.IsContextRow(item.Message)
                     && item.Message.ServerTimestamp is not null)
                 .ToArray();
             var observations = frontierMessages
@@ -1396,10 +1427,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                     && (item.Message.ServerMessageId is null || !knownServerIds.Contains(item.Message.ServerMessageId)))
                 .ToArray();
             var ordinaryHistoricalRows = newHistoricalRows
-                .Where(static item => !ChathistoryContext.IsContextRow(item.Message))
+                .Where(static item => item is not IrcReactionEvent && !ChathistoryContext.IsContextRow(item.Message))
                 .ToArray();
             var observations = newHistoricalRows
-                .Where(item => !ChathistoryContext.IsContextRow(item.Message)
+                .Where(item => item is not IrcReactionEvent && !ChathistoryContext.IsContextRow(item.Message)
                     && item.Message.ServerTimestamp is not null)
                 .Select(item =>
                 {
@@ -1427,6 +1458,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 .OfType<HistoryCoverageAnchor>()
                 .ToArray();
             var allObservations = result.Messages.Count(item => item.IsHistorical
+                && item is not IrcReactionEvent
                 && !ChathistoryContext.IsContextRow(item.Message)
                 && item.Message.ServerTimestamp is not null);
             coverage = entry.CoverageLedger.CompleteBackwardRequest(
@@ -1564,6 +1596,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         var noIdentityRows = 0;
         foreach (var item in events)
         {
+            if (item is IrcReactionEvent)
+            {
+                continue;
+            }
+
             var id = ConversationEntryIdentity.NormalizeServerMessageId(item.Message.ServerMessageId);
             if (id is null)
             {
@@ -1672,6 +1709,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 ConversationKey = conversation,
                 PageSize = ConfigurationLimits.HistoryLocalProjectionPageSize
             }).ConfigureAwait(false);
+            var reactionRecords = await ReadReactionStateAsync(network, view, CancellationToken.None).ConfigureAwait(false);
             GetEntry(network.Id).CoverageLedger.ObserveLocalPage(
                 HistoryCoverageKey.Create(network.Id, conversation),
                 page.Records,
@@ -1681,6 +1719,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             await InvokeOnDispatcherAsync(
                 () =>
                 {
+                    view.SetCurrentReactionActor(ReactionActorIdentity.ForLocal(network.Id, network.Snapshot.Nickname));
+                    view.ApplyReactionRecords(reactionRecords);
                     view.AppendHistoryRecords(page.Records);
                     var ledger = GetEntry(network.Id).CoverageLedger;
                     view.SetHistoryCoverage(ledger.ObserveProjectedWindow(
@@ -2527,6 +2567,18 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         NotifyNavigationChanged();
+    }
+
+    internal void ApplyLocalReaction(WorkspaceView view, ReactionEvent reaction)
+    {
+        ArgumentNullException.ThrowIfNull(view);
+        ArgumentNullException.ThrowIfNull(reaction);
+        if (TryGet(view.NetworkId, out var workspace) && workspace is not null)
+        {
+            view.SetCurrentReactionActor(reaction.Actor);
+            view.ApplyReaction(reaction);
+            _logging?.RecordReaction(workspace.Id, workspace.ProfileId, view, reaction);
+        }
     }
 
     private void PublishQueryPending(IrcQueryOperation operation)
@@ -4394,10 +4446,13 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 }
                 Append(workspace.EnsureChannel(mode.Channel, reopen: false), semanticEvent);
                 break;
+            case IrcReactionEvent reaction:
+                RouteReactionEvent(workspace, reaction, snapshot, receivedAt);
+                break;
             case IrcHistoryTargetEvent:
             case IrcTagmsgEvent:
-                // TARGETS is discovery metadata and TAGMSG has no Phase 1Y
-                // reaction/read-marker semantics. Neither is transcript state.
+                // TARGETS is discovery metadata and an unrecognized TAGMSG is
+                // intentionally not a transcript row.
                 break;
             case IrcBanListItemEvent banListItem:
                 if (RouteBanListItemEvent(workspace, banListItem) is not null)
@@ -4521,6 +4576,67 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
     }
 
+    private void RouteReactionEvent(
+        NetworkWorkspace workspace,
+        IrcReactionEvent reaction,
+        ServerSessionSnapshot snapshot,
+        DateTimeOffset? receivedAt)
+    {
+        var view = ResolveReactionView(workspace, reaction, snapshot);
+        if (view is null)
+        {
+            return;
+        }
+
+        var localAccount = AccountTag(reaction.Message);
+        view.SetCurrentReactionActor(ReactionActorIdentity.ForLocal(workspace.Id, snapshot.Nickname, localAccount));
+        var eventData = ReactionEvent.FromCore(
+            workspace.Id,
+            HistoryConversation(view),
+            reaction,
+            reaction.IsHistorical ? ConversationEntryProvenance.ServerPlayback : ConversationEntryProvenance.Live,
+            receivedAt);
+        view.ApplyReaction(eventData);
+        _logging?.RecordReaction(workspace.Id, workspace.ProfileId, view, eventData);
+    }
+
+    private static WorkspaceView? ResolveReactionView(
+        NetworkWorkspace workspace,
+        IrcReactionEvent reaction,
+        ServerSessionSnapshot snapshot)
+    {
+        if (reaction.IsHistorical
+            && reaction.HistoricalConversation is { Length: > 0 } historicalConversation)
+        {
+            if (workspace.FindQueryByHistoryKey(historicalConversation) is { } historicalQuery)
+            {
+                return historicalQuery;
+            }
+
+            if (snapshot.Features.ChannelTypes.Contains(reaction.Target.FirstOrDefault()))
+            {
+                return workspace.EnsureChannel(reaction.Target, reopen: false);
+            }
+
+            return workspace.EnsureHistoricalQuery(reaction.Message.Prefix?.Name ?? reaction.Target, historicalConversation);
+        }
+
+        if (snapshot.Features.ChannelTypes.Contains(reaction.Target.FirstOrDefault()))
+        {
+            return workspace.EnsureChannel(reaction.Target, reopen: false);
+        }
+
+        var sender = reaction.Message.Prefix?.Name;
+        if (sender is null || IrcIdentity.Equals(sender, snapshot.Nickname, snapshot.Features.CaseMapping))
+        {
+            return workspace.FindQuery(reaction.Target) ?? workspace.EnsureQuery(reaction.Target);
+        }
+
+        var query = workspace.EnsureIncomingQuery(sender, AccountTag(reaction.Message));
+        ObserveQueryIdentity(query, sender, AccountTag(reaction.Message), reaction, historical: false);
+        return query;
+    }
+
     private static QueryView ResolveQuery(NetworkWorkspace workspace, IrcSemanticEvent semanticEvent, string nickname)
     {
         if (semanticEvent.IsHistorical
@@ -4580,6 +4696,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             IrcTopicEvent topic => IsIgnored(workspace, topic.Message.Prefix, AccountTag(topic.Message)),
             IrcTopicUnsetEvent topic => IsIgnored(workspace, topic.Message.Prefix, AccountTag(topic.Message)),
             IrcModeEvent mode => IsIgnored(workspace, mode.Message.Prefix, AccountTag(mode.Message)),
+            IrcReactionEvent reaction => IsIgnored(workspace, reaction.Message.Prefix, AccountTag(reaction.Message)),
             _ => false
         };
 
@@ -5031,7 +5148,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     private static WorkspaceDispatchActionCategory DispatchCategory(IrcSemanticEvent semanticEvent) => semanticEvent switch
     {
-        IrcPrivmsgEvent or IrcQueryMessageEvent or IrcCtcpEvent => WorkspaceDispatchActionCategory.IncomingMessage,
+        IrcPrivmsgEvent or IrcQueryMessageEvent or IrcCtcpEvent or IrcReactionEvent => WorkspaceDispatchActionCategory.IncomingMessage,
         IrcJoinEvent or IrcPartEvent or IrcQuitEvent or IrcKickEvent or IrcAwayEvent or IrcAccountEvent or IrcNamesEvent or IrcNamesCompleteEvent or IrcWhoEvent or IrcWhoEndEvent => WorkspaceDispatchActionCategory.Membership,
         IrcModeEvent or IrcTopicEvent or IrcTopicUnsetEvent or IrcTopicMetadataEvent => WorkspaceDispatchActionCategory.ModeOrTopic,
         IrcNicknameChangedEvent or IrcChannelSynchronizationEvent or IrcWelcomeEvent or IrcRegistrationStateEvent or IrcCapabilityChangedEvent or IrcSaslStateChangedEvent or IrcBatchEvent or IrcMotdEvent => WorkspaceDispatchActionCategory.Lifecycle,

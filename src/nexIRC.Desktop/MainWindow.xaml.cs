@@ -341,6 +341,17 @@ public partial class MainWindow : Window
         }
     }
 
+    private async void OnReactionToggleClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: ReactionSummaryItem summary } button
+            || FindAncestor<ListBoxItem>(button)?.DataContext is not TranscriptEntry entry)
+        {
+            return;
+        }
+
+        await ViewModel.ToggleReactionAsync(entry, summary.Value, summary.CurrentUserReacted).ConfigureAwait(true);
+    }
+
     private async Task SubmitInputAsync()
     {
         await ViewModel.SubmitInputAsync();
@@ -546,6 +557,7 @@ public partial class MainWindow : Window
         {
             ViewModel.SelectView(transcriptView);
             var canReply = ViewModel.Actions.CanReplyTo(transcriptNetwork, transcriptView, transcriptEntry, out var replyReason);
+            var canReact = ViewModel.Actions.CanReactTo(transcriptNetwork, transcriptView, transcriptEntry, unreaction: false, out var reactionReason);
             var canShowOriginal = transcriptEntry.ReplyResolution == ReplyResolutionState.ResolvedLocally
                 || ViewModel.Sessions.CanRecoverReplyParent(transcriptNetwork, transcriptView);
             var originalReason = canShowOriginal
@@ -558,6 +570,17 @@ public partial class MainWindow : Window
                     ViewModel.BeginReply(transcriptEntry);
                     return Task.CompletedTask;
                 }, canReply, replyReason),
+                new("React…", async () =>
+                {
+                    var value = ParticipantInputWindow.Show(this, "React…", "Reaction value (emoji or short text):");
+                    if (string.IsNullOrWhiteSpace(value))
+                    {
+                        ViewModel.StatusText = "Reaction canceled.";
+                        return;
+                    }
+
+                    await ViewModel.ToggleReactionAsync(transcriptEntry, value, remove: false).ConfigureAwait(true);
+                }, canReact, reactionReason),
                 new("Show original", () => ViewModel.NavigateReplyParentAsync(transcriptEntry), transcriptEntry.HasReplyRelationship && canShowOriginal, originalReason)
             };
             OpenContextMenu(transcriptItem, actions, "MessageContextMenu");

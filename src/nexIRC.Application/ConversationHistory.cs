@@ -22,7 +22,7 @@ public enum ConversationTimestampSource
 
 public static class ConversationHistorySchema
 {
-    public const int CurrentVersion = 3;
+    public const int CurrentVersion = 4;
 }
 
 /// <summary>

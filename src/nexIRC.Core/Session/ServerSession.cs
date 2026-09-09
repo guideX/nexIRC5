@@ -447,10 +447,99 @@ public sealed class ServerSession : IAsyncDisposable
                 throw new InvalidOperationException("The server did not negotiate message-tags; replies are unavailable.");
             }
 
+            if (_features.RuntimeISupport.IsClientTagDenied("+reply")
+                || _features.RuntimeISupport.IsClientTagDenied("reply"))
+            {
+                throw new InvalidOperationException("The server's CLIENTTAGDENY policy disallows replies.");
+            }
+
             message = IrcReplyCommandBuilder.Build(
                 new IrcCommandBuilder(_options.MaximumOutboundLineBytes),
                 target,
                 text,
+                parentMessageId);
+            epoch = currentEpoch;
+        }
+
+        await QueueOutboundAsync(message, cancellationToken, epoch).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Sends one application-owned IRCv3 draft reaction TAGMSG. All capability,
+    /// target, identity-generation, and CLIENTTAGDENY checks occur before the
+    /// command enters the transport queue.
+    /// </summary>
+    public ValueTask SendReactionAsync(
+        string target,
+        string reaction,
+        string parentMessageId,
+        bool unreaction = false,
+        int? expectedConnectionGeneration = null,
+        CancellationToken cancellationToken = default)
+    {
+        return SendReactionCoreAsync(
+            target,
+            reaction,
+            parentMessageId,
+            unreaction ? IrcReactionOperation.Unreact : IrcReactionOperation.React,
+            expectedConnectionGeneration,
+            cancellationToken);
+    }
+
+    public ValueTask SendUnreactionAsync(
+        string target,
+        string reaction,
+        string parentMessageId,
+        int? expectedConnectionGeneration = null,
+        CancellationToken cancellationToken = default) =>
+        SendReactionCoreAsync(
+            target,
+            reaction,
+            parentMessageId,
+            IrcReactionOperation.Unreact,
+            expectedConnectionGeneration,
+            cancellationToken);
+
+    private async ValueTask SendReactionCoreAsync(
+        string target,
+        string reaction,
+        string parentMessageId,
+        IrcReactionOperation operation,
+        int? expectedConnectionGeneration,
+        CancellationToken cancellationToken)
+    {
+        IrcOutboundMessage message;
+        ConnectionEpoch epoch;
+        lock (_gate)
+        {
+            if (_registration != RegistrationState.Registered || _activeEpoch is not { IsActive: true } currentEpoch)
+            {
+                throw new InvalidOperationException("The IRC session is not registered.");
+            }
+
+            if (expectedConnectionGeneration is int expected && expected != currentEpoch.Generation)
+            {
+                throw new InvalidOperationException("The reaction belongs to a stale connection generation.");
+            }
+
+            if (!_capabilities.Snapshot.IsEnabled(IrcCapabilityCatalog.MessageTags))
+            {
+                throw new InvalidOperationException("The server did not negotiate message-tags; reactions are unavailable.");
+            }
+
+            if (_features.RuntimeISupport.IsClientTagDenied("+reply")
+                || _features.RuntimeISupport.IsClientTagDenied("reply")
+                || _features.RuntimeISupport.IsClientTagDenied(operation == IrcReactionOperation.React ? "+draft/react" : "+draft/unreact")
+                || _features.RuntimeISupport.IsClientTagDenied(operation == IrcReactionOperation.React ? "draft/react" : "draft/unreact"))
+            {
+                throw new InvalidOperationException("The server's CLIENTTAGDENY policy disallows this reaction.");
+            }
+
+            message = IrcReactionCommandBuilder.Build(
+                new IrcCommandBuilder(_options.MaximumOutboundLineBytes),
+                target,
+                reaction,
+                operation,
                 parentMessageId);
             epoch = currentEpoch;
         }

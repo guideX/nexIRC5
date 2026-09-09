@@ -73,6 +73,32 @@
                             </Style>
                         </TextBlock.Style>
                     </TextBlock>
+                    <ItemsControl ItemsSource="{Binding ReactionSummary}"
+                                  Visibility="{Binding HasReactions, Converter={StaticResource BooleanToVisibility}}"
+                                  AutomationProperties.AutomationId="MessageReaction.Summary"
+                                  AutomationProperties.Name="{Binding ReactionAccessibleDescription}"
+                                  Margin="0,2,0,0">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <WrapPanel />
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Button Content="{Binding DisplayText}"
+                                        Tag="{Binding}"
+                                        Click="OnReactionToggleClick"
+                                        Padding="5,1"
+                                        Margin="0,0,4,0"
+                                        BorderThickness="0"
+                                        Background="#E2E8F0"
+                                        Foreground="#334155"
+                                        ToolTip="{Binding AccessibleText}"
+                                        AutomationProperties.AutomationId="MessageReaction.Toggle"
+                                        AutomationProperties.Name="{Binding AccessibleText}" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
                 </StackPanel>
             </DockPanel>
         </DataTemplate>

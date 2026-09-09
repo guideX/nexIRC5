@@ -142,6 +142,17 @@ public sealed record TranscriptEntry(
 
     public string? BatchId { get; init; }
 
+    /// <summary>Compact, deterministic reaction pills associated with this message.</summary>
+    public IReadOnlyList<ReactionSummaryItem> ReactionSummary { get; init; } = Array.Empty<ReactionSummaryItem>();
+
+    public bool HasReactions => ReactionSummary.Count > 0;
+
+    public string ReactionSummaryText => string.Join(", ", ReactionSummary.Select(static item => item.DisplayText));
+
+    public string ReactionAccessibleDescription => HasReactions
+        ? string.Join(". ", ReactionSummary.Select(static item => item.AccessibleText))
+        : "No reactions";
+
     /// <summary>Temporary presentation marker used by explicit history jumps.</summary>
     public bool IsNavigationAnchor { get; init; }
 
@@ -507,6 +518,9 @@ public abstract class WorkspaceView : ObservableObject
 
     public ThreadSafeObservableCollection<TranscriptEntry> Entries { get; } = [];
 
+    /// <summary>Durable reaction relationships scoped to this conversation view.</summary>
+    public ReactionStateStore ReactionState { get; } = new();
+
     public ThreadSafeObservableCollection<HistoryContextEntry> HistoryContext { get; } = [];
 
     public bool HasHistoryContext => HistoryContext.Count > 0;
@@ -626,6 +640,7 @@ public abstract class WorkspaceView : ObservableObject
                 }
 
                 RefreshReplyRelationships();
+                RefreshReactionSummaries(entry.ServerMessageId);
                 return true;
             }
 
@@ -660,19 +675,28 @@ public abstract class WorkspaceView : ObservableObject
         }
 
         RefreshReplyRelationships();
+        RefreshReactionSummaries(entry.ServerMessageId);
 
         return true;
     }
 
     internal bool AppendHistoryRecord(ConversationLogRecord record, ConversationEntryProvenance provenance)
     {
+        if (record.IsReactionEvent)
+        {
+            ApplyReactionRecord(record);
+            return false;
+        }
+
         var candidate = new ConversationEntryCandidate
         {
             Record = record,
             Provenance = provenance,
             Persist = provenance == ConversationEntryProvenance.ServerPlayback
         };
-        return AppendConversationCandidate(candidate, ConversationHistoryProjection.ToTranscriptEntry(record, provenance), updateLastActivity: false);
+        var appended = AppendConversationCandidate(candidate, ConversationHistoryProjection.ToTranscriptEntry(record, provenance), updateLastActivity: false);
+        RefreshReactionSummaries();
+        return appended;
     }
 
     /// <summary>
@@ -686,7 +710,9 @@ public abstract class WorkspaceView : ObservableObject
         bool preserveOlderWindow = true)
     {
         ArgumentNullException.ThrowIfNull(records);
-        var additions = ConversationHistoryOrdering.OrderAscending(records)
+        var source = records.ToArray();
+        ApplyReactionRecords(source);
+        var additions = ConversationHistoryOrdering.OrderAscending(source.Where(static record => !record.IsReactionEvent))
             .Select(record => ConversationHistoryProjection.ToTranscriptEntry(record, provenance))
             .ToArray();
         if (additions.Length == 0)
@@ -743,6 +769,7 @@ public abstract class WorkspaceView : ObservableObject
             }
 
             RefreshReplyRelationships();
+            RefreshReactionSummaries();
             return accepted.Length;
         }
     }
@@ -753,7 +780,9 @@ public abstract class WorkspaceView : ObservableObject
         ConversationLogRecord? anchor = null)
     {
         ArgumentNullException.ThrowIfNull(records);
-        var projected = ConversationHistoryOrdering.OrderAscending(records)
+        var source = records.ToArray();
+        ApplyReactionRecords(source);
+        var projected = ConversationHistoryOrdering.OrderAscending(source.Where(static record => !record.IsReactionEvent))
             .TakeLast(MaximumEntries)
             .Select(record => ConversationHistoryProjection.ToTranscriptEntry(record, provenance))
             .ToArray();
@@ -772,6 +801,86 @@ public abstract class WorkspaceView : ObservableObject
 
         NavigationAnchor = anchorEntry is null ? null : anchorEntry with { IsNavigationAnchor = true };
         RefreshReplyRelationships();
+        RefreshReactionSummaries();
+    }
+
+    internal void SetCurrentReactionActor(ReactionActorIdentity actor)
+    {
+        ReactionState.SetCurrentActor(actor);
+        RefreshReactionSummaries();
+    }
+
+    internal bool ApplyReaction(ReactionEvent reaction)
+    {
+        ArgumentNullException.ThrowIfNull(reaction);
+        if (reaction.NetworkId != NetworkId)
+        {
+            return false;
+        }
+
+        var changed = ReactionState.Apply(reaction.ParentMessageId, reaction.Value, reaction.Operation, reaction.Actor);
+        RefreshReactionSummaries(reaction.ParentMessageId);
+        return changed != 0;
+    }
+
+    internal void ApplyReactionRecord(ConversationLogRecord record)
+    {
+        ReactionState.ApplyRecord(record);
+        RefreshReactionSummaries(record.ReactionParentMessageId);
+    }
+
+    internal void ApplyReactionRecords(IEnumerable<ConversationLogRecord> records)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        foreach (var record in records)
+        {
+            ReactionState.ApplyRecord(record);
+        }
+
+        RefreshReactionSummaries();
+    }
+
+    internal void RefreshReactionSummaries(string? parentMessageId = null)
+    {
+        lock (_entriesGate)
+        {
+            for (var index = 0; index < Entries.Count; index++)
+            {
+                var entry = Entries[index];
+                if (parentMessageId is not null && !string.Equals(entry.ServerMessageId, parentMessageId, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var summary = ReactionState.GetSummary(entry.ServerMessageId);
+                if (ReactionSummaryEquals(entry.ReactionSummary, summary))
+                {
+                    continue;
+                }
+
+                Entries[index] = entry with { ReactionSummary = summary };
+            }
+        }
+    }
+
+    private static bool ReactionSummaryEquals(
+        IReadOnlyList<ReactionSummaryItem> left,
+        IReadOnlyList<ReactionSummaryItem> right)
+    {
+        if (left.Count != right.Count)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (!Equals(left[index], right[index]))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     internal void SetNavigationAnchor(ConversationLogRecord? anchor)

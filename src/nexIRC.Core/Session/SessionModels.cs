@@ -253,6 +253,22 @@ public sealed record IrcTagmsgEvent(
     IrcMessage Message,
     string Target) : IrcSemanticEvent(Message);
 
+/// <summary>
+/// A valid IRCv3 draft reaction carried by TAGMSG. It is a relationship event,
+/// never an ordinary empty chat message.
+/// </summary>
+public sealed record IrcReactionEvent(
+    IrcMessage Message,
+    string Target,
+    IrcReaction Reaction) : IrcSemanticEvent(Message)
+{
+    public string ParentMessageId => Reaction.ParentMessageId;
+
+    public string Value => Reaction.Value;
+
+    public IrcReactionOperation Operation => Reaction.Operation;
+}
+
 public enum IrcStandardReplyKind
 {
     Fail,

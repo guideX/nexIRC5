@@ -187,6 +187,10 @@ public sealed class IrcMessage
             && batch.Length <= 65
                 ? batch
                 : null;
+        if (IrcReaction.TryParse(this, out var reaction))
+        {
+            Reaction = reaction;
+        }
     }
 
     public string RawLine { get; }
@@ -241,6 +245,15 @@ public sealed class IrcMessage
 
     /// <summary>The IRCv3 batch association tag, when present.</summary>
     public string? BatchId { get; }
+
+    /// <summary>
+    /// Parsed exact-case IRCv3 draft reaction metadata. Invalid or incomplete
+    /// metadata leaves this null without invalidating the IRC message.
+    /// </summary>
+    public IrcReaction? Reaction { get; }
+
+    public bool HasReactionMetadata => TagValues.ContainsKey(IrcReaction.ReactTag)
+        || TagValues.ContainsKey(IrcReaction.UnreactTag);
 
     /// <summary>
     /// Explicit CHATHISTORY pagination evidence.  The draft uses a valueless

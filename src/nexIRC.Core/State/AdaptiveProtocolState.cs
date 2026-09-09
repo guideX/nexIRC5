@@ -503,7 +503,9 @@ public sealed class ISupportSnapshot
         IReadOnlyDictionary<string, int?> targetMax,
         bool utf8Only,
         int? chathistoryLimit,
-        IReadOnlyList<ChathistoryReferenceType> messageReferenceTypes)
+        IReadOnlyList<ChathistoryReferenceType> messageReferenceTypes,
+        bool hasClientTagDeny,
+        IReadOnlyList<string> clientTagDenyEntries)
     {
         RawTokens = rawTokens;
         Tokens = tokens;
@@ -524,6 +526,8 @@ public sealed class ISupportSnapshot
         Utf8Only = utf8Only;
         ChathistoryLimit = chathistoryLimit;
         MessageReferenceTypes = messageReferenceTypes;
+        HasClientTagDeny = hasClientTagDeny;
+        ClientTagDenyEntries = clientTagDenyEntries;
     }
 
     public IReadOnlyList<IrcISupportToken> RawTokens { get; }
@@ -572,6 +576,42 @@ public sealed class ISupportSnapshot
     /// <summary>Known MSGREFTYPES in the server's advertised preference order.</summary>
     public IReadOnlyList<ChathistoryReferenceType> MessageReferenceTypes { get; }
 
+    /// <summary>
+    /// Raw, case-sensitive CLIENTTAGDENY entries. A leading '-' is an
+    /// exception to a wildcard or exact deny entry.
+    /// </summary>
+    public IReadOnlyList<string> ClientTagDenyEntries { get; }
+
+    public bool HasClientTagDeny { get; }
+
+    public bool IsClientTagDenied(string tagName)
+    {
+        if (!HasClientTagDeny || string.IsNullOrEmpty(tagName))
+        {
+            return false;
+        }
+
+        var entries = ClientTagDenyEntries;
+        if (entries.Any(entry => entry.Length > 1
+            && entry[0] == '-'
+            && ClientTagNamesEqual(entry[1..], tagName)))
+        {
+            return false;
+        }
+
+        return entries.Any(entry => string.Equals(entry, "*", StringComparison.Ordinal)
+            || ClientTagNamesEqual(entry, tagName));
+    }
+
+    private static bool ClientTagNamesEqual(string left, string right)
+    {
+        // IRCv3 names are case-sensitive. Some servers expose the optional
+        // leading '+' in CLIENTTAGDENY while others use the tag-data spelling;
+        // accepting either representation does not broaden case matching.
+        return string.Equals(left, right, StringComparison.Ordinal)
+            || string.Equals(left.TrimStart('+'), right.TrimStart('+'), StringComparison.Ordinal);
+    }
+
     public int? Modes { get; init; }
 
     public int? NickLength { get; init; }
@@ -607,7 +647,9 @@ public sealed class ISupportSnapshot
         new Dictionary<string, int?>(StringComparer.Ordinal),
         false,
         null,
-        Array.Empty<ChathistoryReferenceType>());
+        Array.Empty<ChathistoryReferenceType>(),
+        false,
+        Array.Empty<string>());
 }
 
 public enum IrcCaseMapping
@@ -791,7 +833,9 @@ public sealed class ISupportState
             ParseTargetMax(PositiveValue("TARGMAX")),
             HasPositive("UTF8ONLY"),
             ParseChathistoryLimit(PositiveValue("CHATHISTORY")),
-            ParseMessageReferenceTypes(PositiveValue("MSGREFTYPES")))
+            ParseMessageReferenceTypes(PositiveValue("MSGREFTYPES")),
+            HasPositiveToken("CLIENTTAGDENY"),
+            ParseClientTagDeny(PositiveValue("CLIENTTAGDENY")))
         {
             Modes = ParseInt(PositiveValue("MODES")),
             NickLength = ParseInt(PositiveValue("NICKLEN")),
@@ -810,6 +854,22 @@ public sealed class ISupportState
             ? null
             : token.Value ?? string.Empty;
     }
+
+    private bool HasPositiveToken(string name)
+    {
+        var normalized = name.ToUpperInvariant();
+        return _tokens.TryGetValue(normalized, out var token)
+            && !token.IsNegated
+            && !_removedTokens.Contains(normalized);
+    }
+
+    private static string[] ParseClientTagDeny(string? value) =>
+        value is null
+            ? Array.Empty<string>()
+            : value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(static entry => entry.Length <= 128)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
 
     private bool HasPositive(string name) => _tokens.ContainsKey(name) && !_removedTokens.Contains(name);
 

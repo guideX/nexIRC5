@@ -43,6 +43,7 @@ internal static class UiSmokeHarness
         "history-discovery",
         "history-identity",
         "message-reply",
+        "message-reaction",
         "missing-parent",
         "contextual-actions",
         "sustained-interactivity",
@@ -157,6 +158,9 @@ internal static class UiSmokeHarness
                 break;
             case "message-reply":
                 await MessageReplyAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "message-reaction":
+                await MessageReactionAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
             case "missing-parent":
                 await MissingParentAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -1428,6 +1432,63 @@ internal static class UiSmokeHarness
         Console.WriteLine($"MESSAGE_REPLY_UI_METRICS parent=A child=B tagged_send_count=1 visible_canonical_count={channel.EntriesSnapshot.Count(entry => entry.ServerMessageId is "A" or "B")} local_parent_navigation=true search_preserved=true");
     }
 
+    private static async Task MessageReactionAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    {
+        var viewModel = window.ViewModel;
+        var sessions = viewModel.Sessions;
+        var channel = RequiredChannel(network);
+        viewModel.SelectView(channel);
+
+        demo.AlphaTransport.EnqueueInboundLine("@msgid=RX-PARENT :Alex!demo@alpha.server PRIVMSG #general :Reaction parent");
+        await WaitForAsync(sessions, () => channel.EntriesSnapshot.Any(entry => entry.ServerMessageId == "RX-PARENT"), "reaction smoke parent did not arrive").ConfigureAwait(true);
+        var parent = channel.EntriesSnapshot.Single(entry => entry.ServerMessageId == "RX-PARENT");
+        Require(ReactionSummaryFor(channel, "RX-PARENT").Count == 0, "reaction smoke exposed an unexpected blank or synthetic reaction row");
+
+        var sent = await viewModel.Actions.SendReactionAsync(network, channel, parent, "👍").ConfigureAwait(true);
+        Require(sent.Succeeded, $"reaction smoke send was rejected: {sent.Message}");
+        await WaitForPollingAsync(
+            () => demo.AlphaTransport.OutboundLines.Count(line => line == "@+reply=RX-PARENT;+draft/react=👍 TAGMSG #general") == 1,
+            "reaction smoke did not send exactly one canonical TAGMSG").ConfigureAwait(true);
+        Require(ReactionSummaryFor(channel, "RX-PARENT").Count == 0, "echo-message reaction send duplicated optimistic state");
+
+        demo.AlphaTransport.EnqueueInboundLine("@+reply=RX-PARENT;+draft/react=👍;msgid=RX-1 :nexAlpha!demo@alpha.server TAGMSG #general");
+        await WaitForAsync(sessions, () => ReactionSummaryFor(channel, "RX-PARENT").SingleOrDefault(item => item.Value == "👍")?.Count == 1, "reaction smoke own echo did not create one reaction pill").ConfigureAwait(true);
+        Require(ReactionSummaryFor(channel, "RX-PARENT").Single(item => item.Value == "👍").CurrentUserReacted, "reaction smoke own echo did not reconcile to the current actor");
+
+        demo.AlphaTransport.EnqueueInboundLine("@+reply=RX-PARENT;+draft/react=👍;msgid=RX-2 :Alex!demo@alpha.server TAGMSG #general");
+        await WaitForAsync(sessions, () => ReactionSummaryFor(channel, "RX-PARENT").SingleOrDefault(item => item.Value == "👍")?.Count == 2, "reaction smoke second actor did not aggregate").ConfigureAwait(true);
+
+        var removed = await viewModel.Actions.SendReactionAsync(network, channel, parent, "👍", unreaction: true).ConfigureAwait(true);
+        Require(removed.Succeeded, $"reaction smoke unreact was rejected: {removed.Message}");
+        await WaitForPollingAsync(
+            () => demo.AlphaTransport.OutboundLines.Count(line => line == "@+reply=RX-PARENT;+draft/unreact=👍 TAGMSG #general") == 1,
+            "reaction smoke did not send exactly one canonical UNREACT TAGMSG").ConfigureAwait(true);
+        demo.AlphaTransport.EnqueueInboundLine("@+reply=RX-PARENT;+draft/unreact=👍;msgid=RX-3 :nexAlpha!demo@alpha.server TAGMSG #general");
+        await WaitForAsync(sessions, () => ReactionSummaryFor(channel, "RX-PARENT").SingleOrDefault(item => item.Value == "👍")?.Count == 1, "reaction smoke own unreact did not reconcile").ConfigureAwait(true);
+
+        await sessions.LogStore!.FlushAsync().ConfigureAwait(true);
+        var search = await viewModel.SearchLogsDetailedAsync(new ConversationLogQuery
+        {
+            Scope = ConversationLogSearchScope.CurrentConversation,
+            HistoryScopeId = network.ProfileId ?? network.Id,
+            NetworkId = network.Id,
+            ConversationKind = LogConversationKind.Channel,
+            ConversationName = channel.Channel,
+            ConversationKey = ConversationLoggingService.BuildConversationKey(LogConversationKind.Channel, channel.Channel),
+            Text = "Reaction parent",
+            MaximumResults = 4
+        }).ConfigureAwait(true);
+        var result = AssertSingleSearchResult(search.Results, "reaction search result");
+        Require(result.Record.ServerMessageId == "RX-PARENT", "reaction search did not return the canonical parent");
+        channel.ClearEntries();
+        Require(await viewModel.RouteLogSearchResultAsync(result).ConfigureAwait(true), "reaction search result could not reopen the parent");
+        await sessions.FlushStateDispatchAsync().ConfigureAwait(true);
+        var reopened = channel.EntriesSnapshot.SingleOrDefault(entry => entry.ServerMessageId == "RX-PARENT");
+        Require(reopened is not null && reopened.ReactionSummary.Single(item => item.Value == "👍").Count == 1, "reopened history did not reconstruct durable reaction state");
+        Require(channel.EntriesSnapshot.Count(entry => entry.ServerMessageId is "RX-PARENT") == 1, "reaction replay created a duplicate visible parent");
+        Console.WriteLine($"MESSAGE_REACTION_UI_METRICS parent=RX-PARENT react_send_count=1 unreact_send_count=1 actor_count=1 durable_reopen=true blank_rows=0");
+    }
+
     private static async Task MissingParentAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
     {
         var viewModel = window.ViewModel;
@@ -2210,6 +2271,9 @@ internal static class UiSmokeHarness
 
     private static ChannelView RequiredChannel(NetworkWorkspace network) =>
         network.Channels.Single(channel => channel.Channel == "#general");
+
+    private static IReadOnlyList<ReactionSummaryItem> ReactionSummaryFor(WorkspaceView view, string parentMessageId) =>
+        view.EntriesSnapshot.Single(entry => entry.ServerMessageId == parentMessageId).ReactionSummary;
 
     private static ConversationLogSearchResult AssertSingleSearchResult(IReadOnlyList<ConversationLogSearchResult> results, string label) =>
         results.Count == 1

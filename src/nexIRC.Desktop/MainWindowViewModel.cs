@@ -839,6 +839,32 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         return result;
     }
 
+    public async Task<CommandDispatchResult> ToggleReactionAsync(
+        TranscriptEntry entry,
+        string value,
+        bool remove,
+        CancellationToken cancellationToken = default)
+    {
+        if (ActiveView is not (ChannelView or QueryView)
+            || !Sessions.TryGet(ActiveView.NetworkId, out var network)
+            || network is null)
+        {
+            var unavailable = CommandDispatchResult.Failure("Reactions are unavailable without an active conversation.", ActiveView);
+            StatusText = unavailable.Message;
+            return unavailable;
+        }
+
+        var result = await Actions.SendReactionAsync(
+            network,
+            ActiveView,
+            entry,
+            value,
+            remove,
+            cancellationToken).ConfigureAwait(true);
+        StatusText = result.Message;
+        return result;
+    }
+
     public ParticipantActionContext CreateParticipantContext(NetworkWorkspace network, ChannelView channel, ChannelMemberView member) =>
         new(network, channel, member, network.Channels.Where(candidate => candidate.IsJoined).ToArray());
 

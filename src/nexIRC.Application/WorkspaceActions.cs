@@ -413,6 +413,11 @@ public sealed class WorkspaceActionRouter
         {
             disabledReason = "The server did not negotiate message-tags.";
         }
+        else if (network.Snapshot.Features.RuntimeISupport.IsClientTagDenied("+reply")
+            || network.Snapshot.Features.RuntimeISupport.IsClientTagDenied("reply"))
+        {
+            disabledReason = "The server's CLIENTTAGDENY policy disallows replies.";
+        }
         else if (view is ChannelView channel
             && (!channel.IsJoined || channel.LifecycleState is ConversationLifecycleState.Parted or ConversationLifecycleState.Kicked or ConversationLifecycleState.Disconnected))
         {
@@ -428,6 +433,98 @@ public sealed class WorkspaceActionRouter
         }
 
         return disabledReason is null;
+    }
+
+    public bool CanReactTo(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        TranscriptEntry entry,
+        bool unreaction,
+        out string? disabledReason)
+    {
+        if (!CanReplyTo(network, view, entry, out disabledReason))
+        {
+            return false;
+        }
+
+        if (!view.EntriesSnapshot.Any(item => string.Equals(item.ServerMessageId, entry.ServerMessageId, StringComparison.Ordinal)))
+        {
+            disabledReason = "The parent message is not part of the current conversation view.";
+            return false;
+        }
+
+        var tag = unreaction ? IrcReaction.UnreactTag : IrcReaction.ReactTag;
+        var bareTag = unreaction ? "draft/unreact" : "draft/react";
+        if (network.Snapshot.Features.RuntimeISupport.IsClientTagDenied(tag)
+            || network.Snapshot.Features.RuntimeISupport.IsClientTagDenied(bareTag))
+        {
+            disabledReason = "The server's CLIENTTAGDENY policy disallows this reaction.";
+            return false;
+        }
+
+        return true;
+    }
+
+    public async ValueTask<CommandDispatchResult> SendReactionAsync(
+        NetworkWorkspace network,
+        WorkspaceView view,
+        TranscriptEntry entry,
+        string value,
+        bool unreaction = false,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(view);
+        ArgumentNullException.ThrowIfNull(entry);
+        try
+        {
+            IrcReactionCommandBuilder.ValidateReactionValue(value);
+        }
+        catch (ArgumentException exception)
+        {
+            return CommandDispatchResult.Failure(exception.Message, view);
+        }
+
+        if (!CanReactTo(network, view, entry, unreaction, out var disabledReason))
+        {
+            return CommandDispatchResult.Failure(disabledReason ?? "Reactions are unavailable for this message.", view);
+        }
+
+        var target = view is ChannelView channel ? channel.Channel : ((QueryView)view).Nickname;
+        try
+        {
+            ValidateTarget(target, "reaction target");
+            await network.Session.SendReactionAsync(
+                target,
+                value,
+                entry.ServerMessageId!,
+                unreaction,
+                network.Snapshot.ConnectionGeneration,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
+        {
+            return CommandDispatchResult.Failure(exception.Message, view);
+        }
+
+        if (!network.Snapshot.Capabilities.IsEnabled(IrcCapabilityCatalog.EchoMessage))
+        {
+            var actor = ReactionActorIdentity.ForLocal(network.Id, network.Session.Snapshot.Nickname);
+            _sessions.ApplyLocalReaction(view, new ReactionEvent
+            {
+                NetworkId = network.Id,
+                ConversationKey = HistoryConversationKey(view),
+                ParentMessageId = entry.ServerMessageId!,
+                Value = value,
+                Operation = unreaction ? ReactionOperation.Unreact : ReactionOperation.React,
+                Actor = actor,
+                Timestamp = DateTimeOffset.UtcNow,
+                ReceivedAt = DateTimeOffset.UtcNow,
+                IsLocal = true
+            });
+        }
+
+        return CommandDispatchResult.Success(unreaction ? $"Removed reaction from {target}." : $"Reaction sent to {target}.", view);
     }
 
     public bool TryCreateReplyComposer(

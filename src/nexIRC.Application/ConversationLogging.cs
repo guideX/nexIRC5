@@ -12,7 +12,13 @@ public enum LogConversationKind { Channel, PrivateConversation, Status }
 
 public enum LogMessageKind
 {
-    Message, Action, Notice, Ctcp, Join, Part, Quit, Kick, Nick, Topic, Mode, System, Error
+    Message, Action, Notice, Ctcp, Join, Part, Quit, Kick, Nick, Topic, Mode, System, Error, Reaction
+}
+
+public enum DurableReactionOperation
+{
+    React,
+    Unreact
 }
 
 public enum LogDirection { Incoming, Outgoing }
@@ -55,6 +61,43 @@ public sealed record ConversationLogRecord
     public string? ServerMessageId { get; init; }
     /// <summary>Opaque, case-sensitive server msgid referenced by +reply.</summary>
     public string? ReplyParentMessageId { get; init; }
+
+    /// <summary>
+    /// Additive relationship-event fields. Reaction records have
+    /// MessageKind=Reaction and are never projected as transcript rows.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReactionParentMessageId { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReactionValue { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DurableReactionOperation? ReactionOperation { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReactionActorKey { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReactionActorDisplay { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReactionActorAccount { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReactionActorNickname { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReactionActorUser { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReactionActorHost { get; init; }
+
+    [JsonIgnore]
+    public bool IsReactionEvent => MessageKind == LogMessageKind.Reaction
+        && ReactionParentMessageId is { Length: > 0 }
+        && ReactionValue is { Length: > 0 }
+        && ReactionActorKey is { Length: > 0 };
     /// <summary>
     /// Locally allocated ordering value, scoped to NetworkId and conversation.
     /// It is not a server identity and is never used to claim replay equality.
@@ -77,7 +120,15 @@ internal static class ConversationLogRecordValidation
         && record.ConversationKey is not null
         && (record.ServerMessageId is null || record.ServerMessageId.Length <= 256)
         && (record.ReplyParentMessageId is null || record.ReplyParentMessageId.Length <= 256)
-        && (record.BatchId is null || record.BatchId.Length <= 256);
+        && (record.BatchId is null || record.BatchId.Length <= 256)
+        && (record.ReactionParentMessageId is null || record.ReactionParentMessageId.Length <= 256)
+        && (record.ReactionValue is null || record.ReactionValue.Length <= 1024)
+        && (record.ReactionActorKey is null || record.ReactionActorKey.Length <= 1024)
+        && (record.ReactionActorDisplay is null || record.ReactionActorDisplay.Length <= 512)
+        && (record.ReactionActorAccount is null || record.ReactionActorAccount.Length <= 256)
+        && (record.ReactionActorNickname is null || record.ReactionActorNickname.Length <= 128)
+        && (record.ReactionActorUser is null || record.ReactionActorUser.Length <= 128)
+        && (record.ReactionActorHost is null || record.ReactionActorHost.Length <= 256);
 }
 
 public sealed record ConversationLogQuery
@@ -307,6 +358,7 @@ public sealed record HistoryExportRequest
 public interface IConversationLogStore : IAsyncDisposable
 {
     ValueTask<bool> AppendAsync(ConversationLogRecord record, CancellationToken cancellationToken = default);
+    ValueTask<IReadOnlyList<ConversationLogRecord>> ReadReactionEventsAsync(Guid networkId, Guid scopeId, LogConversationKind kind, string conversationName, string? conversationKey = null, int maximum = ConfigurationLimits.MaximumHistoryExportRecords, CancellationToken cancellationToken = default);
     ValueTask<IReadOnlyList<ConversationLogRecord>> ReadPageAsync(Guid scopeId, LogConversationKind kind, string conversationName, int pageSize = ConfigurationLimits.MaximumHistoryPageSize, DateTimeOffset? before = null, CancellationToken cancellationToken = default);
     ValueTask<HistoryPage> ReadPageWindowAsync(HistoryPageRequest request, CancellationToken cancellationToken = default);
     ValueTask<ConversationHistoryRange> ReadRangeAsync(HistoryExportRequest request, CancellationToken cancellationToken = default);
@@ -388,6 +440,58 @@ public sealed class ConversationLoggingService
             Provenance = entry.Provenance,
             TimestampSource = entry.TimestampSource,
             BatchId = entry.BatchId
+        };
+        _ = AppendSafeAsync(record);
+    }
+
+    public void RecordReaction(Guid networkId, Guid? profileId, WorkspaceView view, ReactionEvent reaction)
+    {
+        ArgumentNullException.ThrowIfNull(view);
+        ArgumentNullException.ThrowIfNull(reaction);
+        if (reaction.Provenance == ConversationEntryProvenance.LocalHistory)
+        {
+            return;
+        }
+
+        var preferences = _preferences();
+        if (!preferences.ConversationLoggingEnabled
+            || view.Kind == WorkspaceViewKind.Query && !preferences.PrivateMessageLoggingEnabled)
+        {
+            return;
+        }
+
+        var kind = view.Kind == WorkspaceViewKind.Channel ? LogConversationKind.Channel : LogConversationKind.PrivateConversation;
+        var name = view is ChannelView channel ? channel.Channel : ((QueryView)view).Nickname;
+        var record = new ConversationLogRecord
+        {
+            Timestamp = reaction.Timestamp,
+            ReceivedAt = reaction.ReceivedAt,
+            NetworkId = networkId,
+            ScopeId = profileId ?? networkId,
+            ProfileId = profileId,
+            ConversationKind = kind,
+            ConversationName = name,
+            ConversationKey = reaction.ConversationKey,
+            Sender = reaction.Actor.DisplayName,
+            MessageKind = LogMessageKind.Reaction,
+            Direction = reaction.IsLocal
+                ? LogDirection.Outgoing
+                : LogDirection.Incoming,
+            Text = reaction.Value,
+            ServerMessageId = reaction.EventMessageId,
+            ReplyParentMessageId = reaction.ParentMessageId,
+            ReactionParentMessageId = reaction.ParentMessageId,
+            ReactionValue = reaction.Value,
+            ReactionOperation = reaction.Operation == ReactionOperation.Unreact ? DurableReactionOperation.Unreact : DurableReactionOperation.React,
+            ReactionActorKey = reaction.Actor.Key,
+            ReactionActorDisplay = reaction.Actor.DisplayName,
+            ReactionActorAccount = reaction.Actor.Account,
+            ReactionActorNickname = reaction.Actor.Nickname,
+            ReactionActorUser = reaction.Actor.User,
+            ReactionActorHost = reaction.Actor.Host,
+            Provenance = reaction.Provenance,
+            TimestampSource = reaction.TimestampSource,
+            BatchId = reaction.BatchId
         };
         _ = AppendSafeAsync(record);
     }
@@ -664,7 +768,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             {
                 hasOlder |= segmentPage.HasOlder;
                 hasNewer |= segmentPage.HasNewer;
-                selected.AddRange(segmentPage.Records);
+                selected.AddRange(segmentPage.Records.Where(static record => !record.IsReactionEvent));
                 selected.Sort(request.Around is not null
                     ? (left, right) => CompareAround(left, right, request.Around.Value)
                     : preferOldest ? CompareAscending : CompareDescending);
@@ -740,6 +844,52 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
 
         return new ConversationHistoryRange(ConversationHistoryOrdering.OrderAscending(
             ConversationHistoryMerge.DeduplicateExact(records)).ToArray(), truncated);
+    }
+
+    public async ValueTask<IReadOnlyList<ConversationLogRecord>> ReadReactionEventsAsync(
+        Guid networkId,
+        Guid scopeId,
+        LogConversationKind kind,
+        string conversationName,
+        string? conversationKey = null,
+        int maximum = ConfigurationLimits.MaximumHistoryExportRecords,
+        CancellationToken cancellationToken = default)
+    {
+        await FlushAsync(cancellationToken).ConfigureAwait(false);
+        maximum = Math.Clamp(maximum, 1, ConfigurationLimits.MaximumHistoryExportRecords);
+        var effectiveKey = conversationKey ?? ConversationLoggingService.BuildConversationKey(kind, conversationName);
+        var records = new List<ConversationLogRecord>();
+        foreach (var path in GetConversationPaths(scopeId, effectiveKey))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await foreach (var record in ReadFileAsync(path, cancellationToken).ConfigureAwait(false))
+            {
+                if (!record.IsReactionEvent
+                    || record.NetworkId != networkId
+                    || record.ScopeId != scopeId
+                    || record.ConversationKind != kind
+                    || !string.Equals(EffectiveConversationKey(record), effectiveKey, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                records.Add(record);
+                if (records.Count >= maximum)
+                {
+                    break;
+                }
+            }
+
+            if (records.Count >= maximum)
+            {
+                break;
+            }
+        }
+
+        return ConversationHistoryOrdering.OrderAscending(
+                ConversationHistoryMerge.DeduplicateExact(records))
+            .Take(maximum)
+            .ToArray();
     }
 
     public async ValueTask<HistoryAnchorResult> FindByServerMessageIdAsync(
@@ -1154,7 +1304,8 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         string conversationName,
         string? conversationKey = null,
         Guid? networkId = null) =>
-        record.ScopeId == scopeId
+        !record.IsReactionEvent
+        && record.ScopeId == scopeId
         && (networkId is null || record.NetworkId == networkId)
         && record.ConversationKind == conversationKind
         && (string.IsNullOrWhiteSpace(conversationKey)
@@ -2100,6 +2251,11 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
 
     internal static bool Matches(ConversationLogRecord record, ConversationLogQuery query, string text)
     {
+        if (record.IsReactionEvent)
+        {
+            return false;
+        }
+
         var conversationMatches = string.IsNullOrWhiteSpace(query.ConversationKey)
             ? string.IsNullOrWhiteSpace(query.ConversationName) || IrcIdentity.Equals(record.ConversationName, query.ConversationName, IrcCaseMapping.Rfc1459)
             : string.Equals(EffectiveConversationKey(record), query.ConversationKey, StringComparison.Ordinal);
@@ -2494,7 +2650,8 @@ internal sealed class SearchResultCollector
 internal static class HistoryPageSelector
 {
     internal static bool MatchesHistoryRecord(ConversationLogRecord record, HistoryPageRequest request) =>
-        record.ScopeId == request.ScopeId
+        !record.IsReactionEvent
+        && record.ScopeId == request.ScopeId
         && (request.NetworkId is null || record.NetworkId == request.NetworkId)
         && record.ConversationKind == request.ConversationKind
         && (string.IsNullOrWhiteSpace(request.ConversationKey)
@@ -2502,7 +2659,8 @@ internal static class HistoryPageSelector
             : string.Equals(ConversationLoggingService.EffectiveConversationKey(record), request.ConversationKey, StringComparison.Ordinal));
 
     internal static bool MatchesHistoryRecord(ConversationLogRecord record, HistoryExportRequest request) =>
-        record.ScopeId == request.ScopeId
+        !record.IsReactionEvent
+        && record.ScopeId == request.ScopeId
         && (request.NetworkId is null || record.NetworkId == request.NetworkId)
         && record.ConversationKind == request.ConversationKind
         && (string.IsNullOrWhiteSpace(request.ConversationKey)
@@ -2620,6 +2778,35 @@ public sealed class InMemoryConversationLogStore : IConversationLogStore
             });
         }
         return ValueTask.FromResult(true);
+    }
+
+    public ValueTask<IReadOnlyList<ConversationLogRecord>> ReadReactionEventsAsync(
+        Guid networkId,
+        Guid scopeId,
+        LogConversationKind kind,
+        string conversationName,
+        string? conversationKey = null,
+        int maximum = ConfigurationLimits.MaximumHistoryExportRecords,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversationName);
+        cancellationToken.ThrowIfCancellationRequested();
+        maximum = Math.Clamp(maximum, 1, ConfigurationLimits.MaximumHistoryExportRecords);
+        var effectiveKey = conversationKey ?? ConversationLoggingService.BuildConversationKey(kind, conversationName);
+        lock (_gate)
+        {
+            var records = _records
+                .Where(record => record.IsReactionEvent
+                    && record.NetworkId == networkId
+                    && record.ScopeId == scopeId
+                    && record.ConversationKind == kind
+                    && string.Equals(ConversationLoggingService.EffectiveConversationKey(record), effectiveKey, StringComparison.Ordinal))
+                .ToArray();
+            return ValueTask.FromResult<IReadOnlyList<ConversationLogRecord>>(
+                ConversationHistoryOrdering.OrderAscending(ConversationHistoryMerge.DeduplicateExact(records))
+                    .Take(maximum)
+                    .ToArray());
+        }
     }
 
     public ValueTask<IReadOnlyList<ConversationLogRecord>> ReadPageAsync(Guid scopeId, LogConversationKind kind, string conversationName, int pageSize = ConfigurationLimits.MaximumHistoryPageSize, DateTimeOffset? before = null, CancellationToken cancellationToken = default)

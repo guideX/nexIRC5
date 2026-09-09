@@ -64,7 +64,8 @@ public sealed class IrcCommandBuilder
         IReadOnlyDictionary<string, string?> tags,
         string command,
         IReadOnlyList<string>? middleParameters = null,
-        string? trailingParameter = null)
+        string? trailingParameter = null,
+        IReadOnlyList<string>? orderedTagKeys = null)
     {
         ArgumentNullException.ThrowIfNull(tags);
         if (tags.Count == 0)
@@ -75,7 +76,16 @@ public sealed class IrcCommandBuilder
         ValidateToken(command, nameof(command), allowLeadingColon: false);
         var builder = new StringBuilder("@");
         var first = true;
-        foreach (var tag in tags.OrderBy(static pair => pair.Key, StringComparer.Ordinal))
+        var tagSequence = orderedTagKeys is null
+            ? tags.OrderBy(static pair => pair.Key, StringComparer.Ordinal)
+            : orderedTagKeys
+                .Distinct(StringComparer.Ordinal)
+                .Where(tags.ContainsKey)
+                .Select(key => new KeyValuePair<string, string?>(key, tags[key]))
+                .Concat(tags
+                    .Where(pair => !orderedTagKeys.Contains(pair.Key, StringComparer.Ordinal))
+                    .OrderBy(static pair => pair.Key, StringComparer.Ordinal));
+        foreach (var tag in tagSequence)
         {
             ValidateTagKey(tag.Key);
             if (!first)

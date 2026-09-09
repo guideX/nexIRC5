@@ -184,7 +184,8 @@ internal sealed class SessionStateStore
                 {
                     ApplyHistoricalMessage(message, features, events, command == "NOTICE");
                 }
-                else if (features.Capabilities.IsEnabled(IrcCapabilityCatalog.EventPlayback))
+                else if (features.Capabilities.IsEnabled(IrcCapabilityCatalog.EventPlayback)
+                    || command == "TAGMSG" && message.Reaction is not null)
                 {
                     ApplyHistoricalStateEvent(message, features, events);
                 }
@@ -317,6 +318,9 @@ internal sealed class SessionStateStore
                 break;
             case "001":
                 events.Add(new IrcWelcomeEvent(message, features.NetworkName));
+                break;
+            case "TAGMSG":
+                ApplyTagmsg(message, features, events);
                 break;
         }
 
@@ -599,6 +603,31 @@ internal sealed class SessionStateStore
         }
     }
 
+    private static void ApplyTagmsg(IrcMessage message, ServerFeatureSet features, List<IrcSemanticEvent> events)
+    {
+        var target = Parameter(message, 0);
+        if (target is null || !IsSafeTagmsgTarget(target))
+        {
+            return;
+        }
+
+        if (message.Reaction is { } reaction)
+        {
+            events.Add(new IrcReactionEvent(message, target, reaction));
+        }
+        else
+        {
+            // Preserve the existing safe representation for ordinary or
+            // malformed TAGMSGs without turning them into transcript rows.
+            events.Add(new IrcTagmsgEvent(message, target));
+        }
+    }
+
+    private static bool IsSafeTagmsgTarget(string? target) =>
+        !string.IsNullOrWhiteSpace(target)
+        && target.Length <= 512
+        && !target.Any(static character => char.IsWhiteSpace(character) || char.IsControl(character) || character == ':');
+
     private void ApplyHistoricalMessage(IrcMessage message, ServerFeatureSet features, List<IrcSemanticEvent> events, bool isNotice)
     {
         var target = Parameter(message, 0);
@@ -655,8 +684,13 @@ internal sealed class SessionStateStore
                 => HistoricalAway(message, awayNickname),
             "ACCOUNT" when message.Prefix?.Name is { Length: > 0 } accountNickname
                 => new IrcAccountEvent(message, accountNickname, HistoricalAccount(message)),
-            "TAGMSG" when Parameter(message, 0) is { Length: > 0 } tagTarget
-                => new IrcTagmsgEvent(message, tagTarget),
+            "TAGMSG" when Parameter(message, 0) is { Length: > 0 } historicalTagTarget
+                && IsSafeTagmsgTarget(historicalTagTarget)
+                && message.Reaction is { } historicalReaction
+                => new IrcReactionEvent(message, historicalTagTarget, historicalReaction),
+            "TAGMSG" when Parameter(message, 0) is { Length: > 0 } ordinaryTagTarget
+                && IsSafeTagmsgTarget(ordinaryTagTarget)
+                => new IrcTagmsgEvent(message, ordinaryTagTarget),
             _ => null
         };
 
