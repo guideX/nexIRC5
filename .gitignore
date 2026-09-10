@@ -6,4 +6,4 @@
 *.suo
 TestResults/
 coverage/
-
+artifacts/phase27/

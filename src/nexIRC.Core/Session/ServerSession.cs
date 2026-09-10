@@ -114,6 +114,16 @@ public sealed class ServerSession : IAsyncDisposable
 
     public event EventHandler<SessionSemanticEvent>? SemanticEventReceived;
 
+    /// <summary>
+    /// Developer diagnostics tap for the redacted raw receive path.
+    /// Subscribers are observational only and never own the bounded event
+    /// channel consumed by the application event drainer.
+    /// </summary>
+    public event EventHandler<RawIrcLineEvent>? RawLineReceived;
+
+    /// <summary>Developer diagnostics tap for sanitized outbound commands.</summary>
+    public event EventHandler<OutboundIrcCommandEvent>? OutboundCommandSent;
+
     public IrcEventDispatcher EventDispatcher { get; } = new();
 
     public ServerSessionSnapshot Snapshot
@@ -970,11 +980,13 @@ public sealed class ServerSession : IAsyncDisposable
                 if (IsCurrentEpoch(epoch))
                 {
                     var redactedBytes = IrcSensitiveData.RedactFramedBytes(command.FramedBytes.Span);
-                    _outboundEvents.Writer.TryWrite(new OutboundIrcCommandEvent(
+                    var outboundEvent = new OutboundIrcCommandEvent(
                         DateTimeOffset.UtcNow,
                         IrcSensitiveData.RedactLine(command.Line),
                         redactedBytes,
-                        epoch.Generation));
+                        epoch.Generation);
+                    _outboundEvents.Writer.TryWrite(outboundEvent);
+                    PublishOutboundDiagnostic(outboundEvent);
                 }
             }
         }
@@ -1001,8 +1013,11 @@ public sealed class ServerSession : IAsyncDisposable
         }
 
         var receivedAt = DateTimeOffset.UtcNow;
-        var rawEvent = new RawIrcLineEvent(receivedAt, frame.Text, frame.Bytes, epoch.Generation);
+        var redactedLine = IrcSensitiveData.RedactLine(frame.Text);
+        var redactedBytes = IrcSensitiveData.RedactFramedBytes(frame.Bytes.Span);
+        var rawEvent = new RawIrcLineEvent(receivedAt, redactedLine, redactedBytes, epoch.Generation);
         await _rawEvents.Writer.WriteAsync(rawEvent, connectionCts.Token).ConfigureAwait(false);
+        PublishRawDiagnostic(rawEvent);
         if (!IsCurrentEpoch(epoch))
         {
             return;
@@ -1283,6 +1298,30 @@ public sealed class ServerSession : IAsyncDisposable
         else if (!KnownCommands.Contains(message.Command))
         {
             await PublishSemanticAsync(new IrcUnknownCommandEvent(message), epoch, receivedAt).ConfigureAwait(false);
+        }
+    }
+
+    private void PublishRawDiagnostic(RawIrcLineEvent rawEvent)
+    {
+        try
+        {
+            RawLineReceived?.Invoke(this, rawEvent);
+        }
+        catch
+        {
+            // Diagnostics must never alter the protocol state machine.
+        }
+    }
+
+    private void PublishOutboundDiagnostic(OutboundIrcCommandEvent outboundEvent)
+    {
+        try
+        {
+            OutboundCommandSent?.Invoke(this, outboundEvent);
+        }
+        catch
+        {
+            // Diagnostics must never alter the protocol state machine.
         }
     }
 

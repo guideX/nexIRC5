@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>nexIRC.Interoperability</AssemblyName>
+    <RootNamespace>nexIRC.Interoperability</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\nexIRC.Core\nexIRC.Core.csproj" />
+    <ProjectReference Include="..\nexIRC.Networking\nexIRC.Networking.csproj" />
+    <ProjectReference Include="..\nexIRC.Application\nexIRC.Application.csproj" />
+  </ItemGroup>
+</Project>
