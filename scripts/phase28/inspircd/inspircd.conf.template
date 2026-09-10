@@ -1,0 +1,45 @@
+# Phase 28 disposable InspIRCd configuration template.
+# The launcher substitutes @PORT@, @CONFIGDIR@, @DATADIR@, @LOGDIR@,
+# @MODULEDIR@, @RUNTIMEDIR@, @CLIENTTAGPOLICY@, @MODULES@, and
+# @CTCTAGS_CONFIG@.
+
+<server name="inspircd.phase28.local"
+        description="nexIRC Phase 28 interoperability server"
+        network="Phase28InspIRCd">
+
+<admin name="nexIRC Phase 28"
+       description="Disposable localhost interoperability test"
+       email="noreply@localhost">
+
+<path configdir="@CONFIGDIR@"
+      datadir="@DATADIR@"
+      logdir="@LOGDIR@"
+      moduledir="@MODULEDIR@"
+      runtimedir="@RUNTIMEDIR@">
+
+<bind address="127.0.0.1" port="@PORT@" type="clients">
+
+<connect name="main"
+         allow="127.0.0.1"
+         timeout="30"
+         pingfreq="1m"
+         resolvehostnames="no"
+         useident="no"
+         localmax="5"
+         globalmax="5"
+         limit="50"
+         maxchans="20"
+         hardsendq="1M"
+         softsendq="64K"
+         recvq="64K"
+         threshold="100">
+
+<files motd="motd.example.txt">
+
+<options defaultbind="ipv4"
+         defaultmodes="nost">
+
+<log method="file" type="*" level="normal" target="phase28.log">
+
+@MODULES@
+@CTCTAGS_CONFIG@
