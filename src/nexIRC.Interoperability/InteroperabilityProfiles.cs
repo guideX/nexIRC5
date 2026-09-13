@@ -49,6 +49,9 @@ internal static class InteroperabilityProfileCatalog
             IrcCapabilityCatalog.EventPlayback
         };
 
+    private static readonly IReadOnlySet<string> NoProfileCapabilityAssumptions =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
     public static IReadOnlyDictionary<string, InteroperabilityServerProfile> Profiles { get; } =
         new Dictionary<string, InteroperabilityServerProfile>(StringComparer.OrdinalIgnoreCase)
         {
@@ -60,6 +63,14 @@ internal static class InteroperabilityProfileCatalog
                 true,
                 "external-service",
                 CommonOptionalCapabilities),
+            ["inspircd-testnet"] = new(
+                "inspircd-testnet",
+                "InspIRCd",
+                "testnet.inspircd.org",
+                6697,
+                true,
+                "external-service",
+                NoProfileCapabilityAssumptions),
             ["inspircd-local-full"] = new(
                 "inspircd-local-full",
                 "InspIRCd",

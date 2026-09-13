@@ -118,7 +118,9 @@ internal sealed record Phase27Options(
         }
 
         var stamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
-        output ??= Path.Combine("artifacts", "phase27", $"phase27-result-{stamp}.json");
+        output ??= profile.Name.Equals("inspircd-testnet", StringComparison.OrdinalIgnoreCase)
+            ? Path.Combine("artifacts", "phase29", "inspircd-testnet-result.json")
+            : Path.Combine("artifacts", "phase27", $"phase27-result-{stamp}.json");
         return new Phase27Options(server, port, useTls, TimeSpan.FromSeconds(timeoutSeconds), output, transcript, profile);
     }
 }
@@ -151,6 +153,12 @@ internal sealed class Phase27Harness
     private string? _resultPath;
     private string? _transcriptPath;
     private bool _durableEvidence;
+    private bool _queryReplyEvidence;
+    private bool _queryReactionEvidence;
+
+    private bool IsPhase29 => _options.Profile.Name.Equals("inspircd-testnet", StringComparison.OrdinalIgnoreCase);
+
+    private string PhaseNumber => IsPhase29 ? "29" : "27";
 
     public Phase27Harness(Phase27Options options) => _options = options;
 
@@ -158,8 +166,10 @@ internal sealed class Phase27Harness
     {
         var result = new Phase27RunResult
         {
-            SchemaVersion = _options.Profile.Name.StartsWith("inspircd-", StringComparison.OrdinalIgnoreCase)
-                ? "nexIRC-phase28-v1"
+            SchemaVersion = IsPhase29
+                ? "nexIRC-phase29-v1"
+                : _options.Profile.Name.StartsWith("inspircd-", StringComparison.OrdinalIgnoreCase)
+                    ? "nexIRC-phase28-v1"
                 : "nexIRC-phase27-v1",
             ProfileName = _options.Profile.Name,
             Profile = new Phase28ProfileEvidence(
@@ -173,14 +183,14 @@ internal sealed class Phase27Harness
                 _options.Profile.ClientTagPolicy),
             StartedAt = _startedAt,
             Endpoint = new Phase27EndpointEvidence(_options.Server, _options.Port, _options.UseTls, ClassifyEndpoint(_options.Server)),
-            Outcome = "HARNESS_COMPLETE_SERVER_BLOCKED"
+            Outcome = IsPhase29 ? "TESTNET_UNREACHABLE" : "HARNESS_COMPLETE_SERVER_BLOCKED"
         };
 
         using var timeout = new CancellationTokenSource(_options.Timeout);
-        var channel = $"#nexirc27-{RandomToken(8)}";
-        var nickA = $"n27a{RandomToken(8)}";
-        var nickB = $"n27b{RandomToken(8)}";
-        var evidenceRoot = Path.Combine(Path.GetTempPath(), $"nexirc-phase27-{Guid.NewGuid():N}");
+        var channel = $"#nexirc{PhaseNumber}-{RandomToken(8)}";
+        var nickA = $"n{PhaseNumber}a{RandomToken(8)}";
+        var nickB = $"n{PhaseNumber}b{RandomToken(8)}";
+        var evidenceRoot = Path.Combine(Path.GetTempPath(), $"nexirc-phase{PhaseNumber}-{Guid.NewGuid():N}");
         Directory.CreateDirectory(evidenceRoot);
 
         try
@@ -193,10 +203,11 @@ internal sealed class Phase27Harness
             await _clientB.ConnectAsync(timeout.Token).ConfigureAwait(false);
             await RunScenariosAsync(channel, timeout.Token).ConfigureAwait(false);
 
+            var completedOutcome = DetermineSuccessOutcome();
             result = result with
             {
-                Outcome = DetermineSuccessOutcome(),
-                Success = true,
+                Outcome = completedOutcome,
+                Success = completedOutcome is not "TESTNET_CAPABILITY_BLOCKED" and not "INSPIRCD_CORE_INTEROP_VERIFIED",
                 Server = BuildServerEvidence(_clientA, _clientB),
                 Scenarios = BuildScenarioEvidence(),
                 Notes = _notes.ToArray()
@@ -206,7 +217,8 @@ internal sealed class Phase27Harness
         {
             result = result with
             {
-                Failure = $"The bounded Phase 27 run exceeded {_options.Timeout.TotalSeconds:0} seconds.",
+                Failure = $"The bounded Phase {PhaseNumber} run exceeded {_options.Timeout.TotalSeconds:0} seconds.",
+                Outcome = IsPhase29 ? "TESTNET_UNREACHABLE" : result.Outcome,
                 Notes = _notes.Append("No live success is claimed for a timed-out run.").ToArray(),
                 Server = BuildServerEvidence(_clientA, _clientB),
                 Scenarios = BuildScenarioEvidence()
@@ -216,6 +228,9 @@ internal sealed class Phase27Harness
         {
             result = result with
             {
+                Outcome = IsPhase29 && (_clientA is null || _clientB is null)
+                    ? "TESTNET_UNREACHABLE"
+                    : result.Outcome,
                 Failure = $"{exception.GetType().Name}: {exception.Message}",
                 Notes = _notes.Append("No live success is claimed for a failed run.").ToArray(),
                 Server = BuildServerEvidence(_clientA, _clientB),
@@ -266,7 +281,22 @@ internal sealed class Phase27Harness
             channel,
             new IrcEndpoint(_options.Server, _options.Port, _options.UseTls),
             logRoot,
-            RequestedCapabilities);
+            RequestedCapabilities,
+            PhaseNumber);
+
+    private async Task CaptureVersionEvidenceAsync(CancellationToken cancellationToken)
+    {
+        var client = _clientA ?? throw new InvalidOperationException("Client A was not created.");
+        await client.Network.Session.SendCommandAsync("VERSION", cancellationToken: cancellationToken).ConfigureAwait(false);
+        if (await WaitForOptionalAsync(() => client.InboundLines().Any(IsVersionEvidence), cancellationToken).ConfigureAwait(false))
+        {
+            _notes.Add($"The server responded to an ordinary VERSION query; observed version evidence: {ParseServerVersion(client, _clientB!)}.");
+        }
+        else
+        {
+            _notes.Add("The ordinary VERSION query produced no bounded 351 response; welcome numeric version evidence remains authoritative.");
+        }
+    }
 
     private async Task RunScenariosAsync(string channel, CancellationToken cancellationToken)
     {
@@ -277,6 +307,7 @@ internal sealed class Phase27Harness
         await WaitForAsync(() => b.Network.Snapshot.Registration == RegistrationState.Registered, "client B registration", cancellationToken).ConfigureAwait(false);
         await WaitForAsync(() => a.Channel.IsJoined, "client A channel join", cancellationToken).ConfigureAwait(false);
         await WaitForAsync(() => b.Channel.IsJoined, "client B channel join", cancellationToken).ConfigureAwait(false);
+        await CaptureVersionEvidenceAsync(cancellationToken).ConfigureAwait(false);
 
         _notes.Add($"Temporary channel: {channel}; nicknames were randomized for this run.");
         var relationshipReady = await CaptureParentAndReplyAsync(channel, cancellationToken).ConfigureAwait(false);
@@ -334,7 +365,7 @@ internal sealed class Phase27Harness
     {
         var a = _clientA!;
         var b = _clientB!;
-        var parentText = $"phase27-parent-{RandomToken(10)}";
+        var parentText = $"phase{PhaseNumber}-parent-{RandomToken(10)}";
         var parentOutboundBefore = a.OutboundCount(line => IsPrivmsg(line, channel, parentText));
         var send = await a.Router.SendMessageAsync(a.Network, channel, parentText, a.Channel, cancellationToken).ConfigureAwait(false);
         Require(send.Succeeded, $"parent send failed: {send.Message}");
@@ -363,7 +394,7 @@ internal sealed class Phase27Harness
         _parentMessageId = parentId;
         RecordScenario("canonical-parent", InteroperabilityScenarioStatus.Passed, "The parent was relayed with an opaque canonical msgid; client A's own no-echo copy was not used as the relationship key.");
 
-        var replyText = $"phase27-reply-{RandomToken(10)}";
+        var replyText = $"phase{PhaseNumber}-reply-{RandomToken(10)}";
         Require(b.Router.TryCreateReplyComposer(b.Network, b.Channel, parentB!, out var composer, out var reason), reason ?? "reply composer unavailable");
         var replyOutboundBefore = b.OutboundCount(line => IsReplyPrivmsg(line, channel, _parentMessageId!, replyText));
         var reply = await b.Router.SendReplyAsync(b.Network, b.Channel, composer!, replyText, cancellationToken).ConfigureAwait(false);
@@ -483,7 +514,7 @@ internal sealed class Phase27Harness
     {
         var a = _clientA!;
         var b = _clientB!;
-        var tag = "+nexirc/phase27-test";
+        var tag = $"+nexirc/phase{PhaseNumber}-test";
         var before = a.InboundCount(line => HasTag(line, tag));
         await b.Network.Session.SendTaggedCommandAsync(
             new Dictionary<string, string?>(StringComparer.Ordinal) { [tag] = "ok" },
@@ -492,12 +523,12 @@ internal sealed class Phase27Harness
             cancellationToken: cancellationToken).ConfigureAwait(false);
         if (await WaitForOptionalAsync(() => a.InboundCount(line => HasTag(line, tag)) > before, cancellationToken).ConfigureAwait(false))
         {
-            _notes.Add("The namespaced +nexirc/phase27-test TAGMSG was relayed, demonstrating generic client-only tag relay independently of reaction parsing.");
+            _notes.Add($"The namespaced {tag} TAGMSG was relayed, demonstrating generic client-only tag relay independently of reaction parsing.");
             RecordScenario("unknown-client-tag-relay", InteroperabilityScenarioStatus.Passed, "The permitted namespaced client-only tag was relayed semantically unchanged.");
         }
         else
         {
-            _notes.Add("The server did not relay the namespaced +nexirc/phase27-test TAGMSG; this is recorded as observed server policy, not a parser failure.");
+            _notes.Add($"The server did not relay the namespaced {tag} TAGMSG; this is recorded as observed server policy, not a parser failure.");
             RecordScenario("unknown-client-tag-relay", InteroperabilityScenarioStatus.BlockedByServer, "The client-only test tag was sent, but no semantic relay was observed.");
         }
     }
@@ -505,7 +536,7 @@ internal sealed class Phase27Harness
     private async Task CaptureServerErrorAsync(string channel, CancellationToken cancellationToken)
     {
         var b = _clientB!;
-        var nonexistent = $"#nexirc27-nope-{RandomToken(6)}";
+        var nonexistent = $"#nexirc{PhaseNumber}-nope-{RandomToken(6)}";
         try
         {
             await b.Network.Session.SendReactionAsync(nonexistent, "👍", _parentMessageId!, cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -527,10 +558,13 @@ internal sealed class Phase27Harness
         var a = _clientA!;
         var b = _clientB!;
         var oldGeneration = b.Network.Snapshot.ConnectionGeneration;
+        var originalCapabilities = b.Network.Snapshot.Capabilities.Enabled.ToHashSet(StringComparer.Ordinal);
         await b.Manager.ReconnectAsync(b.Network.Id, cancellationToken).ConfigureAwait(false);
         b.AttachTrace();
         await WaitForAsync(() => b.Network.Snapshot.Registration == RegistrationState.Registered, "client B reconnect registration", cancellationToken).ConfigureAwait(false);
         await WaitForAsync(() => b.Network.Channels.Any(item => item.IsJoined), "client B reconnect channel join", cancellationToken).ConfigureAwait(false);
+        var freshCapabilities = b.Network.Snapshot.Capabilities.Enabled.ToHashSet(StringComparer.Ordinal);
+        _notes.Add($"Reconnect renegotiated CAP on a fresh session; capability set unchanged={originalCapabilities.SetEquals(freshCapabilities)}; enabled={string.Join(",", freshCapabilities.OrderBy(static value => value, StringComparer.Ordinal))}.");
         var currentChannel = b.Network.Channels.First(item => item.IsJoined);
         if (_parentMessageId is not { Length: > 0 })
         {
@@ -564,7 +598,7 @@ internal sealed class Phase27Harness
 
         await a.Manager.DisconnectAsync(a.Network.Id).ConfigureAwait(false);
         a.AttachTrace();
-        var offlineMessage = $"phase27-history-extra-{RandomToken(10)}";
+        var offlineMessage = $"phase{PhaseNumber}-history-extra-{RandomToken(10)}";
         var send = await b.Router.SendMessageAsync(b.Network, channel, offlineMessage, currentChannel, cancellationToken).ConfigureAwait(false);
         Require(send.Succeeded, $"history extra message failed: {send.Message}");
         await WaitForAsync(() => currentChannel.EntriesSnapshot.Any(entry => entry.Text == offlineMessage && entry.ServerMessageId is not null), "history extra message echo", cancellationToken).ConfigureAwait(false);
@@ -627,7 +661,8 @@ internal sealed class Phase27Harness
         var peerA = b.Nickname;
         var peerB = a.Nickname;
         var queryA = a.Router.OpenQuery(a.Network, peerA);
-        var dmParentText = $"phase27-dm-parent-{RandomToken(10)}";
+        var unrelatedQuery = a.Router.OpenQuery(a.Network, $"n{PhaseNumber}other{RandomToken(6)}");
+        var dmParentText = $"phase{PhaseNumber}-dm-parent-{RandomToken(10)}";
         var sent = await a.Router.SendMessageAsync(a.Network, peerA, dmParentText, queryA, cancellationToken).ConfigureAwait(false);
         Require(sent.Succeeded, $"DM parent send failed: {sent.Message}");
         await WaitForAsync(() => queryA.EntriesSnapshot.Any(entry => entry.Text == dmParentText && entry.ServerMessageId is not null), "DM parent own echo", cancellationToken).ConfigureAwait(false);
@@ -639,20 +674,28 @@ internal sealed class Phase27Harness
         Require(string.Equals(parentA.ServerMessageId, parentB.ServerMessageId, StringComparison.Ordinal), "DM parent msgid differed between clients");
 
         Require(b.Router.TryCreateReplyComposer(b.Network, queryB, parentB, out var composer, out var reason), reason ?? "DM reply composer unavailable");
-        var dmReplyText = $"phase27-dm-reply-{RandomToken(10)}";
+        var dmReplyText = $"phase{PhaseNumber}-dm-reply-{RandomToken(10)}";
         var reply = await b.Router.SendReplyAsync(b.Network, queryB, composer!, dmReplyText, cancellationToken).ConfigureAwait(false);
         Require(reply.Succeeded, $"DM reply failed: {reply.Message}");
         await WaitForAsync(() => queryA.EntriesSnapshot.Any(entry => entry.Text == dmReplyText && entry.ReplyParentMessageId == parentA.ServerMessageId), "DM reply relay", cancellationToken).ConfigureAwait(false);
+        await WaitForAsync(() => queryB.EntriesSnapshot.Count(entry => entry.Text == dmReplyText && entry.ReplyParentMessageId == parentB.ServerMessageId) == 1, "DM reply echo projection", cancellationToken).ConfigureAwait(false);
+        Require(queryA.EntriesSnapshot.Count(entry => entry.Text == dmReplyText && entry.ReplyParentMessageId == parentA.ServerMessageId) == 1, "DM reply relay produced duplicate projected rows");
+        _queryReplyEvidence = true;
 
         var before = queryA.EntryCount;
+        var beforeB = queryB.EntryCount;
         var reaction = await b.Router.SendReactionAsync(b.Network, queryB, parentB, "👍", cancellationToken: cancellationToken).ConfigureAwait(false);
         Require(reaction.Succeeded, $"DM reaction failed: {reaction.Message}");
-        await WaitForAsync(() => ReactionCount(queryA, parentA.ServerMessageId!, "👍") == 1, "DM reaction relay", cancellationToken).ConfigureAwait(false);
-        Require(queryA.EntryCount == before, "DM reaction created a blank query row");
+        await WaitForAsync(() => ReactionCount(queryA, parentA.ServerMessageId!, "👍") == 1
+            && ReactionCount(queryB, parentB.ServerMessageId!, "👍") == 1, "DM reaction relay and echo", cancellationToken).ConfigureAwait(false);
+        _queryReactionEvidence = true;
+        Require(queryA.EntryCount == before && queryB.EntryCount == beforeB, "DM reaction created a blank query row or echo duplicate");
         var unreaction = await b.Router.SendReactionAsync(b.Network, queryB, parentB, "👍", unreaction: true, cancellationToken).ConfigureAwait(false);
         Require(unreaction.Succeeded, $"DM unreaction failed: {unreaction.Message}");
-        await WaitForAsync(() => ReactionCount(queryA, parentA.ServerMessageId!, "👍") == 0, "DM unreaction relay", cancellationToken).ConfigureAwait(false);
-        Require(queryA.EntriesSnapshot.All(entry => !entry.Text.StartsWith("phase27-parent-", StringComparison.Ordinal)), "DM query leaked channel content");
+        await WaitForAsync(() => ReactionCount(queryA, parentA.ServerMessageId!, "👍") == 0
+            && ReactionCount(queryB, parentB.ServerMessageId!, "👍") == 0, "DM unreaction relay", cancellationToken).ConfigureAwait(false);
+        Require(queryA.EntriesSnapshot.All(entry => !entry.Text.StartsWith($"phase{PhaseNumber}-parent-", StringComparison.Ordinal)), "DM query leaked channel content");
+        Require(unrelatedQuery.EntryCount == 0, "DM relationship events leaked into an unrelated query");
 
         await a.Store.FlushAsync(cancellationToken).ConfigureAwait(false);
         var search = await a.Store.SearchDetailedAsync(new ConversationLogQuery
@@ -825,7 +868,10 @@ internal sealed class Phase27Harness
             ClassifyReactionSupport(a, b, deny))
         {
             CapabilityMatrix = BuildCapabilityMatrix(a, b),
-            ClientTagPolicy = _options.Profile.ClientTagPolicy ?? "unknown/unconfigured"
+            ClientTagPolicy = _options.Profile.ClientTagPolicy ?? "unknown/unconfigured",
+            ServerName = ParseServerName(a, b),
+            Welcome = ParseWelcome(a, b),
+            VersionEvidence = ParseVersionEvidence(a, b)
         };
     }
 
@@ -876,8 +922,8 @@ internal sealed class Phase27Harness
         _clientB?.InboundCount(line => line.RawLine.Contains(IrcReaction.ReactTag, StringComparison.Ordinal)) > 0,
         _clientA?.InboundCount(line => line.RawLine.Contains(IrcReaction.UnreactTag, StringComparison.Ordinal)) > 0,
         _clientA?.Channel.EntryCount > 0,
-        _clientA?.Network.Queries.Any(query => query.EntriesSnapshot.Any(entry => entry.ReplyParentMessageId is not null)) == true,
-        _clientA?.Network.Queries.Any(query => query.EntriesSnapshot.Any(entry => entry.Text.Contains("phase27-dm-parent", StringComparison.Ordinal))) == true,
+        _queryReplyEvidence,
+        _queryReactionEvidence,
         _clientA?.Network.Snapshot.State == ServerSessionState.Registered,
         _durableEvidence,
         "Unavailable: a safe live missing-parent projection was not reproducible; deterministic Phase 25/26 recovery tests remain authoritative.")
@@ -917,6 +963,20 @@ internal sealed class Phase27Harness
             && _scenarioEvidence.Any(item => item.Name == "reply-relay" && item.Status == InteroperabilityScenarioStatus.Passed)
             && _scenarioEvidence.Any(item => item.Name == "reaction-lifecycle" && item.Status == InteroperabilityScenarioStatus.Passed)
             && _scenarioEvidence.Any(item => item.Name == "unreaction" && item.Status == InteroperabilityScenarioStatus.Passed);
+        if (IsPhase29)
+        {
+            if (!corePassed)
+            {
+                return "TESTNET_CAPABILITY_BLOCKED";
+            }
+
+            var extendedPassed = _scenarioEvidence.Any(item => item.Name == "reaction-aggregation" && item.Status == InteroperabilityScenarioStatus.Passed)
+                && _scenarioEvidence.Any(item => item.Name == "query-reply-reaction" && item.Status == InteroperabilityScenarioStatus.Passed)
+                && _scenarioEvidence.Any(item => item.Name == "reconnect" && item.Status == InteroperabilityScenarioStatus.Passed)
+                && _scenarioEvidence.Any(item => item.Name == "durable-reopen" && item.Status == InteroperabilityScenarioStatus.Passed);
+            return extendedPassed ? "MULTI_SERVER_INTEROPERABILITY_VERIFIED" : "INSPIRCD_CORE_INTEROP_VERIFIED";
+        }
+
         return corePassed ? "SECOND_SERVER_CORE_INTEROP_VERIFIED" : "SECOND_SERVER_CAPABILITY_VARIANCE_SAFE";
     }
 
@@ -994,6 +1054,15 @@ internal sealed class Phase27Harness
         foreach (var line in a.InboundLines().Concat(b.InboundLines()))
         {
             var parsed = IrcMessageParser.Parse(line.RawLine);
+            if (parsed.Success && parsed.Message?.NumericCommand == 351 && parsed.Message.Parameters.Count >= 2)
+            {
+                var version = parsed.Message.Parameters[1];
+                if (!string.IsNullOrWhiteSpace(version))
+                {
+                    return version;
+                }
+            }
+
             if (parsed.Success && parsed.Message?.NumericCommand == 2 && parsed.Message.TrailingParameter is { } text)
             {
                 var match = Regex.Match(text, @"running version\s+(?<version>\S+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
@@ -1006,6 +1075,34 @@ internal sealed class Phase27Harness
 
         return "unknown";
     }
+
+    private static string ParseServerName(Phase27Client a, Phase27Client b) =>
+        a.InboundLines()
+            .Concat(b.InboundLines())
+            .Select(line => IrcMessageParser.Parse(line.RawLine).Message)
+            .Where(message => message is not null && message.NumericCommand is 1 or 2 or 5 or 351)
+            .Select(message => message!.Prefix?.Name)
+            .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name))
+        ?? "unknown";
+
+    private static string ParseWelcome(Phase27Client a, Phase27Client b) =>
+        a.InboundLines()
+            .Concat(b.InboundLines())
+            .Select(line => IrcMessageParser.Parse(line.RawLine).Message)
+            .Where(message => message?.NumericCommand == 1)
+            .Select(message => message!.TrailingParameter)
+            .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))
+        is { } welcome
+            ? Phase27Sanitizer.Sanitize(welcome)
+            : "unobserved";
+
+    private static string[] ParseVersionEvidence(Phase27Client a, Phase27Client b) =>
+        a.InboundLines()
+            .Concat(b.InboundLines())
+            .Where(IsVersionEvidence)
+            .Select(line => Phase27Sanitizer.Sanitize(line.RawLine))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
 
     private static string ClassifyEndpoint(string server) =>
         IPAddress.TryParse(server, out var address) && IPAddress.IsLoopback(address)
@@ -1022,9 +1119,9 @@ internal sealed class Phase27Harness
         }
 
         var message = parsed.Message;
-        return message.Command is "CAP" or "JOIN" or "PART" or "PRIVMSG" or "TAGMSG" or "BATCH" or "CHATHISTORY" or "FAIL"
+        return message.Command is "CAP" or "JOIN" or "PART" or "PRIVMSG" or "TAGMSG" or "BATCH" or "CHATHISTORY" or "FAIL" or "VERSION"
             || message.NumericCommand == 5
-            || message.NumericCommand is 400 or 401 or 402 or 403 or 404 or 405 or 407 or 409 or 411 or 412 or 421 or 461;
+            || message.NumericCommand is 1 or 2 or 351 or 400 or 401 or 402 or 403 or 404 or 405 or 407 or 409 or 411 or 412 or 421 or 461;
     }
 
     private static bool IsPrivmsg(Phase27TraceLine line, string target, string text)
@@ -1068,6 +1165,12 @@ internal sealed class Phase27Harness
         return parsed.Success && (parsed.Message?.Command == "FAIL" || parsed.Message?.NumericCommand is >= 400 and <= 599);
     }
 
+    private static bool IsVersionEvidence(Phase27TraceLine line)
+    {
+        var parsed = IrcMessageParser.Parse(line.RawLine);
+        return parsed.Success && line.Direction == IrcTranscriptDirection.Inbound && parsed.Message?.NumericCommand == 351;
+    }
+
     private static TranscriptEntry FindEntry(WorkspaceView view, string messageId) =>
         view.EntriesSnapshot.Single(entry => string.Equals(entry.ServerMessageId, messageId, StringComparison.Ordinal));
 
@@ -1085,7 +1188,7 @@ internal sealed class Phase27Harness
             cancellationToken.ThrowIfCancellationRequested();
             if (DateTimeOffset.UtcNow >= deadline)
             {
-                throw new TimeoutException($"Phase 27 condition was not reached: {description}.");
+                throw new TimeoutException($"Interoperability condition was not reached: {description}.");
             }
 
             await Task.Delay(25, cancellationToken).ConfigureAwait(false);
@@ -1144,7 +1247,7 @@ internal sealed class Phase27Client : IAsyncDisposable
     private readonly object _traceGate = new();
     private readonly List<ServerSession> _tracedSessions = [];
 
-    public Phase27Client(string label, string nickname, string channel, IrcEndpoint endpoint, string logRoot, IReadOnlyList<string> requestedCapabilities)
+    public Phase27Client(string label, string nickname, string channel, IrcEndpoint endpoint, string logRoot, IReadOnlyList<string> requestedCapabilities, string phaseNumber)
     {
         Label = label;
         Nickname = nickname;
@@ -1168,11 +1271,11 @@ internal sealed class Phase27Client : IAsyncDisposable
         Manager = new NetworkSessionManager(new TcpTlsIrcTransportFactory(), configuration: configuration, logStore: Store);
         Network = Manager.Add(new NetworkConnectionOptions
         {
-            DisplayName = $"Phase 27 client {label}",
+            DisplayName = $"Phase {phaseNumber} client {label}",
             Endpoint = endpoint,
             Nickname = nickname,
             Username = nickname,
-            RealName = "nexIRC 5 Phase 27 interoperability test",
+            RealName = $"nexIRC 5 Phase {phaseNumber} interoperability test",
             RequestedCapabilities = requestedCapabilities,
             DesiredChannels = new HashSet<string>(StringComparer.Ordinal) { channel },
             Reconnect = new ReconnectPolicy(Enabled: false),
@@ -1331,6 +1434,9 @@ internal sealed record Phase27ServerEvidence(
 {
     public IReadOnlyDictionary<string, string> CapabilityMatrix { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
     public string ClientTagPolicy { get; init; } = "unknown/unconfigured";
+    public string ServerName { get; init; } = "unknown";
+    public string Welcome { get; init; } = "unobserved";
+    public IReadOnlyList<string> VersionEvidence { get; init; } = Array.Empty<string>();
 }
 internal sealed record Phase27HistoryEvidence(
     bool CapabilityEnabled,
