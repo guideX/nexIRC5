@@ -62,7 +62,7 @@ public sealed record ChannelAuthority(
 
         var snapshot = network.Snapshot;
         var connected = snapshot.Registration == RegistrationState.Registered
-            && snapshot.State is not (ServerSessionState.Disconnected or ServerSessionState.Failed or ServerSessionState.ReconnectWaiting);
+            && snapshot.Continuity.State == ConnectionContinuityState.Synchronized;
         if (!connected)
         {
             return Create(network, channel, "unknown", ChannelAuthorityDecision.Denied("The network is not registered."), null, false);

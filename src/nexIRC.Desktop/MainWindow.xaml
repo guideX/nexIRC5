@@ -124,7 +124,7 @@
             </DockPanel>
         </DataTemplate>
         <DataTemplate DataType="{x:Type app:ServerStatusView}">
-            <TextBlock Text="{Binding DisplayLabel}" Margin="4,2" ToolTip="{Binding StateText}" />
+            <TextBlock Text="{Binding DisplayLabel}" Margin="4,2" ToolTip="{Binding ContinuityText}" />
         </DataTemplate>
         <DataTemplate DataType="{x:Type app:ChannelView}">
             <TextBlock Margin="4,2" ToolTip="{Binding LifecycleText}">
@@ -152,7 +152,8 @@
                 <StackPanel>
                     <TextBlock Text="Server status" FontSize="20" FontWeight="SemiBold" Foreground="#172033" />
                     <TextBlock Text="{Binding EndpointText}" Foreground="#64748B" Margin="0,4,0,10" />
-                    <TextBlock Text="{Binding StateText}" FontWeight="SemiBold" Foreground="#2563EB" />
+                    <TextBlock Text="{Binding ContinuityText}" FontWeight="SemiBold" Foreground="#2563EB" />
+                    <TextBlock Text="{Binding StateText, StringFormat=IRC: {0}}" Foreground="#64748B" Margin="0,2,0,0" />
                     <TextBlock Text="IRCv3 capabilities" FontWeight="SemiBold" Margin="0,10,0,2" />
                     <TextBlock Text="{Binding CapabilitiesText}" Foreground="#475569" />
                 </StackPanel>

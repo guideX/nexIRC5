@@ -274,6 +274,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
         return _logStore is not null
             || network.Snapshot.Registration == RegistrationState.Registered
+                && network.Snapshot.Continuity.State == ConnectionContinuityState.Synchronized
                 && network.Session.CanLoadOlderHistory(conversation);
     }
 
@@ -294,6 +295,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
         return _logStore is not null
             || network.Snapshot.Registration == RegistrationState.Registered
+                && network.Snapshot.Continuity.State == ConnectionContinuityState.Synchronized
                 && network.Session.CanLoadNewerHistory(HistoryConversation(view));
     }
 
@@ -304,6 +306,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(anchor);
         if (network.Id != view.NetworkId
             || network.Snapshot.Registration != RegistrationState.Registered
+            || network.Snapshot.Continuity.State != ConnectionContinuityState.Synchronized
             || view is not (ChannelView or QueryView)
             || _logStore is null && !network.Session.ChathistorySupport.IsUsable)
         {
@@ -519,6 +522,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         return network.Snapshot.Registration == RegistrationState.Registered
+            && network.Snapshot.Continuity.State == ConnectionContinuityState.Synchronized
             && network.Session.ChathistorySupport.IsUsable
             && SelectHistoryTarget(view) is not null;
     }
@@ -2480,6 +2484,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         var currentSnapshot = entry.Session.Snapshot;
         var desiredChannels = currentSnapshot.DesiredChannels.ToHashSet(IrcCaseMappingComparer.For(currentSnapshot.Features.CaseMapping));
         CaptureReconnectBoundaries(entry, currentSnapshot.ConnectionGeneration);
+        entry.ContinuityRecoveryRequired = true;
+        entry.ContinuityPreviousGeneration = currentSnapshot.ConnectionGeneration;
         await StopEntryAsync(entry, "nexIRC reconnect").ConfigureAwait(false);
         entry.Options = entry.Options with { DesiredChannels = desiredChannels };
         entry.NeedsReplacement = true;
@@ -3464,6 +3470,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private void Attach(SessionEntry entry)
     {
         entry.Session.StateChanged += OnSessionStateChanged;
+        entry.Session.ContinuityStateChanged += OnSessionContinuityStateChanged;
         entry.Session.SemanticEventReceived += OnSessionSemanticEvent;
         entry.Workspace.ApplySnapshot(entry.Session.Snapshot);
     }
@@ -3483,13 +3490,21 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     private void ReplaceSession(SessionEntry entry)
     {
-        entry.Session = new ServerSession(entry.Options.ToSessionOptions(entry.Workspace.Id), _transportFactory);
+        var previousGeneration = entry.Workspace.Snapshot.ConnectionGeneration;
+        entry.Session = new ServerSession(
+            entry.Options.ToSessionOptions(
+                entry.Workspace.Id,
+                entry.ContinuityRecoveryRequired,
+                entry.ContinuityRecoveryRequired ? entry.ContinuityPreviousGeneration ?? previousGeneration : null),
+            _transportFactory);
         entry.Workspace.Options = entry.Options;
         entry.Workspace.Session = entry.Session;
         entry.Workspace.ResetForNewSession(entry.Session);
         entry.Started = false;
         entry.RunTask = null;
         entry.NeedsReplacement = false;
+        entry.ContinuityRecoveryRequired = false;
+        entry.ContinuityPreviousGeneration = null;
         Attach(entry);
     }
 
@@ -3497,7 +3512,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     {
         ClearOperations(entry.Workspace.Id);
         entry.Session.StateChanged -= OnSessionStateChanged;
+        entry.Session.ContinuityStateChanged -= OnSessionContinuityStateChanged;
         entry.Session.SemanticEventReceived -= OnSessionSemanticEvent;
+        entry.ContinuitySynchronizationCts?.Cancel();
         try
         {
             await entry.Session.DisposeAsync().ConfigureAwait(false);
@@ -3567,10 +3584,6 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             }
 
             entry.Workspace.ApplySnapshot(snapshot);
-            if (change.Current == ServerSessionState.Registered)
-            {
-                _ = RecoverReconnectHistoryAsync(entry, session, change.ConnectionGeneration);
-            }
             if (change.Current is ServerSessionState.Disconnected or ServerSessionState.Failed)
             {
                 ClearOperations(entry.Workspace.Id);
@@ -3604,6 +3617,117 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                     nameof(SessionStateChangedEvent)));
             }
         }, WorkspaceDispatchActionCategory.Lifecycle);
+    }
+
+    private void OnSessionContinuityStateChanged(object? sender, ConnectionContinuityStateChangedEvent change)
+    {
+        if (sender is not ServerSession session || !TryGetEntry(session, out var entry))
+        {
+            return;
+        }
+
+        if (change.Current == ConnectionContinuityState.Interrupted)
+        {
+            entry.ContinuitySynchronizationCts?.Cancel();
+        }
+
+        if (change.Current == ConnectionContinuityState.Synchronizing)
+        {
+            entry.ContinuitySynchronizationCts?.Cancel();
+            var synchronizationCts = new CancellationTokenSource();
+            entry.ContinuitySynchronizationCts = synchronizationCts;
+            _ = RunContinuitySynchronizationAsync(entry, session, change.Snapshot.ConnectionGeneration, synchronizationCts);
+        }
+
+        var snapshot = session.Snapshot;
+        Dispatch(() =>
+        {
+            if (_disposed || !IsCurrentGeneration(entry, session, change.Snapshot.ConnectionGeneration))
+            {
+                if (!_disposed)
+                {
+                    Interlocked.Increment(ref _staleGenerationEventsDiscarded);
+                }
+
+                return;
+            }
+
+            entry.Workspace.ApplySnapshot(snapshot);
+            if (change.Current is ConnectionContinuityState.Interrupted
+                or ConnectionContinuityState.Recovering
+                or ConnectionContinuityState.Synchronizing
+                or ConnectionContinuityState.Synchronized
+                or ConnectionContinuityState.Terminal)
+            {
+                var text = FormatContinuityTransition(change, snapshot);
+                var kind = change.Current == ConnectionContinuityState.Terminal
+                    ? TranscriptEntryKind.Error
+                    : change.Current is ConnectionContinuityState.Interrupted or ConnectionContinuityState.Recovering
+                        ? TranscriptEntryKind.Reconnect
+                        : TranscriptEntryKind.Connection;
+                entry.Workspace.StatusView.Append(new TranscriptEntry(
+                    DateTimeOffset.Now,
+                    kind,
+                    null,
+                    text,
+                    Sequence: NextActivitySequence()));
+                NotifyNavigationChanged();
+            }
+        }, WorkspaceDispatchActionCategory.Lifecycle);
+    }
+
+    private async Task RunContinuitySynchronizationAsync(
+        SessionEntry entry,
+        ServerSession session,
+        int generation,
+        CancellationTokenSource synchronizationCts)
+    {
+        var token = synchronizationCts.Token;
+        ContinuitySynchronizationOutcome outcome;
+        try
+        {
+            if (!session.ChathistorySupport.IsUsable)
+            {
+                outcome = ContinuitySynchronizationOutcome.Unsupported;
+            }
+            else
+            {
+                outcome = await RecoverReconnectHistoryAsync(entry, session, generation, token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (InvalidOperationException exception)
+        {
+            outcome = ContinuitySynchronizationOutcome.Partial;
+            if (session.Snapshot.ConnectionGeneration != generation)
+            {
+                return;
+            }
+
+            _ = exception;
+        }
+        catch
+        {
+            outcome = ContinuitySynchronizationOutcome.Failed;
+        }
+
+        if (token.IsCancellationRequested || !IsCurrentGeneration(entry, session, generation))
+        {
+            return;
+        }
+
+        session.CompleteSynchronization(generation, outcome, outcome switch
+        {
+            ContinuitySynchronizationOutcome.Unsupported => "The server does not advertise usable CHATHISTORY; continuity is bounded to the live replacement session.",
+            ContinuitySynchronizationOutcome.Recovered => "Bounded reconnect history reconciliation completed.",
+            ContinuitySynchronizationOutcome.NoGapObserved => "No bounded reconnect gap was observed.",
+            ContinuitySynchronizationOutcome.Partial => "Reconnect history reconciliation completed with bounded gaps remaining.",
+            ContinuitySynchronizationOutcome.Failed => "Reconnect history reconciliation failed; the live replacement session remains usable.",
+            _ => null
+        });
     }
 
     private void CaptureReconnectBoundaries(SessionEntry entry, int connectionGeneration)
@@ -3746,8 +3870,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private async Task<ReconnectHistoryBoundary?> WaitForReconnectBoundaryAsync(
         SessionEntry entry,
         string conversation,
-        int generation)
+        int generation,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (!entry.ReconnectBoundarySignals.TryGetValue(conversation, out var signal))
         {
             return null;
@@ -3759,7 +3885,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             return completed.ConnectionGeneration == generation ? completed : null;
         }
 
-        var winner = await Task.WhenAny(signal.Task, Task.Delay(ReconnectBoundaryObservationWindow)).ConfigureAwait(false);
+        var winner = await Task.WhenAny(signal.Task, Task.Delay(ReconnectBoundaryObservationWindow, cancellationToken)).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
         if (winner != signal.Task || entry.Session.Snapshot.ConnectionGeneration != generation)
         {
             return null;
@@ -3774,7 +3901,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         ServerSession session,
         ReconnectHistoryBoundary olderSource,
         ReconnectHistoryBoundary newerSource,
-        int generation)
+        int generation,
+        CancellationToken cancellationToken = default)
     {
         if (session.Snapshot.ConnectionGeneration != generation)
         {
@@ -3856,7 +3984,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         ChathistoryResult result;
         try
         {
-            result = await session.RequestHistoryAsync(request).ConfigureAwait(false);
+            result = await session.RequestHistoryAsync(request, cancellationToken).ConfigureAwait(false);
         }
         catch (InvalidOperationException exception)
         {
@@ -3991,11 +4119,16 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             : null;
     }
 
-    private async Task RecoverReconnectHistoryAsync(SessionEntry entry, ServerSession session, int generation)
+    private async Task<ContinuitySynchronizationOutcome> RecoverReconnectHistoryAsync(
+        SessionEntry entry,
+        ServerSession session,
+        int generation,
+        CancellationToken cancellationToken)
     {
+        var synchronizationOutcome = ContinuitySynchronizationOutcome.NoGapObserved;
         if (!session.ChathistorySupport.IsUsable)
         {
-            return;
+            return ContinuitySynchronizationOutcome.Unsupported;
         }
 
         var recovered = 0;
@@ -4003,6 +4136,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         var channelBoundaries = entry.ReconnectBoundaries.Values.Where(static boundary => boundary.IsChannel).Take(16).ToArray();
         foreach (var boundary in channelBoundaries)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (requests >= MaximumReconnectHistoryRequests || recovered >= MaximumReconnectMessages || session.Snapshot.ConnectionGeneration != generation)
             {
                 break;
@@ -4011,10 +4145,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             // A precise reconnect repair needs the first canonical message in
             // this same conversation.  Give the live path a short bounded
             // observation window before retaining the old LATEST fallback.
-            var newerBoundary = await WaitForReconnectBoundaryAsync(entry, boundary.Conversation, generation).ConfigureAwait(false);
+            var newerBoundary = await WaitForReconnectBoundaryAsync(entry, boundary.Conversation, generation, cancellationToken).ConfigureAwait(false);
             if (newerBoundary is not null)
             {
-                var exact = await RepairReconnectGapAsync(entry, session, boundary, newerBoundary, generation).ConfigureAwait(false);
+                var exact = await RepairReconnectGapAsync(entry, session, boundary, newerBoundary, generation, cancellationToken).ConfigureAwait(false);
                 if (exact.Attempted)
                 {
                     if (exact.RecoveredEntries > 0)
@@ -4023,6 +4157,14 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                     }
 
                     requests += exact.Requests;
+                    if (exact.RecoveredEntries > 0)
+                    {
+                        synchronizationOutcome = ContinuitySynchronizationOutcome.Recovered;
+                    }
+                    else if (exact.Requests > 0 && exact.Reason is not null)
+                    {
+                        synchronizationOutcome = ContinuitySynchronizationOutcome.Partial;
+                    }
                     continue;
                 }
             }
@@ -4051,10 +4193,18 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             requests++;
             try
             {
-                var result = await session.RequestHistoryAsync(request).ConfigureAwait(false);
+                var result = await session.RequestHistoryAsync(request, cancellationToken).ConfigureAwait(false);
                 if (result.Succeeded)
                 {
                     recovered = Math.Min(MaximumReconnectMessages, recovered + result.MessageCount);
+                    if (result.MessageCount > 0)
+                    {
+                        synchronizationOutcome = ContinuitySynchronizationOutcome.Recovered;
+                    }
+                }
+                else
+                {
+                    synchronizationOutcome = ContinuitySynchronizationOutcome.Partial;
                 }
             }
             catch (InvalidOperationException)
@@ -4070,18 +4220,19 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         var knownQueryBoundaries = entry.ReconnectBoundaries.Values.Where(static boundary => !boundary.IsChannel).Take(MaximumRecoveredQueries).ToArray();
         foreach (var boundary in knownQueryBoundaries)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (requests >= MaximumReconnectHistoryRequests || recovered >= MaximumReconnectMessages || session.Snapshot.ConnectionGeneration != generation)
             {
                 break;
             }
 
-            var newerBoundary = await WaitForReconnectBoundaryAsync(entry, boundary.Conversation, generation).ConfigureAwait(false);
+            var newerBoundary = await WaitForReconnectBoundaryAsync(entry, boundary.Conversation, generation, cancellationToken).ConfigureAwait(false);
             if (newerBoundary is null)
             {
                 continue;
             }
 
-            var exact = await RepairReconnectGapAsync(entry, session, boundary, newerBoundary, generation).ConfigureAwait(false);
+            var exact = await RepairReconnectGapAsync(entry, session, boundary, newerBoundary, generation, cancellationToken).ConfigureAwait(false);
             if (!exact.Attempted)
             {
                 continue;
@@ -4089,6 +4240,14 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
             recovered = Math.Min(MaximumReconnectMessages, recovered + exact.RecoveredEntries);
             requests += exact.Requests;
+            if (exact.RecoveredEntries > 0)
+            {
+                synchronizationOutcome = ContinuitySynchronizationOutcome.Recovered;
+            }
+            else if (exact.Requests > 0 && exact.Reason is not null)
+            {
+                synchronizationOutcome = ContinuitySynchronizationOutcome.Partial;
+            }
         }
 
         if (entry.LastDisconnectAt is not null
@@ -4096,6 +4255,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             && requests < MaximumReconnectHistoryRequests
             && recovered < MaximumReconnectMessages)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var queryBoundaries = entry.ReconnectBoundaries.Values.Where(static boundary => !boundary.IsChannel).ToArray();
             var lower = queryBoundaries.Length == 0
                 ? (entry.LastDisconnectAt ?? DateTimeOffset.UtcNow).Subtract(DiscoveryClockFuzz)
@@ -4115,12 +4275,13 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             try
             {
                 requests++;
-                var targets = await session.RequestHistoryAsync(discovery).ConfigureAwait(false);
+                var targets = await session.RequestHistoryAsync(discovery, cancellationToken).ConfigureAwait(false);
                 if (targets.Succeeded)
                 {
                     var recoveredQueries = 0;
                     foreach (var target in targets.Targets.Take(MaximumReconnectTargetResults))
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         if (target.Kind != ChathistoryTargetKind.Query
                             || recoveredQueries >= MaximumRecoveredQueries
                             || requests >= MaximumReconnectHistoryRequests
@@ -4214,10 +4375,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                                 continue;
                             }
 
-                            var newerBoundary = await WaitForReconnectBoundaryAsync(entry, matchingBoundary.Conversation, generation).ConfigureAwait(false);
+                            var newerBoundary = await WaitForReconnectBoundaryAsync(entry, matchingBoundary.Conversation, generation, cancellationToken).ConfigureAwait(false);
                             if (newerBoundary is not null)
                             {
-                                var exact = await RepairReconnectGapAsync(entry, session, matchingBoundary, newerBoundary, generation).ConfigureAwait(false);
+                                var exact = await RepairReconnectGapAsync(entry, session, matchingBoundary, newerBoundary, generation, cancellationToken).ConfigureAwait(false);
                                 if (exact.Attempted)
                                 {
                                     if (exact.RecoveredEntries > 0)
@@ -4226,6 +4387,14 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                                     }
 
                                     requests += exact.Requests;
+                                    if (exact.RecoveredEntries > 0)
+                                    {
+                                        synchronizationOutcome = ContinuitySynchronizationOutcome.Recovered;
+                                    }
+                                    else if (exact.Requests > 0 && exact.Reason is not null)
+                                    {
+                                        synchronizationOutcome = ContinuitySynchronizationOutcome.Partial;
+                                    }
                                     continue;
                                 }
                             }
@@ -4254,13 +4423,14 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                             Purpose = ChathistoryRequestPurpose.ReconnectGap
                         };
                         requests++;
-                        var result = await session.RequestHistoryAsync(request).ConfigureAwait(false);
+                        var result = await session.RequestHistoryAsync(request, cancellationToken).ConfigureAwait(false);
                         if (result.Succeeded)
                         {
                             var count = result.MessageCount;
                             recovered = Math.Min(MaximumReconnectMessages, recovered + count);
                             if (count > 0)
                             {
+                                synchronizationOutcome = ContinuitySynchronizationOutcome.Recovered;
                                 await InvokeOnDispatcherAsync(
                                     () =>
                                     {
@@ -4270,6 +4440,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                                     WorkspaceDispatchActionCategory.HistoryProjection).ConfigureAwait(false);
                                 recoveredQueries++;
                             }
+                        }
+                        else
+                        {
+                            synchronizationOutcome = ContinuitySynchronizationOutcome.Partial;
                         }
                     }
                 }
@@ -4297,6 +4471,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 NotifyNavigationChanged();
             }, WorkspaceDispatchActionCategory.HistoryProjection);
         }
+
+        return synchronizationOutcome;
     }
 
     private void OnSessionSemanticEvent(object? sender, SessionSemanticEvent item)
@@ -5008,6 +5184,24 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         return identity is null ? detail : $"{detail} · {identity}";
     }
 
+    private static string FormatContinuityTransition(
+        ConnectionContinuityStateChangedEvent change,
+        ServerSessionSnapshot snapshot)
+    {
+        var detail = change.Current switch
+        {
+            ConnectionContinuityState.Interrupted => "Connection interrupted; workspace state preserved",
+            ConnectionContinuityState.Recovering => "Recovering IRC session",
+            ConnectionContinuityState.Synchronizing => "Synchronizing continuity history",
+            ConnectionContinuityState.Synchronized => "Connection synchronized",
+            ConnectionContinuityState.Terminal => "Continuity recovery stopped",
+            ConnectionContinuityState.Disconnected => "Disconnected",
+            _ => change.Current.ToString()
+        };
+        var identity = snapshot.Features.NetworkName ?? snapshot.Identity.NetworkName;
+        return identity is null ? detail : $"{detail} · {identity}";
+    }
+
     private static IrcNotificationType NotificationType(IrcSemanticEvent semanticEvent, WorkspaceActivity activity) => semanticEvent switch
     {
         IrcQueryMessageEvent => IrcNotificationType.PrivateMessage,
@@ -5291,6 +5485,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         public DateTimeOffset? LastDisconnectAt { get; set; }
 
         public ServerSession? ReconnectSourceSession { get; set; }
+
+        public CancellationTokenSource? ContinuitySynchronizationCts { get; set; }
+
+        public bool ContinuityRecoveryRequired { get; set; }
+
+        public int? ContinuityPreviousGeneration { get; set; }
     }
 
     private sealed record ReconnectHistoryBoundary(

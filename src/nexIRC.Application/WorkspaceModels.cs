@@ -234,9 +234,14 @@ public sealed record NetworkConnectionOptions
 
     public SaslAuthenticationPolicy SaslPolicy { get; init; } = SaslAuthenticationPolicy.Disabled;
 
-    public ServerSessionOptions ToSessionOptions(Guid? networkId = null) => new()
+    public ServerSessionOptions ToSessionOptions(
+        Guid? networkId = null,
+        bool continuityRecoveryRequired = false,
+        int? continuityPreviousGeneration = null) => new()
     {
         NetworkId = networkId,
+        ContinuityRecoveryRequired = continuityRecoveryRequired,
+        ContinuityPreviousGeneration = continuityPreviousGeneration,
         Endpoint = Endpoint,
         Nickname = Nickname,
         Username = Username,
@@ -1174,6 +1179,7 @@ public abstract class WorkspaceView : ObservableObject
 public sealed class ServerStatusView : WorkspaceView
 {
     private NetworkDisplayState _connectionState = NetworkDisplayState.Disconnected;
+    private ConnectionContinuityState _continuityState = ConnectionContinuityState.Disconnected;
     private string? _networkName;
     private string _endpointText = string.Empty;
     private string _capabilitiesText = "(none negotiated)";
@@ -1190,6 +1196,12 @@ public sealed class ServerStatusView : WorkspaceView
         internal set => SetProperty(ref _connectionState, value);
     }
 
+    public ConnectionContinuityState ContinuityState
+    {
+        get => _continuityState;
+        internal set => SetProperty(ref _continuityState, value);
+    }
+
     public string? NetworkName
     {
         get => _networkName;
@@ -1204,11 +1216,14 @@ public sealed class ServerStatusView : WorkspaceView
 
     public string StateText => ConnectionState.ToString();
 
+    public string ContinuityText => ContinuityState.ToString();
+
     public string CapabilitiesText => _capabilitiesText;
 
     internal void ApplySnapshot(ServerSessionSnapshot snapshot)
     {
         ConnectionState = ToDisplayState(snapshot.State);
+        ContinuityState = snapshot.Continuity.State;
         NetworkName = snapshot.Features.NetworkName ?? snapshot.Identity.NetworkName;
         EndpointText = snapshot.Endpoint.ToString();
         var capabilitiesText = snapshot.Capabilities.Enabled.Count == 0
@@ -1220,6 +1235,7 @@ public sealed class ServerStatusView : WorkspaceView
             OnPropertyChanged(nameof(CapabilitiesText));
         }
         OnPropertyChanged(nameof(StateText));
+        OnPropertyChanged(nameof(ContinuityText));
     }
 
     internal static NetworkDisplayState ToDisplayState(ServerSessionState state) => state switch
@@ -1803,6 +1819,7 @@ public sealed class NetworkWorkspace : ObservableObject
 {
     private string _displayName;
     private NetworkDisplayState _state = NetworkDisplayState.Disconnected;
+    private ConnectionContinuityState _continuityState = ConnectionContinuityState.Disconnected;
     private string? _networkName;
     private ServerSessionSnapshot _snapshot;
     private ServerSession _session;
@@ -1830,6 +1847,7 @@ public sealed class NetworkWorkspace : ObservableObject
         ArgumentNullException.ThrowIfNull(session);
         _snapshot = session.Snapshot;
         State = ServerStatusView.ToDisplayState(_snapshot.State);
+        ContinuityState = _snapshot.Continuity.State;
         NetworkName = _snapshot.Features.NetworkName ?? _snapshot.Identity.NetworkName;
         StatusView.ApplySnapshot(_snapshot);
         foreach (var channel in Channels)
@@ -1862,7 +1880,7 @@ public sealed class NetworkWorkspace : ObservableObject
         internal set => SetProperty(ref _displayName, value);
     }
 
-    public string DisplayLabel => $"{DisplayName}  [{StateText}]";
+    public string DisplayLabel => $"{DisplayName}  [{ContinuityText}]";
 
     public NetworkDisplayState State
     {
@@ -1877,7 +1895,22 @@ public sealed class NetworkWorkspace : ObservableObject
         }
     }
 
+    public ConnectionContinuityState ContinuityState
+    {
+        get => _continuityState;
+        private set
+        {
+            if (SetProperty(ref _continuityState, value))
+            {
+                OnPropertyChanged(nameof(ContinuityText));
+                OnPropertyChanged(nameof(DisplayLabel));
+            }
+        }
+    }
+
     public string StateText => State.ToString();
+
+    public string ContinuityText => ContinuityState.ToString();
 
     public string? NetworkName
     {
@@ -1916,10 +1949,11 @@ public sealed class NetworkWorkspace : ObservableObject
 
         _snapshot = snapshot;
         State = ServerStatusView.ToDisplayState(snapshot.State);
+        ContinuityState = snapshot.Continuity.State;
         NetworkName = snapshot.Features.NetworkName ?? snapshot.Identity.NetworkName;
         StatusView.ApplySnapshot(snapshot);
 
-        var networkAvailable = snapshot.State is not (ServerSessionState.Disconnected or ServerSessionState.Failed or ServerSessionState.ReconnectWaiting);
+        var networkAvailable = snapshot.Continuity.State == ConnectionContinuityState.Synchronized;
         foreach (var channel in snapshot.Channels)
         {
             var isDesired = snapshot.DesiredChannels.Any(item => IrcCaseMappingComparer.Equals(item, channel.Name, snapshot.Features.CaseMapping));
@@ -1996,7 +2030,7 @@ public sealed class NetworkWorkspace : ObservableObject
             : null;
         var view = new QueryView(Id, viewId, nickname, historyKey);
         view.MarkCurrentSessionIdentity(_snapshot.ConnectionGeneration);
-        view.ApplyConnectionState(_snapshot.State is not (ServerSessionState.Disconnected or ServerSessionState.Failed or ServerSessionState.ReconnectWaiting));
+        view.ApplyConnectionState(_snapshot.Continuity.State == ConnectionContinuityState.Synchronized);
         Queries.Add(view);
         InsertView(view);
         return view;

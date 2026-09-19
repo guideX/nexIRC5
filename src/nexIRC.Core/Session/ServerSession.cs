@@ -39,6 +39,7 @@ public sealed class ServerSession : IAsyncDisposable
     private readonly IrcCapabilityNegotiator _capabilities;
     private readonly ISupportState _isupport = new();
     private readonly ServerIdentityDetector _identityDetector = new();
+    private readonly ConnectionContinuityStateMachine _continuity = new();
     private readonly CancellationTokenSource _disposeCts = new();
     private ServerFeatureSet _features;
     private ServerSessionState _state = ServerSessionState.Disconnected;
@@ -112,6 +113,8 @@ public sealed class ServerSession : IAsyncDisposable
 
     public event EventHandler<SessionStateChangedEvent>? StateChanged;
 
+    public event EventHandler<ConnectionContinuityStateChangedEvent>? ContinuityStateChanged;
+
     public event EventHandler<SessionSemanticEvent>? SemanticEventReceived;
 
     /// <summary>
@@ -145,6 +148,13 @@ public sealed class ServerSession : IAsyncDisposable
     /// application event-drain consumer.
     /// </summary>
     public Task QuitWritten => _quitWritten.Task;
+
+    /// <summary>
+    /// Product-level continuity state.  This is the authoritative distinction
+    /// between a registered transport and a workspace that has finished
+    /// reconnect reconciliation.
+    /// </summary>
+    public ConnectionContinuitySnapshot Continuity => _continuity.Snapshot;
 
     /// <summary>
     /// Test and diagnostic visibility for session ownership. This is a count,
@@ -577,6 +587,8 @@ public sealed class ServerSession : IAsyncDisposable
             }
         }
 
+        PublishContinuityTransition(MarkIntentionalDisconnect(reason ?? "The user requested disconnect."));
+
         if (runTask is null)
         {
             return;
@@ -616,6 +628,29 @@ public sealed class ServerSession : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Completes the replacement-generation synchronization barrier.  The
+    /// generation check is the ownership fence for asynchronous history work.
+    /// </summary>
+    public bool CompleteSynchronization(
+        int connectionGeneration,
+        ContinuitySynchronizationOutcome outcome,
+        string? detail = null)
+    {
+        ConnectionContinuityTransition? transition;
+        lock (_gate)
+        {
+            transition = _continuity.CompleteSynchronization(
+                connectionGeneration,
+                outcome,
+                DateTimeOffset.UtcNow,
+                detail);
+        }
+
+        PublishContinuityTransition(transition);
+        return transition is not null;
+    }
+
     private async Task DisposeCoreAsync()
     {
         try
@@ -645,12 +680,13 @@ public sealed class ServerSession : IAsyncDisposable
             {
                 reconnectAttempt++;
                 IIrcTransport? transport = null;
+                ConnectionEpoch? epoch = null;
                 ConnectionFailure? failure;
                 try
                 {
                     SetState(ServerSessionState.Connecting);
                     transport = await _transportFactory.CreateAsync(_options.Endpoint, cancellationToken).ConfigureAwait(false);
-                    var epoch = BeginConnectionGeneration();
+                    epoch = BeginConnectionGeneration();
                     _identityDetector.ObserveHostname(_options.Endpoint.Host);
                     if (_options.Endpoint.UseTls)
                     {
@@ -689,6 +725,30 @@ public sealed class ServerSession : IAsyncDisposable
                     }
                 }
 
+                if (epoch is not null && !_disconnectRequested && !cancellationToken.IsCancellationRequested)
+                {
+                    if (failure.IsTransient)
+                    {
+                        PublishContinuityTransition(MarkInterrupted(epoch.Generation, failure));
+                    }
+                    else if (failure.Kind is not ConnectionFailureKind.Cancelled and not ConnectionFailureKind.Intentional)
+                    {
+                        PublishContinuityTransition(MarkTerminal(epoch.Generation, failure.Message));
+                    }
+
+                    if (_state == ServerSessionState.Failed)
+                    {
+                        PublishContinuityTransition(MarkTerminal(epoch.Generation, failure.Message));
+                    }
+                }
+                else if (epoch is null
+                    && !_disconnectRequested
+                    && !cancellationToken.IsCancellationRequested
+                    && failure.Kind is not ConnectionFailureKind.Cancelled and not ConnectionFailureKind.Intentional)
+                {
+                    PublishContinuityTransition(MarkTerminal(_connectionGeneration, failure.Message));
+                }
+
                 if (_disconnectRequested || cancellationToken.IsCancellationRequested || failure.Kind is ConnectionFailureKind.Cancelled or ConnectionFailureKind.Intentional)
                 {
                     break;
@@ -698,6 +758,14 @@ public sealed class ServerSession : IAsyncDisposable
                 ResetForReconnect();
                 if (!_options.Reconnect.Enabled || reconnectAttempt >= Math.Max(1, _options.Reconnect.MaximumAttempts))
                 {
+                    if (epoch is not null)
+                    {
+                        PublishContinuityTransition(MarkTerminal(epoch.Generation, failure.Message));
+                    }
+                    else
+                    {
+                        PublishContinuityTransition(MarkTerminal(_connectionGeneration, failure.Message));
+                    }
                     SetState(ServerSessionState.Failed);
                     break;
                 }
@@ -724,6 +792,10 @@ public sealed class ServerSession : IAsyncDisposable
             _outboundEvents.Writer.TryComplete();
             if (_state != ServerSessionState.Failed)
             {
+                if (_disconnectRequested || cancellationToken.IsCancellationRequested)
+                {
+                    PublishContinuityTransition(MarkIntentionalDisconnect("The IRC session shut down."));
+                }
                 SetState(ServerSessionState.Disconnected);
             }
         }
@@ -1134,6 +1206,10 @@ public sealed class ServerSession : IAsyncDisposable
                 _stateStore.SetNickname(welcomeNickname);
             }
 
+            var continuityRequiresSynchronization = _continuity.Snapshot.SynchronizationRequired;
+            PublishContinuityTransition(MarkRegistrationComplete(
+                epoch.Generation,
+                continuityRequiresSynchronization));
             SetState(ServerSessionState.Registered);
             await PublishSemanticAsync(new IrcRegistrationStateEvent(message, previousRegistration, _registration), epoch, receivedAt).ConfigureAwait(false);
             await QueueDesiredChannelsAsync(epoch, connectionCts.Token).ConfigureAwait(false);
@@ -1731,7 +1807,6 @@ public sealed class ServerSession : IAsyncDisposable
 
     private void InvalidateConnectionState(ConnectionEpoch epoch)
     {
-        CompleteHistoryRequest(ChathistoryRequestCompletion.Disconnected, "The IRC connection ended before the history batch completed.");
         lock (_gate)
         {
             if (!ReferenceEquals(_activeEpoch, epoch))
@@ -1771,6 +1846,11 @@ public sealed class ServerSession : IAsyncDisposable
             _saslResponseSent = false;
             DisposeActiveCredentialUnsafe();
         }
+
+        CompleteHistoryRequest(
+            ChathistoryRequestCompletion.Disconnected,
+            "The IRC connection ended before the history batch completed.",
+            expectedGeneration: epoch.Generation);
     }
 
     private bool IsCurrentEpoch(ConnectionEpoch epoch)
@@ -2026,13 +2106,14 @@ public sealed class ServerSession : IAsyncDisposable
     private void CompleteHistoryRequest(
         ChathistoryRequestCompletion completion,
         string? failure,
-        bool exhausted = false)
+        bool exhausted = false,
+        int? expectedGeneration = null)
     {
         PendingChathistoryRequest? pending;
         lock (_gate)
         {
             pending = _activeHistoryRequest;
-            if (pending is null)
+            if (pending is null || expectedGeneration is int expected && pending.ConnectionGeneration != expected)
             {
                 return;
             }
@@ -2101,6 +2182,8 @@ public sealed class ServerSession : IAsyncDisposable
 
     private ConnectionEpoch BeginConnectionGeneration()
     {
+        ConnectionContinuityTransition? transition;
+        ConnectionEpoch epoch;
         lock (_gate)
         {
             if (_activeEpoch is not null)
@@ -2134,10 +2217,17 @@ public sealed class ServerSession : IAsyncDisposable
             DisposeActiveCredentialUnsafe();
             _activeSaslMechanism = null;
             _saslResponseSent = false;
-            var epoch = new ConnectionEpoch(_connectionGeneration);
+            epoch = new ConnectionEpoch(_connectionGeneration);
             _activeEpoch = epoch;
-            return epoch;
+            transition = _continuity.BeginRecovery(
+                _connectionGeneration,
+                _options.ContinuityRecoveryRequired,
+                _options.ContinuityPreviousGeneration,
+                DateTimeOffset.UtcNow);
         }
+
+        PublishContinuityTransition(transition);
+        return epoch;
     }
 
     private void ResetForReconnect()
@@ -2213,6 +2303,63 @@ public sealed class ServerSession : IAsyncDisposable
         _state = state;
     }
 
+    private ConnectionContinuityTransition? MarkRegistrationComplete(int generation, bool synchronizationRequired)
+    {
+        lock (_gate)
+        {
+            return _continuity.MarkRegistrationComplete(
+                generation,
+                synchronizationRequired,
+                DateTimeOffset.UtcNow);
+        }
+    }
+
+    private ConnectionContinuityTransition? MarkInterrupted(int generation, ConnectionFailure failure)
+    {
+        lock (_gate)
+        {
+            return _continuity.MarkInterrupted(generation, failure, DateTimeOffset.UtcNow);
+        }
+    }
+
+    private ConnectionContinuityTransition? MarkTerminal(int generation, string detail)
+    {
+        lock (_gate)
+        {
+            return _continuity.MarkTerminal(generation, DateTimeOffset.UtcNow, detail);
+        }
+    }
+
+    private ConnectionContinuityTransition? MarkIntentionalDisconnect(string detail)
+    {
+        lock (_gate)
+        {
+            return _continuity.MarkIntentionalDisconnect(_connectionGeneration, DateTimeOffset.UtcNow, detail);
+        }
+    }
+
+    private void PublishContinuityTransition(ConnectionContinuityTransition? transition)
+    {
+        if (transition is null)
+        {
+            return;
+        }
+
+        var change = new ConnectionContinuityStateChangedEvent(
+            transition.Previous,
+            transition.Current,
+            transition.Snapshot);
+        try
+        {
+            ContinuityStateChanged?.Invoke(this, change);
+        }
+        catch
+        {
+            // Continuity observers are projections/diagnostics and cannot
+            // alter the protocol state machine.
+        }
+    }
+
     private ServerSessionSnapshot CreateSnapshot() => new(
         _state,
         _registration,
@@ -2230,6 +2377,7 @@ public sealed class ServerSession : IAsyncDisposable
         _stateStore.Queries,
         _stateStore.DesiredChannels)
     {
+        Continuity = _continuity.Snapshot,
         Motd = _stateStore.Motd,
         Authentication = new SaslAuthenticationSnapshot(
             _options.SaslPolicy,

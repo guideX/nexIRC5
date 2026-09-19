@@ -739,7 +739,7 @@ public sealed class WorkspaceActionRouter
 
     private static bool IsRegistered(NetworkWorkspace network) =>
         network.Snapshot.Registration == RegistrationState.Registered
-        && network.Snapshot.State is not (ServerSessionState.Disconnected or ServerSessionState.Failed or ServerSessionState.ReconnectWaiting);
+        && network.Snapshot.Continuity.State == ConnectionContinuityState.Synchronized;
 
     private static bool IsChannelTarget(NetworkWorkspace network, string target) =>
         target.Length > 0 && network.Snapshot.Features.ChannelTypes.Contains(target[0]);

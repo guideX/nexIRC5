@@ -134,6 +134,38 @@ public sealed class WorkspaceTests
     }
 
     [Fact]
+    public async Task ContinuityProjectionPreservesQueryAcrossReplacementAndWaitsForSynchronization()
+    {
+        var factory = new FakeIrcTransportFactory();
+        var first = new FakeIrcTransport(new IrcEndpoint("continuity.example", 6667, false));
+        var second = new FakeIrcTransport(first.Endpoint);
+        factory.Add(first);
+        factory.Add(second);
+        await using var manager = new NetworkSessionManager(factory);
+        var network = manager.Add(Options("Continuity", first.Endpoint, "alice") with
+        {
+            Reconnect = new ReconnectPolicy(true, 2, TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(2))
+        });
+
+        await manager.ConnectAsync(network.Id);
+        await WaitForAsync(() => first.ConnectCount == 1);
+        Register(first, "srv", "alice");
+        first.EnqueueInboundLine(":bob!u@h PRIVMSG alice :before interruption");
+        await WaitForAsync(() => network.ContinuityState == ConnectionContinuityState.Synchronized && network.Queries.Count == 1);
+        var query = network.Queries.Single();
+        Assert.Contains(query.EntriesSnapshot, entry => entry.Text == "before interruption");
+
+        first.EnqueueRemoteDisconnect();
+        await WaitForAsync(() => second.ConnectCount == 1 && network.ContinuityState is ConnectionContinuityState.Interrupted or ConnectionContinuityState.Recovering);
+        Register(second, "srv", "alice");
+        await WaitForAsync(() => network.ContinuityState == ConnectionContinuityState.Synchronized);
+
+        Assert.Same(query, Assert.Single(network.Queries));
+        Assert.Contains(query.EntriesSnapshot, entry => entry.Text == "before interruption");
+        Assert.Equal(ContinuitySynchronizationOutcome.Unsupported, network.Snapshot.Continuity.SynchronizationOutcome);
+    }
+
+    [Fact]
     public async Task InactiveViewsExposeUnreadAndImportantActivityUntilActivated()
     {
         var factory = new FakeIrcTransportFactory();

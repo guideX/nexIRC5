@@ -75,6 +75,15 @@ public sealed class ServerSessionOptions
 {
     public Guid? NetworkId { get; init; }
 
+    /// <summary>
+    /// Set by the application when it intentionally replaces a session object
+    /// but must still perform continuity synchronization against the durable
+    /// workspace retained from the prior session.
+    /// </summary>
+    public bool ContinuityRecoveryRequired { get; init; }
+
+    public int? ContinuityPreviousGeneration { get; init; }
+
     public required IrcEndpoint Endpoint { get; init; }
 
     public required string Nickname { get; init; }
@@ -471,6 +480,8 @@ public sealed record ServerSessionSnapshot(
     IReadOnlyList<IrcQuerySnapshot> Queries,
     IReadOnlySet<string> DesiredChannels)
 {
+    public ConnectionContinuitySnapshot Continuity { get; init; } = ConnectionContinuitySnapshot.Initial;
+
     public IrcMotdSnapshot Motd { get; init; } = IrcMotdSnapshot.Empty;
 
     public SaslAuthenticationSnapshot Authentication { get; init; } = SaslAuthenticationSnapshot.Disabled;
@@ -488,6 +499,11 @@ public sealed record SessionStateChangedEvent(
     ServerSessionState Previous,
     ServerSessionState Current,
     int ConnectionGeneration);
+
+public sealed record ConnectionContinuityStateChangedEvent(
+    ConnectionContinuityState Previous,
+    ConnectionContinuityState Current,
+    ConnectionContinuitySnapshot Snapshot);
 
 public sealed record SessionSemanticEvent(
     IrcSemanticEvent Event,

@@ -47,7 +47,7 @@ public sealed record ParticipantActionContext(
 
     public bool IsRegistered => IsConsistent
         && Network.Snapshot.Registration == RegistrationState.Registered
-        && Network.Snapshot.State is not (ServerSessionState.Disconnected or ServerSessionState.Failed or ServerSessionState.ReconnectWaiting);
+        && Network.Snapshot.Continuity.State == ConnectionContinuityState.Synchronized;
 
     public bool IsJoined => Channel.IsJoined;
 
