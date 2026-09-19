@@ -157,6 +157,29 @@ public sealed class ServerSession : IAsyncDisposable
     public ConnectionContinuitySnapshot Continuity => _continuity.Snapshot;
 
     /// <summary>
+    /// Bounded continuity diagnostics for reconstructing recovery episodes.
+    /// Entries contain lifecycle metadata only; protocol secrets and raw
+    /// authentication payloads are never recorded here.
+    /// </summary>
+    public ConnectionContinuityDiagnosticsSnapshot ContinuityDiagnostics => _continuity.Diagnostics;
+
+    public void RecordContinuityDiagnostic(
+        ContinuityDiagnosticKind kind,
+        string? detail = null,
+        int? connectionGeneration = null,
+        int? relatedGeneration = null)
+    {
+        var generation = connectionGeneration ?? Continuity.ConnectionGeneration;
+        _continuity.RecordDiagnostic(generation, kind, detail, relatedGeneration);
+    }
+
+    public void RecordHistoricalDuplicateSuppressed(int? connectionGeneration = null, string? detail = null)
+    {
+        var generation = connectionGeneration ?? Continuity.ConnectionGeneration;
+        _continuity.RecordHistoricalDuplicateSuppressed(generation, detail);
+    }
+
+    /// <summary>
     /// Test and diagnostic visibility for session ownership. This is a count,
     /// not an object registry, so observability cannot retain a session.
     /// </summary>
@@ -264,6 +287,10 @@ public sealed class ServerSession : IAsyncDisposable
                 built.Request,
                 currentEpoch.Generation);
             _activeHistoryRequest = pending;
+            _continuity.RecordDiagnostic(
+                currentEpoch.Generation,
+                ContinuityDiagnosticKind.RecoveryRequestStarted,
+                $"{pending.Request.Purpose}:{pending.Request.Operation}");
             if (pending.Request.Conversation is { Length: > 0 } conversation)
             {
                 SetHistoryStateUnsafe(conversation, requestActive: true, beginningReached: false, failed: false, failure: null);
@@ -637,12 +664,32 @@ public sealed class ServerSession : IAsyncDisposable
         ContinuitySynchronizationOutcome outcome,
         string? detail = null)
     {
+        var result = ConnectionContinuityRecoveryResult.FromOutcome(
+            connectionGeneration,
+            true,
+            outcome,
+            historyAvailable: outcome is not ContinuitySynchronizationOutcome.Unsupported,
+            recoveryRequestSent: outcome is ContinuitySynchronizationOutcome.Recovered
+                or ContinuitySynchronizationOutcome.Partial
+                or ContinuitySynchronizationOutcome.Failed,
+            replayCompleted: outcome == ContinuitySynchronizationOutcome.Recovered,
+            recoveryImpossible: outcome == ContinuitySynchronizationOutcome.Unsupported,
+            detail: detail);
+        return CompleteSynchronization(connectionGeneration, result, detail);
+    }
+
+    public bool CompleteSynchronization(
+        int connectionGeneration,
+        ConnectionContinuityRecoveryResult result,
+        string? detail = null)
+    {
+        ArgumentNullException.ThrowIfNull(result);
         ConnectionContinuityTransition? transition;
         lock (_gate)
         {
             transition = _continuity.CompleteSynchronization(
                 connectionGeneration,
-                outcome,
+                result,
                 DateTimeOffset.UtcNow,
                 detail);
         }
@@ -895,6 +942,7 @@ public sealed class ServerSession : IAsyncDisposable
     {
         if (!IsCurrentEpoch(epoch))
         {
+            _continuity.RecordStaleCallback(epoch.Generation, "A stale inbound frame was ignored.");
             return;
         }
 
@@ -1081,6 +1129,7 @@ public sealed class ServerSession : IAsyncDisposable
     {
         if (!IsCurrentEpoch(epoch))
         {
+            _continuity.RecordStaleCallback(epoch.Generation, "A stale inbound frame was ignored.");
             return;
         }
 
@@ -2157,6 +2206,15 @@ public sealed class ServerSession : IAsyncDisposable
                 .Take(16)
                 .ToArray()
         });
+        _continuity.RecordDiagnostic(
+            pending.ConnectionGeneration,
+            completion switch
+            {
+                ChathistoryRequestCompletion.Succeeded => ContinuityDiagnosticKind.RecoveryRequestCompleted,
+                ChathistoryRequestCompletion.Cancelled or ChathistoryRequestCompletion.Disconnected or ChathistoryRequestCompletion.StaleGeneration => ContinuityDiagnosticKind.RecoveryRequestCancelled,
+                _ => ContinuityDiagnosticKind.RecoveryRequestFailed
+            },
+            $"{pending.Request.Purpose}:{completion}{(failure is null ? string.Empty : $": {failure}")}");
     }
 
     private async ValueTask QueueOutboundAsync(IrcOutboundMessage command, CancellationToken cancellationToken, ConnectionEpoch? epoch = null)

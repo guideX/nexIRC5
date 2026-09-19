@@ -1180,6 +1180,7 @@ public sealed class ServerStatusView : WorkspaceView
 {
     private NetworkDisplayState _connectionState = NetworkDisplayState.Disconnected;
     private ConnectionContinuityState _continuityState = ConnectionContinuityState.Disconnected;
+    private ConnectionContinuityRecoveryResult _recoveryResult = ConnectionContinuityRecoveryResult.InProgress(0, false);
     private string? _networkName;
     private string _endpointText = string.Empty;
     private string _capabilitiesText = "(none negotiated)";
@@ -1201,6 +1202,26 @@ public sealed class ServerStatusView : WorkspaceView
         get => _continuityState;
         internal set => SetProperty(ref _continuityState, value);
     }
+
+    public ConnectionContinuityRecoveryResult RecoveryResult
+    {
+        get => _recoveryResult;
+        private set
+        {
+            if (SetProperty(ref _recoveryResult, value))
+            {
+                OnPropertyChanged(nameof(RecoveryQuality));
+                OnPropertyChanged(nameof(RecoveryEvidence));
+                OnPropertyChanged(nameof(RecoveryQualityText));
+            }
+        }
+    }
+
+    public ContinuityRecoveryResultKind RecoveryQuality => RecoveryResult.Kind;
+
+    public ContinuityEvidenceLevel RecoveryEvidence => RecoveryResult.Evidence;
+
+    public string RecoveryQualityText => RecoveryQuality.ToString();
 
     public string? NetworkName
     {
@@ -1224,6 +1245,7 @@ public sealed class ServerStatusView : WorkspaceView
     {
         ConnectionState = ToDisplayState(snapshot.State);
         ContinuityState = snapshot.Continuity.State;
+        RecoveryResult = snapshot.Continuity.RecoveryResult;
         NetworkName = snapshot.Features.NetworkName ?? snapshot.Identity.NetworkName;
         EndpointText = snapshot.Endpoint.ToString();
         var capabilitiesText = snapshot.Capabilities.Enabled.Count == 0
@@ -1820,6 +1842,7 @@ public sealed class NetworkWorkspace : ObservableObject
     private string _displayName;
     private NetworkDisplayState _state = NetworkDisplayState.Disconnected;
     private ConnectionContinuityState _continuityState = ConnectionContinuityState.Disconnected;
+    private ConnectionContinuityRecoveryResult _recoveryResult = ConnectionContinuityRecoveryResult.InProgress(0, false);
     private string? _networkName;
     private ServerSessionSnapshot _snapshot;
     private ServerSession _session;
@@ -1848,6 +1871,7 @@ public sealed class NetworkWorkspace : ObservableObject
         _snapshot = session.Snapshot;
         State = ServerStatusView.ToDisplayState(_snapshot.State);
         ContinuityState = _snapshot.Continuity.State;
+        RecoveryResult = _snapshot.Continuity.RecoveryResult;
         NetworkName = _snapshot.Features.NetworkName ?? _snapshot.Identity.NetworkName;
         StatusView.ApplySnapshot(_snapshot);
         foreach (var channel in Channels)
@@ -1908,6 +1932,26 @@ public sealed class NetworkWorkspace : ObservableObject
         }
     }
 
+    public ConnectionContinuityRecoveryResult RecoveryResult
+    {
+        get => _recoveryResult;
+        private set
+        {
+            if (SetProperty(ref _recoveryResult, value))
+            {
+                OnPropertyChanged(nameof(RecoveryQuality));
+                OnPropertyChanged(nameof(RecoveryEvidence));
+                OnPropertyChanged(nameof(RecoveryQualityText));
+            }
+        }
+    }
+
+    public ContinuityRecoveryResultKind RecoveryQuality => RecoveryResult.Kind;
+
+    public ContinuityEvidenceLevel RecoveryEvidence => RecoveryResult.Evidence;
+
+    public string RecoveryQualityText => RecoveryQuality.ToString();
+
     public string StateText => State.ToString();
 
     public string ContinuityText => ContinuityState.ToString();
@@ -1950,6 +1994,7 @@ public sealed class NetworkWorkspace : ObservableObject
         _snapshot = snapshot;
         State = ServerStatusView.ToDisplayState(snapshot.State);
         ContinuityState = snapshot.Continuity.State;
+        RecoveryResult = snapshot.Continuity.RecoveryResult;
         NetworkName = snapshot.Features.NetworkName ?? snapshot.Identity.NetworkName;
         StatusView.ApplySnapshot(snapshot);
 
