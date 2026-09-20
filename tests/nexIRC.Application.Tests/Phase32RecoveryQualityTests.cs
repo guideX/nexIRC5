@@ -44,6 +44,7 @@ public sealed class Phase32RecoveryQualityTests
         Assert.Same(query, Assert.Single(network.Queries));
         Assert.Single(query.EntriesSnapshot, entry => entry.ServerMessageId == "phase32-message-1");
         Assert.Equal(ContinuityRecoveryResultKind.Unsupported, network.RecoveryQuality);
+        Assert.Equal(ConnectionRecoveryStrategyId.BestEffortNoHistory, network.RecoveryResult.Strategy);
         Assert.False(network.RecoveryResult.CanClaimLosslessContinuity);
     }
 
@@ -80,6 +81,7 @@ public sealed class Phase32RecoveryQualityTests
         Assert.Equal(ContinuityRecoveryResultKind.Unsupported, network.StatusView.RecoveryQuality);
         Assert.Equal(ContinuityEvidenceLevel.BestEffort, network.StatusView.RecoveryEvidence);
         Assert.Equal(ContinuityRecoveryResultKind.Unsupported, network.Snapshot.Continuity.RecoveryResult.Kind);
+        Assert.Equal(ConnectionRecoveryStrategyId.BestEffortNoHistory, network.Snapshot.Continuity.RecoveryResult.Strategy);
         Assert.Contains("history", network.Snapshot.Continuity.RecoveryResult.Detail, StringComparison.OrdinalIgnoreCase);
     }
 

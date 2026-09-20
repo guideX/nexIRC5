@@ -74,6 +74,9 @@ public sealed class FakeIrcTransport : IIrcTransport, IIrcTransportCallbackSourc
         remove => _callbackReceived -= value;
     }
 
+    /// <summary>Deterministic test-server hook for observing client commands.</summary>
+    public event Action<string>? OutboundLineWritten;
+
     public IReadOnlyList<byte[]> OutboundBytes => _outbound.ToArray();
 
     public IReadOnlyList<string> OutboundLines => _outbound.Select(bytes => Encoding.UTF8.GetString(bytes).TrimEnd('\r', '\n')).ToArray();
@@ -170,6 +173,7 @@ public sealed class FakeIrcTransport : IIrcTransport, IIrcTransportCallbackSourc
         }
 
         _outbound.Enqueue(buffer.ToArray());
+        OutboundLineWritten?.Invoke(Encoding.UTF8.GetString(buffer.Span).TrimEnd('\r', '\n'));
         return ValueTask.CompletedTask;
     }
 

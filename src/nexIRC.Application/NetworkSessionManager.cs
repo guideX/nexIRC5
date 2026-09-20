@@ -23,6 +23,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private readonly bool _ownsNotifications;
     private readonly bool _ownsLogStore;
     private readonly IrcOperationTimeoutPolicy _operationTimeouts;
+    private readonly ConnectionRecoveryStrategySelector _recoveryStrategySelector = new();
     private readonly object _disposeGate = new();
     private readonly object _replyNavigationGate = new();
     private readonly Dictionary<string, Task<HistoryNavigationResult>> _replyNavigationTasks = new(StringComparer.Ordinal);
@@ -3726,20 +3727,22 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         CancellationTokenSource synchronizationCts)
     {
         var token = synchronizationCts.Token;
-        ContinuityRecoveryAttempt attempt;
+        var boundary = CreateRecoveryBoundary(entry, session, generation);
+        var context = new ConnectionRecoveryStrategyContext(
+            session,
+            boundary,
+            cancellation => new ValueTask<ConnectionRecoveryExecutionResult>(
+                RecoverReconnectHistoryAsync(entry, session, generation, cancellation)));
+        var selected = _recoveryStrategySelector.Select(context, recoveryRequired: true);
+        session.RecordContinuityStrategySelected(
+            selected.Selection.Strategy,
+            selected.Selection.Reason,
+            $"generation={generation}; conversations={boundary.Conversations.Count}; gaps={boundary.KnownGapKeys.Count}",
+            generation);
+        ConnectionContinuityRecoveryResult result;
         try
         {
-            session.RecordContinuityDiagnostic(
-                ContinuityDiagnosticKind.RecoveryStrategySelected,
-                session.ChathistorySupport.IsUsable ? "bounded-chathistory-recovery" : "live-session-only");
-            if (!session.ChathistorySupport.IsUsable)
-            {
-                attempt = ContinuityRecoveryAttempt.Unsupported;
-            }
-            else
-            {
-                attempt = await RecoverReconnectHistoryAsync(entry, session, generation, token).ConfigureAwait(false);
-            }
+            result = await selected.Strategy.RecoverAsync(context, selected.Selection.Reason, token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
@@ -3747,8 +3750,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
         catch (InvalidOperationException exception)
         {
-            attempt = ContinuityRecoveryAttempt.Failed(
-                session.ChathistorySupport.IsUsable,
+            result = CreateStrategyFailureResult(
+                selected,
+                generation,
                 "Continuity history could not be started: " + exception.Message);
             if (session.Snapshot.ConnectionGeneration != generation)
             {
@@ -3758,8 +3762,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
         catch
         {
-            attempt = ContinuityRecoveryAttempt.Failed(
-                session.ChathistorySupport.IsUsable,
+            result = CreateStrategyFailureResult(
+                selected,
+                generation,
                 "Continuity history failed unexpectedly.");
         }
 
@@ -3768,18 +3773,25 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             return;
         }
 
-        var result = ConnectionContinuityRecoveryResult.FromOutcome(
-            generation,
-            true,
-            attempt.Outcome,
-            attempt.HistoryAvailable,
-            attempt.RecoveryRequestSent,
-            attempt.ReplayCompleted,
-            attempt.ExactGapRecovered,
-            attempt.RecoveryImpossible,
-            attempt.Detail);
         session.CompleteSynchronization(generation, result, result.Detail);
     }
+
+    private static ConnectionContinuityRecoveryResult CreateStrategyFailureResult(
+        SelectedConnectionRecoveryStrategy selected,
+        int generation,
+        string detail) =>
+        ConnectionContinuityRecoveryResult.FromOutcome(
+                generation,
+                recoveryRequired: true,
+                ContinuitySynchronizationOutcome.Failed,
+                historyAvailable: selected.Selection.Strategy == ConnectionRecoveryStrategyId.Ircv3ChatHistory,
+                recoveryImpossible: true,
+                detail: detail) with
+        {
+            Strategy = selected.Selection.Strategy,
+            StrategyReason = selected.Selection.Reason,
+            UnresolvedGap = true
+        };
 
     private static void CancelContinuitySynchronization(SessionEntry entry)
     {
@@ -3811,6 +3823,33 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             // result is diagnostic state; it must not become an unobserved
             // task exception during shutdown or replacement.
         }
+    }
+
+    private static ConnectionRecoveryBoundary CreateRecoveryBoundary(
+        SessionEntry entry,
+        ServerSession session,
+        int generation)
+    {
+        var conversations = entry.ReconnectBoundaries.Values
+            .Select(boundary => new ConnectionRecoveryConversationBoundary(
+                boundary.Conversation,
+                boundary.Target,
+                boundary.ServerMessageId,
+                boundary.Timestamp,
+                boundary.IsChannel,
+                boundary.DurableSequence))
+            .ToArray();
+        var gaps = entry.GapLedger.Snapshot
+            .Where(gap => !gap.IsTerminal)
+            .Select(static gap => gap.Key)
+            .Take(32)
+            .ToArray();
+        return new ConnectionRecoveryBoundary(
+            generation,
+            session.Continuity.PreviousGeneration,
+            entry.LastDisconnectAt ?? DateTimeOffset.UtcNow,
+            conversations,
+            gaps);
     }
 
     private void CaptureReconnectBoundaries(SessionEntry entry, int connectionGeneration)
@@ -4208,7 +4247,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             || summary.Reason.StartsWith("Local history already filled", StringComparison.Ordinal)
             || summary.Reason.StartsWith("The exact BETWEEN interval is empty", StringComparison.Ordinal));
 
-    private async Task<ContinuityRecoveryAttempt> RecoverReconnectHistoryAsync(
+    private async Task<ConnectionRecoveryExecutionResult> RecoverReconnectHistoryAsync(
         SessionEntry entry,
         ServerSession session,
         int generation,
@@ -4217,7 +4256,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         var synchronizationOutcome = ContinuitySynchronizationOutcome.NoGapObserved;
         if (!session.ChathistorySupport.IsUsable)
         {
-            return ContinuityRecoveryAttempt.Unsupported;
+            return ConnectionRecoveryExecutionResult.Unsupported;
         }
 
         var recovered = 0;
@@ -4626,7 +4665,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             synchronizationOutcome = ContinuitySynchronizationOutcome.Partial;
         }
 
-        return new ContinuityRecoveryAttempt(
+        return new ConnectionRecoveryExecutionResult(
             synchronizationOutcome,
             HistoryAvailable: true,
             recoveryRequestSent,
@@ -4642,7 +4681,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 ContinuitySynchronizationOutcome.Partial => "Reconnect history reconciliation completed with bounded gaps remaining.",
                 ContinuitySynchronizationOutcome.Failed => "Reconnect history reconciliation failed; the live replacement session remains usable.",
                 _ => null
-            });
+            },
+            RecoveredEventCount: recovered,
+            UnresolvedGap: unresolvedGap,
+            CommandsIssued: requests);
     }
 
     private void OnSessionSemanticEvent(object? sender, SessionSemanticEvent item)
@@ -5685,34 +5727,6 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         Guid ViewId,
         int ConnectionGeneration,
         long DurableSequence);
-
-    private sealed record ContinuityRecoveryAttempt(
-        ContinuitySynchronizationOutcome Outcome,
-        bool HistoryAvailable,
-        bool RecoveryRequestSent,
-        bool ReplayCompleted,
-        bool ExactGapRecovered,
-        bool RecoveryImpossible,
-        string? Detail)
-    {
-        public static ContinuityRecoveryAttempt Unsupported { get; } = new(
-            ContinuitySynchronizationOutcome.Unsupported,
-            HistoryAvailable: false,
-            RecoveryRequestSent: false,
-            ReplayCompleted: false,
-            ExactGapRecovered: false,
-            RecoveryImpossible: true,
-            "The server does not advertise usable CHATHISTORY; continuity is bounded to the live replacement session.");
-
-        public static ContinuityRecoveryAttempt Failed(bool historyAvailable, string detail) => new(
-            ContinuitySynchronizationOutcome.Failed,
-            historyAvailable,
-            RecoveryRequestSent: false,
-            ReplayCompleted: false,
-            ExactGapRecovered: false,
-            RecoveryImpossible: true,
-            detail);
-    }
 
     private sealed record ReconnectRepairSummary(bool Attempted, int Requests, int RecoveredEntries, string? Reason)
     {

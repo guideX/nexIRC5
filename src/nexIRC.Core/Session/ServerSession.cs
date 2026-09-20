@@ -173,6 +173,16 @@ public sealed class ServerSession : IAsyncDisposable
         _continuity.RecordDiagnostic(generation, kind, detail, relatedGeneration);
     }
 
+    public void RecordContinuityStrategySelected(
+        ConnectionRecoveryStrategyId strategy,
+        string reason,
+        string? boundary = null,
+        int? connectionGeneration = null)
+    {
+        var generation = connectionGeneration ?? Continuity.ConnectionGeneration;
+        _continuity.RecordRecoveryStrategySelected(generation, strategy, reason, boundary);
+    }
+
     public void RecordHistoricalDuplicateSuppressed(int? connectionGeneration = null, string? detail = null)
     {
         var generation = connectionGeneration ?? Continuity.ConnectionGeneration;

@@ -85,6 +85,16 @@ public sealed record ConnectionContinuityRecoveryResult(
     bool LosslessContinuitySupported,
     string? Detail)
 {
+    public ConnectionRecoveryStrategyId Strategy { get; init; } = ConnectionRecoveryStrategyId.None;
+
+    public string? StrategyReason { get; init; }
+
+    public int RecoveredEventCount { get; init; }
+
+    public bool UnresolvedGap { get; init; }
+
+    public int CommandsIssued { get; init; }
+
     public bool IsFinal => Kind is not ContinuityRecoveryResultKind.InProgress;
 
     /// <summary>
@@ -195,7 +205,20 @@ public sealed record ContinuityDiagnosticEntry(
     int ConnectionGeneration,
     int? RelatedGeneration,
     ContinuityDiagnosticKind Kind,
-    string? Detail);
+    string? Detail)
+{
+    public ConnectionRecoveryStrategyId? Strategy { get; init; }
+
+    public string? StrategyReason { get; init; }
+
+    public ContinuityRecoveryResultKind? RecoveryResult { get; init; }
+
+    public ContinuityEvidenceLevel? Evidence { get; init; }
+
+    public int? CommandsIssued { get; init; }
+
+    public string? Boundary { get; init; }
+}
 
 public sealed record ContinuityDiagnosticCounters(
     long RecoveryAttempts,
@@ -325,6 +348,25 @@ public sealed class ConnectionContinuityStateMachine
         lock (_gate)
         {
             RecordDiagnosticUnsafe(generation, kind, detail, relatedGeneration);
+        }
+    }
+
+    public void RecordRecoveryStrategySelected(
+        int generation,
+        ConnectionRecoveryStrategyId strategy,
+        string reason,
+        string? boundary = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(reason);
+        lock (_gate)
+        {
+            RecordDiagnosticUnsafe(
+                generation,
+                ContinuityDiagnosticKind.RecoveryStrategySelected,
+                reason,
+                strategy: strategy,
+                strategyReason: reason,
+                boundary: boundary);
         }
     }
 
@@ -626,7 +668,12 @@ public sealed class ConnectionContinuityStateMachine
                 _ => ContinuityDiagnosticKind.GenerationStarted
             },
             updated.Detail,
-            updated.PreviousGeneration);
+            updated.PreviousGeneration,
+            updated.RecoveryResult.Strategy,
+            updated.RecoveryResult.StrategyReason,
+            updated.RecoveryResult.Kind,
+            updated.RecoveryResult.Evidence,
+            updated.RecoveryResult.CommandsIssued);
         if (next == ConnectionContinuityState.Recovering && updated.PreviousGeneration is not null)
         {
             _recoveryAttempts++;
@@ -654,7 +701,13 @@ public sealed class ConnectionContinuityStateMachine
         int generation,
         ContinuityDiagnosticKind kind,
         string? detail,
-        int? relatedGeneration = null)
+        int? relatedGeneration = null,
+        ConnectionRecoveryStrategyId? strategy = null,
+        string? strategyReason = null,
+        ContinuityRecoveryResultKind? recoveryResult = null,
+        ContinuityEvidenceLevel? evidence = null,
+        int? commandsIssued = null,
+        string? boundary = null)
     {
         _diagnosticSequence++;
         _diagnostics.Enqueue(new ContinuityDiagnosticEntry(
@@ -663,7 +716,15 @@ public sealed class ConnectionContinuityStateMachine
             generation,
             relatedGeneration,
             kind,
-            detail));
+            detail)
+        {
+            Strategy = strategy,
+            StrategyReason = strategyReason,
+            RecoveryResult = recoveryResult,
+            Evidence = evidence,
+            CommandsIssued = commandsIssued,
+            Boundary = boundary
+        });
         while (_diagnostics.Count > MaximumDiagnostics)
         {
             _diagnostics.Dequeue();
