@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using System.Windows.Input;
 using nexIRC.Application;
 using nexIRC.Core.Networking;
+using nexIRC.Core.Session;
 
 namespace nexIRC.Desktop;
 
@@ -23,6 +24,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private long _navigationRefreshCoalescedRequests;
     private readonly DesktopNotificationAdapter? _notificationAdapter;
     private readonly System.Windows.Threading.Dispatcher _uiDispatcher;
+    private readonly IResumeStateStore? _resumeStateStore;
+    private readonly IResumeSecretProtector? _resumeSecretProtector;
     private readonly Dictionary<Guid, MemorySaslCredentialProvider> _sessionCredentials = [];
     private readonly Dictionary<Guid, MemoryServerPasswordProvider> _sessionServerPasswords = [];
     private readonly Dictionary<(Guid NetworkId, Guid ViewId), string> _drafts = [];
@@ -41,7 +44,29 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             OperatingSystem.IsWindows()
                 ? new WindowsCredentialStore()
                 : new InMemoryProfileCredentialStore());
-        Sessions = new NetworkSessionManager(transportFactory, new WpfWorkspaceDispatcher(dispatcher), configuration: configuration, logStore: logStore);
+        if (OperatingSystem.IsWindows() && configuration?.Store is JsonConfigurationStore)
+        {
+            try
+            {
+                _resumeStateStore = new JsonResumeStateStore(ResumeStatePaths.GetDefaultRoot());
+                _resumeSecretProtector = new WindowsDpapiResumeSecretProtector();
+            }
+            catch
+            {
+                // A protected-state location failure must not prevent ordinary
+                // IRC connectivity or the existing fallback strategies.
+                _resumeStateStore = null;
+                _resumeSecretProtector = null;
+            }
+        }
+
+        Sessions = new NetworkSessionManager(
+            transportFactory,
+            new WpfWorkspaceDispatcher(dispatcher),
+            configuration: configuration,
+            logStore: logStore,
+            resumeStateStore: _resumeStateStore,
+            resumeSecretProtector: _resumeSecretProtector);
         if (configuration is not null)
         {
             _notificationAdapter = new DesktopNotificationAdapter(Sessions.Notifications, () => CurrentPreferences, notification => { RouteNotification(notification); });
@@ -1009,6 +1034,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             provider.Dispose();
         }
         _sessionServerPasswords.Clear();
+        if (_resumeStateStore is IDisposable disposableResumeStore)
+        {
+            disposableResumeStore.Dispose();
+        }
     }
 
     private void SavePreferencesInBackground()

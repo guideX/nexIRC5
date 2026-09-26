@@ -76,6 +76,16 @@ public sealed class ServerSessionOptions
     public Guid? NetworkId { get; init; }
 
     /// <summary>
+    /// Stable network/profile binding used to look up protected native-resume
+    /// metadata. It must not contain a socket, process, or connection id.
+    /// </summary>
+    public string? ResumeNetworkIdentity { get; init; }
+
+    public IResumeStateStore? ResumeStateStore { get; init; }
+
+    public IResumeSecretProtector? ResumeSecretProtector { get; init; }
+
+    /// <summary>
     /// Set by the application when it intentionally replaces a session object
     /// but must still perform continuity synchronization against the durable
     /// workspace retained from the prior session.

@@ -80,7 +80,12 @@ public sealed record NexIrcResumeSupport(
 
 public sealed class NexIrcResumeSession
 {
-    public NexIrcResumeSession(string token, string authoritativeBoundary, int establishedGeneration)
+    public NexIrcResumeSession(
+        string token,
+        string authoritativeBoundary,
+        int establishedGeneration,
+        string? previousToken = null,
+        int? previousGeneration = null)
     {
         if (!NexIrcResumeProtocol.IsSafeOpaqueValue(token))
         {
@@ -92,9 +97,22 @@ public sealed class NexIrcResumeSession
             throw new ArgumentException("The resume boundary is not a safe opaque IRC value.", nameof(authoritativeBoundary));
         }
 
+        if (previousToken is not null && !NexIrcResumeProtocol.IsSafeOpaqueValue(previousToken))
+        {
+            throw new ArgumentException("The previous resume token is not a safe opaque IRC value.", nameof(previousToken));
+        }
+
+        if (previousToken is null && previousGeneration is not null
+            || previousToken is not null && previousGeneration is not > 0)
+        {
+            throw new ArgumentException("A previous resume token and generation must be supplied together.", nameof(previousGeneration));
+        }
+
         Token = token;
         AuthoritativeBoundary = authoritativeBoundary;
         EstablishedGeneration = establishedGeneration;
+        PreviousToken = previousToken;
+        PreviousGeneration = previousGeneration;
     }
 
     /// <summary>Opaque protocol material; never include this property in diagnostics.</summary>
@@ -106,11 +124,40 @@ public sealed class NexIrcResumeSession
 
     public int EstablishedGeneration { get; }
 
+    /// <summary>
+    /// The server's prior current token while a replacement is awaiting the
+    /// client acknowledgement. The active <see cref="Token"/> is the
+    /// replacement and is safe to offer after a restart because the server's
+    /// bounded overlap accepts it.
+    /// </summary>
+    public string? PreviousToken { get; }
+
+    public int? PreviousGeneration { get; }
+
+    public bool HasPendingRotation => PreviousToken is not null;
+
+    public string DurableCurrentToken => PreviousToken ?? Token;
+
+    public int DurableCurrentGeneration => PreviousGeneration ?? EstablishedGeneration;
+
     public NexIrcResumeSession Advance(string authoritativeBoundary) =>
-        new(Token, authoritativeBoundary, EstablishedGeneration);
+        new(Token, authoritativeBoundary, EstablishedGeneration, PreviousToken, PreviousGeneration);
 
     public NexIrcResumeSession Rotate(string token, string authoritativeBoundary, int generation) =>
-        new(token, authoritativeBoundary, generation);
+        new(token, authoritativeBoundary, generation, Token, EstablishedGeneration);
+
+    public NexIrcResumeSession MarkRotationAcknowledged() =>
+        new(Token, AuthoritativeBoundary, EstablishedGeneration);
+
+    public static NexIrcResumeSession FromDurableState(
+        string currentToken,
+        string? pendingToken,
+        string authoritativeBoundary,
+        int tokenGeneration,
+        int? pendingTokenGeneration) =>
+        pendingToken is { Length: > 0 } pending && pendingTokenGeneration is { } pendingGeneration
+            ? new(pending, authoritativeBoundary, pendingGeneration, currentToken, tokenGeneration)
+            : new(currentToken, authoritativeBoundary, tokenGeneration);
 
     public override string ToString() =>
         $"session={TokenFingerprint}; boundary={AuthoritativeBoundary}; generation={EstablishedGeneration}";

@@ -68,8 +68,16 @@ public static class IrcSensitiveData
     {
         ArgumentNullException.ThrowIfNull(line);
         var withoutLineEnd = line.TrimStart();
-        var separator = withoutLineEnd.IndexOfAny([' ', '\t']);
-        var command = separator < 0 ? withoutLineEnd : withoutLineEnd[..separator];
+        var commandStart = withoutLineEnd.StartsWith(':')
+            ? withoutLineEnd.IndexOfAny([' ', '\t']) + 1
+            : 0;
+        if (commandStart <= 0 || commandStart >= withoutLineEnd.Length)
+        {
+            commandStart = 0;
+        }
+
+        var separator = withoutLineEnd.IndexOfAny([' ', '\t'], commandStart);
+        var command = separator < 0 ? withoutLineEnd[commandStart..] : withoutLineEnd[commandStart..separator];
         return command.Equals("PASS", StringComparison.OrdinalIgnoreCase)
             || command.Equals("AUTHENTICATE", StringComparison.OrdinalIgnoreCase)
             || command.Equals("NEXIRC", StringComparison.OrdinalIgnoreCase);
@@ -80,8 +88,16 @@ public static class IrcSensitiveData
         ArgumentNullException.ThrowIfNull(line);
         var withoutLineEnd = line.TrimEnd('\r', '\n');
         var normalized = withoutLineEnd.TrimStart();
-        var separator = normalized.IndexOfAny([' ', '\t']);
-        var command = separator < 0 ? normalized : normalized[..separator];
+        var commandStart = normalized.StartsWith(':')
+            ? normalized.IndexOfAny([' ', '\t']) + 1
+            : 0;
+        if (commandStart <= 0 || commandStart >= normalized.Length)
+        {
+            commandStart = 0;
+        }
+
+        var separator = normalized.IndexOfAny([' ', '\t'], commandStart);
+        var command = separator < 0 ? normalized[commandStart..] : normalized[commandStart..separator];
         if (command.Equals("PASS", StringComparison.OrdinalIgnoreCase))
         {
             return "PASS :<redacted>";
@@ -110,6 +126,24 @@ public static class IrcSensitiveData
         }
 
         return "AUTHENTICATE <redacted>";
+    }
+
+    /// <summary>
+    /// Parsed protocol messages are public diagnostics too. Reparse a
+    /// redacted representation before publishing PASS/AUTHENTICATE/NEXIRC so
+    /// a bearer credential cannot escape through the parsed-event channel.
+    /// The protocol loop continues using its private original message.
+    /// </summary>
+    public static IrcMessage RedactParsedMessage(IrcMessage message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        if (!IsSensitiveCommandLine(message.RawLine))
+        {
+            return message;
+        }
+
+        var parsed = IrcMessageParser.Parse(RedactLine(message.RawLine));
+        return parsed.Message ?? message;
     }
 
     private static string RedactNexIrcResumeLine(string line)

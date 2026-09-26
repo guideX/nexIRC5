@@ -234,12 +234,23 @@ public sealed record NetworkConnectionOptions
 
     public SaslAuthenticationPolicy SaslPolicy { get; init; } = SaslAuthenticationPolicy.Disabled;
 
+    /// <summary>
+    /// Optional host-owned protected native-resume metadata store. The
+    /// application never puts bearer tokens in NetworkProfile/configuration.
+    /// </summary>
+    public IResumeStateStore? ResumeStateStore { get; init; }
+
     public ServerSessionOptions ToSessionOptions(
         Guid? networkId = null,
         bool continuityRecoveryRequired = false,
-        int? continuityPreviousGeneration = null) => new()
+        int? continuityPreviousGeneration = null,
+        IResumeStateStore? resumeStateStore = null,
+        IResumeSecretProtector? resumeSecretProtector = null) => new()
     {
         NetworkId = networkId,
+        ResumeNetworkIdentity = ResumeStateIdentity.For(Endpoint, networkId),
+        ResumeStateStore = resumeStateStore ?? ResumeStateStore,
+        ResumeSecretProtector = resumeSecretProtector,
         ContinuityRecoveryRequired = continuityRecoveryRequired,
         ContinuityPreviousGeneration = continuityPreviousGeneration,
         Endpoint = Endpoint,

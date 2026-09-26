@@ -13,6 +13,12 @@ public sealed class TcpTlsIrcTransportOptions
     public int MaximumReadBytes { get; init; } = 64 * 1024;
 
     public SslProtocols EnabledSslProtocols { get; init; } = SslProtocols.None;
+
+    /// <summary>
+    /// Test-only trust injection. Production callers leave this null so the
+    /// platform certificate policy remains authoritative.
+    /// </summary>
+    public RemoteCertificateValidationCallback? ServerCertificateValidationCallback { get; init; }
 }
 
 /// <summary>
@@ -71,7 +77,8 @@ public sealed class TcpTlsIrcTransport : IIrcTransport
                 await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
                 {
                     TargetHost = Endpoint.Host,
-                    EnabledSslProtocols = _options.EnabledSslProtocols
+                    EnabledSslProtocols = _options.EnabledSslProtocols,
+                    RemoteCertificateValidationCallback = _options.ServerCertificateValidationCallback
                 }, linked.Token).ConfigureAwait(false);
                 stream = ssl;
             }

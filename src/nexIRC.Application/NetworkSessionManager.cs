@@ -23,6 +23,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private readonly bool _ownsNotifications;
     private readonly bool _ownsLogStore;
     private readonly IrcOperationTimeoutPolicy _operationTimeouts;
+    private readonly IResumeStateStore? _resumeStateStore;
+    private readonly IResumeSecretProtector? _resumeSecretProtector;
     private readonly ConnectionRecoveryStrategySelector _recoveryStrategySelector = new();
     private readonly object _disposeGate = new();
     private readonly object _replyNavigationGate = new();
@@ -52,7 +54,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         ConfigurationService? configuration = null,
         IConversationLogStore? logStore = null,
         ConversationLoggingService? logging = null,
-        IrcOperationTimeoutPolicy? operationTimeouts = null)
+        IrcOperationTimeoutPolicy? operationTimeouts = null,
+        IResumeStateStore? resumeStateStore = null,
+        IResumeSecretProtector? resumeSecretProtector = null)
     {
         _transportFactory = transportFactory ?? throw new ArgumentNullException(nameof(transportFactory));
         _dispatcher = new SerializedWorkspaceDispatcher(dispatcher ?? new ImmediateWorkspaceDispatcher());
@@ -66,6 +70,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             : null);
         _ownsLogStore = logStore is not null;
         _operationTimeouts = operationTimeouts ?? new IrcOperationTimeoutPolicy();
+        _resumeStateStore = resumeStateStore;
+        _resumeSecretProtector = resumeSecretProtector;
         if (configuration is not null)
         {
             ApplyPreferences(configuration.Preferences);
@@ -199,8 +205,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(options);
         ValidateOptions(options);
 
-        var networkId = Guid.NewGuid();
-        var session = new ServerSession(options.ToSessionOptions(networkId), _transportFactory);
+        var networkId = options.ProfileId is Guid profileId && profileId != Guid.Empty ? profileId : Guid.NewGuid();
+        var session = new ServerSession(options.ToSessionOptions(networkId, resumeStateStore: _resumeStateStore, resumeSecretProtector: _resumeSecretProtector), _transportFactory);
         var workspace = new NetworkWorkspace(networkId, options, session);
         var entry = new SessionEntry(workspace, options, session);
         lock (_entriesGate)
@@ -2496,6 +2502,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     public async ValueTask RemoveAsync(Guid networkId)
     {
         var entry = GetEntry(networkId);
+        await entry.Session.ClearPersistedNativeResumeStateAsync().ConfigureAwait(false);
         lock (_entriesGate)
         {
             _entries.Remove(networkId);
@@ -3496,7 +3503,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             entry.Options.ToSessionOptions(
                 entry.Workspace.Id,
                 entry.ContinuityRecoveryRequired,
-                entry.ContinuityRecoveryRequired ? entry.ContinuityPreviousGeneration ?? previousGeneration : null),
+                entry.ContinuityRecoveryRequired ? entry.ContinuityPreviousGeneration ?? previousGeneration : null,
+                _resumeStateStore,
+                _resumeSecretProtector),
             _transportFactory);
         entry.Workspace.Options = entry.Options;
         entry.Workspace.Session = entry.Session;

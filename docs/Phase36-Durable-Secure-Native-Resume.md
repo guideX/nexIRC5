@@ -12,11 +12,10 @@ server's grace overlap leaves the prior token usable. The client never logs
 the replacement token: transcript/raw-line redaction uses a diagnostic
 fingerprint.
 
-The client does not persist bearer tokens across application restart in this
-phase. This is an intentional security decision. Tokens remain memory-only and
-are never written to conversation history or ordinary JSON configuration.
-OS-protected token storage is deferred until its lifecycle and recovery
-semantics are designed and tested.
+Phase 36 intentionally left bearer-token persistence to the follow-on Phase 37
+client-state boundary. Phase 37 adds protected metadata plus Windows DPAPI
+storage and defines its rotation crash semantics in
+`docs/Phase37-Protected-Client-Resume-And-Crash-Resilience.md`.
 
 TLS remains platform-validated through `SslStream` in
 `TcpTlsIrcTransport`; certificate-validation bypasses are test-only. The

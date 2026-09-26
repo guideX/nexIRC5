@@ -35,6 +35,9 @@ public sealed class ServerSession : IAsyncDisposable
     private readonly Channel<SessionSemanticEvent> _semanticEvents = CreateEventChannel<SessionSemanticEvent>();
     private readonly Channel<OutboundIrcCommandEvent> _outboundEvents = CreateEventChannel<OutboundIrcCommandEvent>();
     private readonly object _gate = new();
+    private readonly string _resumeNetworkIdentity;
+    private readonly IResumeStateStore? _resumeStateStore;
+    private readonly IResumeSecretProtector? _resumeSecretProtector;
     private readonly SessionStateStore _stateStore;
     private readonly IrcCapabilityNegotiator _capabilities;
     private readonly ISupportState _isupport = new();
@@ -58,6 +61,7 @@ public sealed class ServerSession : IAsyncDisposable
     private SaslAuthenticationState _authenticationState;
     private string? _authenticationMechanism;
     private string? _authenticationFailure;
+    private string? _authenticatedAccountHint;
     private SaslCredential? _activeCredential;
     private ISaslMechanism? _activeSaslMechanism;
     private bool _saslResponseSent;
@@ -72,6 +76,11 @@ public sealed class ServerSession : IAsyncDisposable
     private readonly HashSet<string> _acceptedNativeResumeBatches = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _nativeLiveSequenceMessageIds = new(StringComparer.Ordinal);
     private NexIrcResumeSession? _nativeResumeSession;
+    private NexIrcResumeSession? _freshSessionAfterRestoredResume;
+    private ClientResumeStateRecord? _loadedResumeState;
+    private DateTimeOffset? _resumeStateCreatedAt;
+    private bool _restoredResumeActive;
+    private bool _resumeStateLoadCompleted;
     private NativeResumeAttempt? _nativeResumeAttempt;
     private string? _nativeLivePendingSequence;
     private string? _nativeLivePendingMessageId;
@@ -83,6 +92,11 @@ public sealed class ServerSession : IAsyncDisposable
         ValidateOptions(options);
         _options = options;
         _transportFactory = transportFactory;
+        _resumeNetworkIdentity = string.IsNullOrWhiteSpace(options.ResumeNetworkIdentity)
+            ? ResumeStateIdentity.For(options.Endpoint, options.NetworkId)
+            : options.ResumeNetworkIdentity!;
+        _resumeStateStore = options.ResumeStateStore;
+        _resumeSecretProtector = options.ResumeSecretProtector;
         _stateStore = new SessionStateStore(options.Nickname, options.DesiredChannels);
         _nicknameCandidates = BuildNicknameCandidates(options);
         var requestedCapabilityList = options.RequestedCapabilities
@@ -268,6 +282,19 @@ public sealed class ServerSession : IAsyncDisposable
             {
                 return NexIrcResumeExecutionResult.Unsupported(
                     "The current generation did not negotiate nexIRC native resume or has no retained logical session.");
+            }
+
+            if (_restoredResumeActive && !TryActivateRestoredResumeStateUnsafe())
+            {
+                return NexIrcResumeExecutionResult.Unsupported(
+                    "The protected resume record does not match the authenticated account context; the stored bearer credential was not offered.");
+            }
+
+            if (_options.SaslPolicy != SaslAuthenticationPolicy.Disabled
+                && _authenticationState != SaslAuthenticationState.Succeeded)
+            {
+                return NexIrcResumeExecutionResult.Unsupported(
+                    "The authenticated account context was not established; the stored bearer credential was not offered.");
             }
 
             if (_nativeResumeAttempt is not null)
@@ -566,6 +593,14 @@ public sealed class ServerSession : IAsyncDisposable
         await QueueOutboundAsync(message, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Removes the protected native-resume record for this network. Normal
+    /// disconnects intentionally do not call this; profile removal, logout,
+    /// or credential replacement may call it explicitly.
+    /// </summary>
+    public ValueTask ClearPersistedNativeResumeStateAsync(CancellationToken cancellationToken = default) =>
+        ClearProtectedResumeStateAsync(cancellationToken: cancellationToken);
+
     public async ValueTask SendCommandAsync(IrcOutboundMessage message, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(message);
@@ -849,11 +884,217 @@ public sealed class ServerSession : IAsyncDisposable
         return RunSupervisorAsync(_runCts.Token);
     }
 
+    private async Task LoadProtectedResumeStateAsync(CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            if (_resumeStateLoadCompleted)
+            {
+                return;
+            }
+
+            _resumeStateLoadCompleted = true;
+        }
+
+        if (_resumeStateStore is null || _resumeSecretProtector is null)
+        {
+            return;
+        }
+
+        ResumeStateLoadResult loaded;
+        try
+        {
+            loaded = await _resumeStateStore.LoadAsync(_resumeNetworkIdentity, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            _continuity.RecordDiagnostic(0, ContinuityDiagnosticKind.RecoveryRequestFailed, "Protected native-resume state could not be loaded; ordinary IRC fallback remains available.");
+            return;
+        }
+
+        if (!loaded.IsUsable || loaded.State is not { } state)
+        {
+            if (loaded.Status is ResumeStateLoadStatus.Corrupt or ResumeStateLoadStatus.Unsupported or ResumeStateLoadStatus.Unavailable)
+            {
+                _continuity.RecordDiagnostic(0, ContinuityDiagnosticKind.RecoveryRequestFailed, $"Protected native-resume state was not usable ({loaded.Status}); ordinary IRC fallback remains available.");
+            }
+
+            return;
+        }
+
+        if (!state.IsSupported)
+        {
+            _continuity.RecordDiagnostic(0, ContinuityDiagnosticKind.RecoveryRequestFailed, "Protected native-resume state uses an unsupported persistence version.");
+            return;
+        }
+
+        if (!state.IsWellFormed || !string.Equals(state.NetworkIdentity, _resumeNetworkIdentity, StringComparison.Ordinal))
+        {
+            _continuity.RecordDiagnostic(0, ContinuityDiagnosticKind.RecoveryRequestFailed, "Protected native-resume state failed its local binding validation.");
+            return;
+        }
+
+        try
+        {
+            var currentToken = _resumeSecretProtector.Unprotect(state.ProtectedCurrentToken, _resumeNetworkIdentity);
+            var pendingToken = state.ProtectedPendingToken is { Length: > 0 } protectedPending
+                ? _resumeSecretProtector.Unprotect(protectedPending, _resumeNetworkIdentity)
+                : null;
+            var restored = NexIrcResumeSession.FromDurableState(
+                currentToken,
+                pendingToken,
+                state.AuthoritativeBoundary,
+                state.TokenGeneration,
+                state.PendingTokenGeneration);
+            lock (_gate)
+            {
+                _loadedResumeState = state;
+                _resumeStateCreatedAt = state.CreatedAt;
+                _nativeResumeSession = restored;
+                _restoredResumeActive = true;
+            }
+        }
+        catch
+        {
+            _continuity.RecordDiagnostic(0, ContinuityDiagnosticKind.RecoveryRequestFailed, "Protected native-resume state could not be unprotected; ordinary IRC fallback remains available.");
+        }
+    }
+
+    private bool TryActivateRestoredResumeStateUnsafe()
+    {
+        if (!_restoredResumeActive
+            || _nativeResumeSession is null
+            || _loadedResumeState is not { } loaded
+            || !NexIrcResumeProtocol.IsSupported(_capabilities.Snapshot))
+        {
+            return false;
+        }
+
+        if (_options.SaslPolicy != SaslAuthenticationPolicy.Disabled
+            && _authenticationState != SaslAuthenticationState.Succeeded)
+        {
+            return false;
+        }
+
+        var account = _authenticatedAccountHint ?? (_options.SaslPolicy == SaslAuthenticationPolicy.Disabled ? _options.Username : null);
+        if (account is null || !string.Equals(account, loaded.AccountIdentity, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private async ValueTask<bool> PersistNativeResumeStateAsync(
+        NexIrcResumeSession session,
+        string? accountIdentity = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_resumeStateStore is null || _resumeSecretProtector is null)
+        {
+            // Protected persistence is optional for headless/third-party
+            // composition. Preserve the Phase 36 in-memory protocol contract
+            // when no durable provider has been installed.
+            return true;
+        }
+
+        var account = accountIdentity ?? _authenticatedAccountHint ?? _options.Username;
+        var now = DateTimeOffset.UtcNow;
+        DateTimeOffset createdAt;
+        lock (_gate)
+        {
+            createdAt = _resumeStateCreatedAt ?? now;
+        }
+
+        try
+        {
+            var state = new ClientResumeStateRecord(
+                ClientResumeStateRecord.CurrentVersion,
+                _resumeNetworkIdentity,
+                account,
+                NexIrcResumeProtocol.CapabilityVersion,
+                _resumeSecretProtector.Protect(session.DurableCurrentToken, _resumeNetworkIdentity),
+                session.HasPendingRotation
+                    ? _resumeSecretProtector.Protect(session.Token, _resumeNetworkIdentity)
+                    : null,
+                session.DurableCurrentGeneration,
+                session.HasPendingRotation ? session.EstablishedGeneration : null,
+                session.HasPendingRotation ? session.DurableCurrentGeneration : session.EstablishedGeneration,
+                session.AuthoritativeBoundary,
+                createdAt,
+                now);
+            var result = await _resumeStateStore.SaveAsync(state, cancellationToken).ConfigureAwait(false);
+            if (!result.Succeeded)
+            {
+                _continuity.RecordDiagnostic(_connectionGeneration, ContinuityDiagnosticKind.RecoveryRequestFailed, "Protected native-resume state could not be durably committed; the in-memory session remains bounded and fallback-safe.");
+                return false;
+            }
+
+            lock (_gate)
+            {
+                _resumeStateCreatedAt = createdAt;
+                _loadedResumeState = state;
+            }
+
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            _continuity.RecordDiagnostic(_connectionGeneration, ContinuityDiagnosticKind.RecoveryRequestFailed, "Protected native-resume state persistence failed without exposing credentials.");
+            return false;
+        }
+    }
+
+    private async ValueTask ClearProtectedResumeStateAsync(
+        bool clearInMemory = true,
+        CancellationToken cancellationToken = default)
+    {
+        if (_resumeStateStore is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _ = await _resumeStateStore.DeleteAsync(_resumeNetworkIdentity, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            _continuity.RecordDiagnostic(_connectionGeneration, ContinuityDiagnosticKind.RecoveryRequestFailed, "Protected native-resume state cleanup failed safely.");
+        }
+        finally
+        {
+            if (clearInMemory)
+            {
+                lock (_gate)
+                {
+                    _loadedResumeState = null;
+                    _nativeResumeSession = null;
+                    _freshSessionAfterRestoredResume = null;
+                    _restoredResumeActive = false;
+                }
+            }
+        }
+    }
+
     private async Task RunSupervisorAsync(CancellationToken cancellationToken)
     {
         var reconnectAttempt = 0;
         try
         {
+            await LoadProtectedResumeStateAsync(cancellationToken).ConfigureAwait(false);
             while (!cancellationToken.IsCancellationRequested && !_disconnectRequested)
             {
                 reconnectAttempt++;
@@ -1278,12 +1519,12 @@ public sealed class ServerSession : IAsyncDisposable
         var parse = IrcMessageParser.Parse(frame.Text);
         if (!parse.Success)
         {
-            await PublishParseErrorAsync(frame.Text, parse.Error ?? "The IRC line could not be parsed.", epoch).ConfigureAwait(false);
+            await PublishParseErrorAsync(IrcSensitiveData.RedactLine(frame.Text), parse.Error ?? "The IRC line could not be parsed.", epoch).ConfigureAwait(false);
             return;
         }
 
         var message = parse.Message!;
-        await _parsedEvents.Writer.WriteAsync(new ParsedIrcMessageEvent(receivedAt, message, epoch.Generation), connectionCts.Token).ConfigureAwait(false);
+        await _parsedEvents.Writer.WriteAsync(new ParsedIrcMessageEvent(receivedAt, IrcSensitiveData.RedactParsedMessage(message), epoch.Generation), connectionCts.Token).ConfigureAwait(false);
         if (!IsCurrentEpoch(epoch))
         {
             return;
@@ -1391,6 +1632,16 @@ public sealed class ServerSession : IAsyncDisposable
                 epoch.Generation,
                 continuityRequiresSynchronization));
             SetState(ServerSessionState.Registered);
+            lock (_gate)
+            {
+                if (TryActivateRestoredResumeStateUnsafe())
+                {
+                    _continuity.RecordDiagnostic(
+                        epoch.Generation,
+                        ContinuityDiagnosticKind.RegistrationCompleted,
+                        $"Protected native-resume state bound to authenticated account; session={_nativeResumeSession!.TokenFingerprint}; boundary={_nativeResumeSession.AuthoritativeBoundary}");
+                }
+            }
             await PublishSemanticAsync(new IrcRegistrationStateEvent(message, previousRegistration, _registration), epoch, receivedAt).ConfigureAwait(false);
             await QueueDesiredChannelsAsync(epoch, connectionCts.Token).ConfigureAwait(false);
         }
@@ -1515,7 +1766,7 @@ public sealed class ServerSession : IAsyncDisposable
 
         if (nativeLiveEvent && stateEvents.Count > 0)
         {
-            CommitNativeLiveEvent(message, epoch.Generation);
+            await CommitNativeLiveEventAsync(message, epoch.Generation).ConfigureAwait(false);
         }
 
         if (historyLimitExceeded)
@@ -1529,7 +1780,7 @@ public sealed class ServerSession : IAsyncDisposable
 
             if (nativeResumePlayback && semanticEvent.IsHistorical)
             {
-                CommitNativeReplayEvent(message, epoch.Generation);
+                await CommitNativeReplayEventAsync(message, epoch.Generation).ConfigureAwait(false);
             }
 
             if (semanticEvent.IsHistorical)
@@ -1805,6 +2056,7 @@ public sealed class ServerSession : IAsyncDisposable
         }
 
         _activeCredential = credential;
+        _authenticatedAccountHint = credential.UserName;
         _activeSaslMechanism = mechanism;
         _saslResponseSent = false;
         await QueueOutboundAsync(new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build("AUTHENTICATE", [mechanism.Name]), connectionCts.Token, epoch).ConfigureAwait(false);
@@ -2288,14 +2540,14 @@ public sealed class ServerSession : IAsyncDisposable
         }
     }
 
-    private Task HandleNativeResumeMessageAsync(
+    private async Task HandleNativeResumeMessageAsync(
         IrcMessage message,
         ConnectionEpoch epoch,
         CancellationTokenSource connectionCts)
     {
         if (!IsCurrentEpoch(epoch))
         {
-            return Task.CompletedTask;
+            return;
         }
 
         var subcommand = message.Parameters.Count == 0
@@ -2306,14 +2558,20 @@ public sealed class ServerSession : IAsyncDisposable
             if (message.Parameters.Count >= 3
                 && string.Equals(message.Parameters[1], NexIrcResumeProtocol.SessionRotateSubcommand, StringComparison.OrdinalIgnoreCase))
             {
-                return HandleNativeSessionRotationAsync(message, epoch, connectionCts);
+                await HandleNativeSessionRotationAsync(message, epoch, connectionCts).ConfigureAwait(false);
+            }
+            else if (message.Parameters.Count >= 4
+                && string.Equals(message.Parameters[1], NexIrcResumeProtocol.SessionAckSubcommand, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(message.Parameters[2], "OK", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleNativeSessionAcknowledgementAsync(message, epoch).ConfigureAwait(false);
             }
             else
             {
-                HandleNativeSessionAnnouncement(message, epoch.Generation);
+                await HandleNativeSessionAnnouncementAsync(message, epoch.Generation).ConfigureAwait(false);
             }
 
-            return Task.CompletedTask;
+            return;
         }
 
         if (subcommand != NexIrcResumeProtocol.ResumeSubcommand || message.Parameters.Count < 2)
@@ -2324,7 +2582,7 @@ public sealed class ServerSession : IAsyncDisposable
                 "The server sent a malformed nexIRC resume response.",
                 fallbackSafe: false,
                  reason: NexIrcResumeRejectionReason.Malformed);
-            return Task.CompletedTask;
+            return;
         }
 
         var response = message.Parameters[1].ToUpperInvariant();
@@ -2334,9 +2592,9 @@ public sealed class ServerSession : IAsyncDisposable
                 HandleNativeResumeAccepted(message.Parameters[2], epoch.Generation);
                 break;
             case "REJECT":
-                HandleNativeResumeRejected(
+                await HandleNativeResumeRejectedAsync(
                     message.Parameters.Count >= 3 ? message.Parameters[2] : string.Empty,
-                    epoch.Generation);
+                    epoch.Generation).ConfigureAwait(false);
                 break;
             case "UNSUPPORTED":
             case "NEW":
@@ -2346,7 +2604,7 @@ public sealed class ServerSession : IAsyncDisposable
                     epoch.Generation);
                 break;
             case "COMPLETE" when message.Parameters.Count >= 3:
-                HandleNativeResumeComplete(message.Parameters[2], epoch.Generation);
+                await HandleNativeResumeCompleteAsync(message.Parameters[2], epoch.Generation).ConfigureAwait(false);
                 break;
             default:
                 FailNativeResumeAttempt(
@@ -2359,10 +2617,9 @@ public sealed class ServerSession : IAsyncDisposable
         }
 
         _ = connectionCts;
-        return Task.CompletedTask;
     }
 
-    private void HandleNativeSessionAnnouncement(IrcMessage message, int generation)
+    private async Task HandleNativeSessionAnnouncementAsync(IrcMessage message, int generation)
     {
         if (!NexIrcResumeProtocol.IsSupported(_capabilities.Snapshot)
             || !NexIrcResumeProtocol.TryReadOpaqueParameters(message, 1, out var token, out var boundary))
@@ -2370,15 +2627,30 @@ public sealed class ServerSession : IAsyncDisposable
             return;
         }
 
+        NexIrcResumeSession? announced = null;
+        var persist = false;
         lock (_gate)
         {
-            if (_nativeResumeSession is null)
+            if (_nativeResumeSession is null || (_restoredResumeActive && !TryActivateRestoredResumeStateUnsafe()))
             {
-                _nativeResumeSession = new NexIrcResumeSession(token, boundary, generation);
+                announced = new NexIrcResumeSession(token, boundary, generation);
+                _nativeResumeSession = announced;
+                _freshSessionAfterRestoredResume = null;
+                _restoredResumeActive = false;
+                _resumeStateCreatedAt = DateTimeOffset.UtcNow;
+                persist = true;
                 _continuity.RecordDiagnostic(
                     generation,
                     ContinuityDiagnosticKind.RegistrationCompleted,
                     $"NexIrcResume session established session={_nativeResumeSession.TokenFingerprint}; boundary={boundary}");
+            }
+            else if (_restoredResumeActive)
+            {
+                _freshSessionAfterRestoredResume = new NexIrcResumeSession(token, boundary, generation);
+                _continuity.RecordDiagnostic(
+                    generation,
+                    ContinuityDiagnosticKind.RegistrationCompleted,
+                    "A fresh server-issued session was retained as bounded fallback while protected native-resume state is attempted.");
             }
             else if (_nativeResumeAttempt is { ReplayAccepted: true })
             {
@@ -2387,6 +2659,11 @@ public sealed class ServerSession : IAsyncDisposable
                     ContinuityDiagnosticKind.RecoveryRequestCompleted,
                     "A duplicate nexIRC session announcement was ignored after replay acceptance; ROTATE carries replacements.");
             }
+        }
+
+        if (persist && announced is not null)
+        {
+            await PersistNativeResumeStateAsync(announced).ConfigureAwait(false);
         }
     }
 
@@ -2428,7 +2705,7 @@ public sealed class ServerSession : IAsyncDisposable
         }
     }
 
-    private void HandleNativeResumeRejected(string reason, int generation)
+    private async Task HandleNativeResumeRejectedAsync(string reason, int generation)
     {
         var rejection = reason.ToUpperInvariant() switch
         {
@@ -2449,6 +2726,40 @@ public sealed class ServerSession : IAsyncDisposable
             ? "The server rejected the native resume request."
             : $"The server rejected the native resume request: {reason}.";
         CompleteNativeResumeRejected(rejection, detail, generation);
+
+        if (rejection is NexIrcResumeRejectionReason.UnknownToken
+            or NexIrcResumeRejectionReason.ExpiredToken
+            or NexIrcResumeRejectionReason.AccountMismatch
+            or NexIrcResumeRejectionReason.BoundaryTooOld
+            or NexIrcResumeRejectionReason.SessionInvalidated
+            or NexIrcResumeRejectionReason.ServerRestarted
+            or NexIrcResumeRejectionReason.NewSessionRequired)
+        {
+            await ClearProtectedResumeStateAsync(clearInMemory: false).ConfigureAwait(false);
+            NexIrcResumeSession? fallback = null;
+            lock (_gate)
+            {
+                _loadedResumeState = null;
+                if (_freshSessionAfterRestoredResume is { } fresh)
+                {
+                    fallback = fresh;
+                    _nativeResumeSession = fresh;
+                    _freshSessionAfterRestoredResume = null;
+                    _restoredResumeActive = false;
+                    _resumeStateCreatedAt = DateTimeOffset.UtcNow;
+                }
+                else
+                {
+                    _nativeResumeSession = null;
+                    _restoredResumeActive = false;
+                }
+            }
+
+            if (fallback is not null)
+            {
+                await PersistNativeResumeStateAsync(fallback).ConfigureAwait(false);
+            }
+        }
     }
 
     private async Task HandleNativeSessionRotationAsync(
@@ -2473,29 +2784,25 @@ public sealed class ServerSession : IAsyncDisposable
 
         var token = message.Parameters[2];
         var boundary = message.Parameters[3];
-        bool accepted;
+        NexIrcResumeSession? rotated = null;
         lock (_gate)
         {
             if (_nativeResumeSession is not { } current)
             {
-                accepted = false;
+                rotated = null;
             }
             else
             {
-                accepted = string.Equals(boundary, current.AuthoritativeBoundary, StringComparison.Ordinal)
+                var accepted = string.Equals(boundary, current.AuthoritativeBoundary, StringComparison.Ordinal)
                     && generation > current.EstablishedGeneration;
                 if (accepted)
                 {
-                    _nativeResumeSession = current.Rotate(token, boundary, generation);
-                    _continuity.RecordDiagnostic(
-                        epoch.Generation,
-                        ContinuityDiagnosticKind.RecoveryRequestCompleted,
-                        $"NexIrcResume token rotation accepted; session={_nativeResumeSession.TokenFingerprint}; generation={generation}");
+                    rotated = current.Rotate(token, boundary, generation);
                 }
             }
         }
 
-        if (!accepted)
+        if (rotated is null)
         {
             FailNativeResumeAttempt(
                 epoch.Generation,
@@ -2506,16 +2813,90 @@ public sealed class ServerSession : IAsyncDisposable
             return;
         }
 
-        // The in-memory session replacement is the client commit point.  The
-        // acknowledgement only tells the server that it may retire the old
-        // token; losing the connection before this write leaves both tokens
-        // usable and therefore cannot strand the client.
+        // Persist the old/current plus replacement/pending pair before either
+        // mutating the in-memory authority or acknowledging. A crash before
+        // this point leaves the old token as the only durable credential.
+        if (!await PersistNativeResumeStateAsync(rotated).ConfigureAwait(false))
+        {
+            _continuity.RecordDiagnostic(
+                epoch.Generation,
+                ContinuityDiagnosticKind.RecoveryRequestFailed,
+                "Token rotation was not acknowledged because the protected replacement could not be durably committed.");
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_nativeResumeSession is not null
+                && string.Equals(_nativeResumeSession.Token, rotated.PreviousToken, StringComparison.Ordinal)
+                && _nativeResumeSession.EstablishedGeneration == rotated.PreviousGeneration)
+            {
+                _nativeResumeSession = rotated;
+                _restoredResumeActive = false;
+                _freshSessionAfterRestoredResume = null;
+                _continuity.RecordDiagnostic(
+                    epoch.Generation,
+                    ContinuityDiagnosticKind.RecoveryRequestCompleted,
+                    $"NexIrcResume token rotation accepted; session={_nativeResumeSession.TokenFingerprint}; generation={generation}");
+            }
+            else
+            {
+                return;
+            }
+        }
+
+        // The acknowledgement only tells the server that it may retire the
+        // old token. Losing the connection after this write but before ACK OK
+        // leaves the protected old/pending pair recoverable on restart.
         await QueueOutboundAsync(
             new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build(
                 NexIrcResumeProtocol.Command,
                 [NexIrcResumeProtocol.SessionSubcommand, NexIrcResumeProtocol.SessionAckSubcommand, generation.ToString(System.Globalization.CultureInfo.InvariantCulture)]),
             connectionCts.Token,
             epoch).ConfigureAwait(false);
+    }
+
+    private async Task HandleNativeSessionAcknowledgementAsync(IrcMessage message, ConnectionEpoch epoch)
+    {
+        if (message.Parameters.Count < 4
+            || !int.TryParse(message.Parameters[3], out var generation)
+            || generation < 1)
+        {
+            return;
+        }
+
+        NexIrcResumeSession? acknowledged = null;
+        lock (_gate)
+        {
+            if (_nativeResumeSession is { HasPendingRotation: true } current
+                && current.EstablishedGeneration == generation)
+            {
+                acknowledged = current.MarkRotationAcknowledged();
+            }
+        }
+
+        if (acknowledged is null)
+        {
+            return;
+        }
+
+        // If cleanup persistence fails, retain the pending pair in memory and
+        // on disk. The server has already promoted the replacement, so the
+        // pending token remains the safe restart credential.
+        if (!await PersistNativeResumeStateAsync(acknowledged).ConfigureAwait(false))
+        {
+            _continuity.RecordDiagnostic(epoch.Generation, ContinuityDiagnosticKind.RecoveryRequestFailed, "ACK OK was received but local rotation cleanup could not be committed; the bounded protected overlap was retained.");
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_nativeResumeSession is { HasPendingRotation: true } current
+                && current.EstablishedGeneration == generation)
+            {
+                _nativeResumeSession = acknowledged;
+            }
+        }
     }
 
     private void CompleteNativeResumeRejected(
@@ -2541,7 +2922,7 @@ public sealed class ServerSession : IAsyncDisposable
         }
     }
 
-    private void HandleNativeResumeComplete(string boundary, int generation)
+    private async Task HandleNativeResumeCompleteAsync(string boundary, int generation)
     {
         if (!NexIrcResumeProtocol.IsSafeOpaqueValue(boundary))
         {
@@ -2554,6 +2935,9 @@ public sealed class ServerSession : IAsyncDisposable
             return;
         }
 
+        NexIrcResumeSession? completedSession = null;
+        NexIrcResumeExecutionResult? result = null;
+        TaskCompletionSource<NexIrcResumeExecutionResult>? completion = null;
         lock (_gate)
         {
             if (_nativeResumeAttempt is not { ConnectionGeneration: var attemptGeneration } attempt
@@ -2576,8 +2960,10 @@ public sealed class ServerSession : IAsyncDisposable
                 return;
             }
 
-            _nativeResumeSession = _nativeResumeSession?.Advance(boundary);
-            var result = new NexIrcResumeExecutionResult(
+            completedSession = _nativeResumeSession = _nativeResumeSession?.Advance(boundary);
+            _restoredResumeActive = false;
+            _freshSessionAfterRestoredResume = null;
+            result = new NexIrcResumeExecutionResult(
                 NexIrcResumeOutcome.Completed,
                 CapabilityNegotiated: true,
                 RequestSent: attempt.RequestSent,
@@ -2593,7 +2979,17 @@ public sealed class ServerSession : IAsyncDisposable
                 FallbackSafe: false);
             _nativeResumeAttempt = null;
             _acceptedNativeResumeBatches.Clear();
-            attempt.Completion.TrySetResult(result);
+            completion = attempt.Completion;
+        }
+
+        if (completedSession is not null)
+        {
+            await PersistNativeResumeStateAsync(completedSession).ConfigureAwait(false);
+        }
+
+        if (result is not null)
+        {
+            completion?.TrySetResult(result);
         }
     }
 
@@ -2746,8 +3142,9 @@ public sealed class ServerSession : IAsyncDisposable
         return true;
     }
 
-    private void CommitNativeLiveEvent(IrcMessage message, int generation)
+    private async Task CommitNativeLiveEventAsync(IrcMessage message, int generation)
     {
+        NexIrcResumeSession? updated = null;
         lock (_gate)
         {
             if (_nativeResumeSession is null
@@ -2758,14 +3155,20 @@ public sealed class ServerSession : IAsyncDisposable
             }
 
             _nativeLiveSequenceMessageIds[sequence] = message.ServerMessageId!;
-            _nativeResumeSession = _nativeResumeSession.Advance(sequence);
+            updated = _nativeResumeSession = _nativeResumeSession.Advance(sequence);
             _nativeLivePendingSequence = null;
             _nativeLivePendingMessageId = null;
         }
+
+        if (updated is not null)
+        {
+            await PersistNativeResumeStateAsync(updated).ConfigureAwait(false);
+        }
     }
 
-    private void CommitNativeReplayEvent(IrcMessage message, int generation)
+    private async Task CommitNativeReplayEventAsync(IrcMessage message, int generation)
     {
+        NexIrcResumeSession? updated = null;
         lock (_gate)
         {
             if (_nativeResumeAttempt is not { ConnectionGeneration: var attemptGeneration } attempt
@@ -2799,7 +3202,12 @@ public sealed class ServerSession : IAsyncDisposable
             attempt.ReplayedEventCount++;
             attempt.PendingSequence = null;
             attempt.PendingMessageId = null;
-            _nativeResumeSession = _nativeResumeSession?.Advance(sequence);
+            updated = _nativeResumeSession = _nativeResumeSession?.Advance(sequence);
+        }
+
+        if (updated is not null)
+        {
+            await PersistNativeResumeStateAsync(updated).ConfigureAwait(false);
         }
     }
 
@@ -3130,6 +3538,7 @@ public sealed class ServerSession : IAsyncDisposable
                 : SaslAuthenticationState.WaitingForCapability;
             _authenticationMechanism = null;
             _authenticationFailure = null;
+            _authenticatedAccountHint = null;
             DisposeActiveCredentialUnsafe();
             _activeSaslMechanism = null;
             _saslResponseSent = false;
@@ -3167,7 +3576,7 @@ public sealed class ServerSession : IAsyncDisposable
             return;
         }
 
-        var item = new IrcParseErrorEvent(DateTimeOffset.UtcNow, rawLine, error, epoch.Generation);
+        var item = new IrcParseErrorEvent(DateTimeOffset.UtcNow, IrcSensitiveData.RedactLine(rawLine), error, epoch.Generation);
         await _parseErrors.Writer.WriteAsync(item).ConfigureAwait(false);
     }
 
