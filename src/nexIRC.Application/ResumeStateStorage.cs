@@ -254,13 +254,22 @@ public sealed class JsonResumeStateStore : IResumeStateStore, IDisposable
         WriteIndented = false
     };
     private readonly string _root;
+    private readonly Action<ResumeStatePersistenceObservation>? _persistenceObserver;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private bool _disposed;
 
     public JsonResumeStateStore(string root)
+        : this(root, persistenceObserver: null)
+    {
+    }
+
+    internal JsonResumeStateStore(
+        string root,
+        Action<ResumeStatePersistenceObservation>? persistenceObserver)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(root);
         _root = Path.GetFullPath(root);
+        _persistenceObserver = persistenceObserver;
         Directory.CreateDirectory(_root);
     }
 
@@ -359,19 +368,25 @@ public sealed class JsonResumeStateStore : IResumeStateStore, IDisposable
         try
         {
             Directory.CreateDirectory(_root);
+            Observe(ResumeStatePersistenceStage.BeforeSerialization, state);
             var bytes = JsonSerializer.SerializeToUtf8Bytes(state, JsonOptions);
             if (bytes.Length > MaximumFileBytes)
             {
                 return new ResumeStateStoreResult(ResumeStateStoreStatus.Corrupt, "The protected resume metadata exceeded its bound.");
             }
 
+            Observe(ResumeStatePersistenceStage.AfterSerialization, state);
             await using (var stream = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough | FileOptions.Asynchronous))
             {
+                Observe(ResumeStatePersistenceStage.AfterTemporaryFileCreated, state);
                 await stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
+                Observe(ResumeStatePersistenceStage.AfterWrite, state);
                 await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
                 stream.Flush(flushToDisk: true);
+                Observe(ResumeStatePersistenceStage.AfterWriteThroughFlush, state);
             }
 
+            Observe(ResumeStatePersistenceStage.BeforeAtomicReplacement, state);
             if (File.Exists(path))
             {
                 File.Replace(temporary, path, path + ".bak", ignoreMetadataErrors: true);
@@ -381,6 +396,7 @@ public sealed class JsonResumeStateStore : IResumeStateStore, IDisposable
                 File.Move(temporary, path, overwrite: false);
             }
 
+            Observe(ResumeStatePersistenceStage.AfterAtomicReplacement, state);
             return new ResumeStateStoreResult(ResumeStateStoreStatus.Stored);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -399,10 +415,13 @@ public sealed class JsonResumeStateStore : IResumeStateStore, IDisposable
         {
             try
             {
+                Observe(ResumeStatePersistenceStage.BeforeTemporaryCleanup, state);
                 if (File.Exists(temporary))
                 {
                     File.Delete(temporary);
                 }
+
+                Observe(ResumeStatePersistenceStage.AfterTemporaryCleanup, state);
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             {
@@ -411,6 +430,14 @@ public sealed class JsonResumeStateStore : IResumeStateStore, IDisposable
             _gate.Release();
         }
     }
+
+    private void Observe(ResumeStatePersistenceStage stage, ClientResumeStateRecord state) =>
+        _persistenceObserver?.Invoke(new ResumeStatePersistenceObservation(
+            stage,
+            state.TokenGeneration,
+            state.PendingTokenGeneration,
+            state.AcknowledgedTokenGeneration,
+            state.AuthoritativeBoundary));
 
     public async ValueTask<ResumeStateStoreResult> DeleteAsync(string networkIdentity, CancellationToken cancellationToken = default)
     {
@@ -462,6 +489,26 @@ public sealed class JsonResumeStateStore : IResumeStateStore, IDisposable
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
 }
+
+internal enum ResumeStatePersistenceStage
+{
+    BeforeSerialization,
+    AfterSerialization,
+    AfterTemporaryFileCreated,
+    AfterWrite,
+    AfterWriteThroughFlush,
+    BeforeAtomicReplacement,
+    AfterAtomicReplacement,
+    BeforeTemporaryCleanup,
+    AfterTemporaryCleanup
+}
+
+internal readonly record struct ResumeStatePersistenceObservation(
+    ResumeStatePersistenceStage Stage,
+    int CurrentGeneration,
+    int? PendingGeneration,
+    int AcknowledgedGeneration,
+    string AuthoritativeBoundary);
 
 public static class ResumeStatePaths
 {

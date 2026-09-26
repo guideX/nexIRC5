@@ -8,6 +8,16 @@ namespace nexIRC.Application.Tests;
 
 public sealed class Phase37ResumeStateStoreTests
 {
+    public static IEnumerable<object[]> PreCommitFailureStages =>
+    [
+        [(int)ResumeStatePersistenceStage.BeforeSerialization],
+        [(int)ResumeStatePersistenceStage.AfterSerialization],
+        [(int)ResumeStatePersistenceStage.AfterTemporaryFileCreated],
+        [(int)ResumeStatePersistenceStage.AfterWrite],
+        [(int)ResumeStatePersistenceStage.AfterWriteThroughFlush],
+        [(int)ResumeStatePersistenceStage.BeforeAtomicReplacement]
+    ];
+
     [Fact]
     public async Task JsonStoreRoundTripsProtectedMetadataWithoutBearerText()
     {
@@ -81,6 +91,184 @@ public sealed class Phase37ResumeStateStoreTests
         Assert.DoesNotContain("phase37-dpapi-secret", Convert.ToBase64String(protectedSecret), StringComparison.Ordinal);
         Assert.Equal("phase37-dpapi-secret", protector.Unprotect(protectedSecret, "profile=one;host=example.test"));
         Assert.ThrowsAny<CryptographicException>(() => protector.Unprotect(protectedSecret, "profile=two;host=example.test"));
+    }
+
+    [Theory]
+    [MemberData(nameof(PreCommitFailureStages))]
+    public async Task PreCommitStorageFaultRetainsAuthoritativePrimaryAndCleansTemporaryFile(int failureStageValue)
+    {
+        var failureStage = (ResumeStatePersistenceStage)failureStageValue;
+        var root = Directory.CreateTempSubdirectory("nexirc-phase38-fault-");
+        try
+        {
+            var first = CreateState("first-token");
+            var replacement = first with
+            {
+                ProtectedCurrentToken = new TestProtector().Protect("second-token", first.NetworkIdentity),
+                UpdatedAt = first.UpdatedAt.AddSeconds(1)
+            };
+
+            using (var seedStore = new JsonResumeStateStore(root.FullName))
+            {
+                Assert.Equal(ResumeStateStoreStatus.Stored, (await seedStore.SaveAsync(first)).Status);
+            }
+
+            using (var failingStore = new JsonResumeStateStore(root.FullName, observation =>
+            {
+                if (observation.Stage == failureStage)
+                {
+                    throw new IOException("Injected pre-commit storage failure.");
+                }
+            }))
+            {
+                var result = await failingStore.SaveAsync(replacement);
+                Assert.Equal(ResumeStateStoreStatus.Failed, result.Status);
+            }
+
+            using var restartedStore = new JsonResumeStateStore(root.FullName);
+            var loaded = await restartedStore.LoadAsync(first.NetworkIdentity);
+            Assert.True(loaded.IsUsable);
+            Assert.Equal(first.UpdatedAt, loaded.State!.UpdatedAt);
+            Assert.Equal("first-token", new TestProtector().Unprotect(loaded.State.ProtectedCurrentToken, first.NetworkIdentity));
+            Assert.Empty(Directory.EnumerateFiles(root.FullName, "*.tmp"));
+        }
+        finally
+        {
+            Directory.Delete(root.FullName, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task TemporaryCleanupFailureAfterReplacementKeepsNewPrimaryAndOneBackup()
+    {
+        var root = Directory.CreateTempSubdirectory("nexirc-phase38-cleanup-");
+        try
+        {
+            var first = CreateState("first-token");
+            var second = first with
+            {
+                ProtectedCurrentToken = new TestProtector().Protect("second-token", first.NetworkIdentity),
+                UpdatedAt = first.UpdatedAt.AddSeconds(1)
+            };
+
+            using (var store = new JsonResumeStateStore(root.FullName))
+            {
+                Assert.Equal(ResumeStateStoreStatus.Stored, (await store.SaveAsync(first)).Status);
+            }
+
+            using (var store = new JsonResumeStateStore(root.FullName, observation =>
+            {
+                if (observation.Stage == ResumeStatePersistenceStage.BeforeTemporaryCleanup)
+                {
+                    throw new IOException("Injected cleanup failure.");
+                }
+            }))
+            {
+                Assert.Equal(ResumeStateStoreStatus.Stored, (await store.SaveAsync(second)).Status);
+            }
+
+            var jsonFiles = Directory.EnumerateFiles(root.FullName, "*.json").ToArray();
+            Assert.Single(jsonFiles);
+            Assert.True(File.Exists(jsonFiles[0] + ".bak"));
+            Assert.Empty(Directory.EnumerateFiles(root.FullName, "*.tmp"));
+
+            using var restartedStore = new JsonResumeStateStore(root.FullName);
+            var loaded = await restartedStore.LoadAsync(first.NetworkIdentity);
+            Assert.True(loaded.IsUsable);
+            Assert.Equal(second.UpdatedAt, loaded.State!.UpdatedAt);
+            Assert.Equal("second-token", new TestProtector().Unprotect(loaded.State.ProtectedCurrentToken, first.NetworkIdentity));
+        }
+        finally
+        {
+            Directory.Delete(root.FullName, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData("truncated", ResumeStateLoadStatus.Corrupt)]
+    [InlineData("malformed", ResumeStateLoadStatus.Corrupt)]
+    [InlineData("unsupported", ResumeStateLoadStatus.Unsupported)]
+    [InlineData("missing-current-token", ResumeStateLoadStatus.Corrupt)]
+    [InlineData("pending-generation-before-current", ResumeStateLoadStatus.Corrupt)]
+    [InlineData("acknowledgement-after-current", ResumeStateLoadStatus.Corrupt)]
+    [InlineData("malformed-boundary", ResumeStateLoadStatus.Corrupt)]
+    [InlineData("mismatched-network", ResumeStateLoadStatus.Corrupt)]
+    public async Task CorruptionMatrixReturnsBoundedFallbackStatus(string corruption, ResumeStateLoadStatus expectedStatus)
+    {
+        var root = Directory.CreateTempSubdirectory("nexirc-phase38-corrupt-");
+        try
+        {
+            var state = CreateState("corruption-token");
+            using (var seedStore = new JsonResumeStateStore(root.FullName))
+            {
+                Assert.Equal(ResumeStateStoreStatus.Stored, (await seedStore.SaveAsync(state)).Status);
+            }
+
+            var path = Directory.EnumerateFiles(root.FullName, "*.json").Single();
+            var contents = corruption switch
+            {
+                "truncated" => "{\"Version\":1",
+                "malformed" => "not-json",
+                "unsupported" => JsonSerializer.Serialize(state with { Version = 99 }),
+                "missing-current-token" => JsonSerializer.Serialize(state with { ProtectedCurrentToken = [] }),
+                "pending-generation-before-current" => JsonSerializer.Serialize(state with
+                {
+                    ProtectedPendingToken = [1, 2, 3],
+                    PendingTokenGeneration = 1
+                }),
+                "acknowledgement-after-current" => JsonSerializer.Serialize(state with { AcknowledgedTokenGeneration = state.TokenGeneration + 1 }),
+                "malformed-boundary" => JsonSerializer.Serialize(state with { AuthoritativeBoundary = " " }),
+                "mismatched-network" => JsonSerializer.Serialize(state with { NetworkIdentity = "another-network" }),
+                _ => throw new ArgumentOutOfRangeException(nameof(corruption))
+            };
+            File.WriteAllText(path, contents);
+
+            using var store = new JsonResumeStateStore(root.FullName);
+            var loaded = await store.LoadAsync(state.NetworkIdentity);
+
+            Assert.Equal(expectedStatus, loaded.Status);
+            Assert.DoesNotContain("corruption-token", loaded.Detail ?? string.Empty, StringComparison.Ordinal);
+            if (expectedStatus == ResumeStateLoadStatus.Corrupt)
+            {
+                Assert.True(File.Exists(path + ".bad"));
+            }
+        }
+        finally
+        {
+            Directory.Delete(root.FullName, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task CorruptPrimaryAndBackupReturnCorruptWithoutSelectingEitherRecord()
+    {
+        var root = Directory.CreateTempSubdirectory("nexirc-phase38-corrupt-pair-");
+        try
+        {
+            using (var store = new JsonResumeStateStore(root.FullName))
+            {
+                var first = CreateState("first-token");
+                var second = first with { UpdatedAt = first.UpdatedAt.AddSeconds(1) };
+                Assert.Equal(ResumeStateStoreStatus.Stored, (await store.SaveAsync(first)).Status);
+                Assert.Equal(ResumeStateStoreStatus.Stored, (await store.SaveAsync(second)).Status);
+            }
+
+            var primary = Directory.EnumerateFiles(root.FullName, "*.json").Single();
+            File.WriteAllText(primary, "broken-primary");
+            File.WriteAllText(primary + ".bak", "broken-backup");
+
+            using var restartedStore = new JsonResumeStateStore(root.FullName);
+            var loaded = await restartedStore.LoadAsync(CreateState("first-token").NetworkIdentity);
+
+            Assert.Equal(ResumeStateLoadStatus.Corrupt, loaded.Status);
+            Assert.True(File.Exists(primary + ".bad"));
+            Assert.True(File.Exists(primary + ".bak"));
+            Assert.Null(loaded.State);
+        }
+        finally
+        {
+            Directory.Delete(root.FullName, recursive: true);
+        }
     }
 
     private static ClientResumeStateRecord CreateState(string token)

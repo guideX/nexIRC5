@@ -2725,8 +2725,6 @@ public sealed class ServerSession : IAsyncDisposable
         var detail = string.IsNullOrWhiteSpace(reason)
             ? "The server rejected the native resume request."
             : $"The server rejected the native resume request: {reason}.";
-        CompleteNativeResumeRejected(rejection, detail, generation);
-
         if (rejection is NexIrcResumeRejectionReason.UnknownToken
             or NexIrcResumeRejectionReason.ExpiredToken
             or NexIrcResumeRejectionReason.AccountMismatch
@@ -2760,6 +2758,11 @@ public sealed class ServerSession : IAsyncDisposable
                 await PersistNativeResumeStateAsync(fallback).ConfigureAwait(false);
             }
         }
+
+        // The resume caller treats completion as the postcondition for this
+        // rejection. Finish clearing/adopting durable fallback state first so
+        // it cannot observe a rejected result alongside the stale credential.
+        CompleteNativeResumeRejected(rejection, detail, generation);
     }
 
     private async Task HandleNativeSessionRotationAsync(
