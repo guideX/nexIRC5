@@ -131,6 +131,14 @@ public static class IrcSensitiveData
         if (tokens.Length >= 4
             && tokens[1].Equals("SESSION", StringComparison.OrdinalIgnoreCase))
         {
+            if (tokens.Length >= 6
+                && tokens[2].Equals(NexIrcResumeProtocol.SessionRotateSubcommand, StringComparison.OrdinalIgnoreCase))
+            {
+                return commandIndex >= 0
+                    ? line[..(commandIndex + 1)] + $"NEXIRC SESSION ROTATE <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[3])}> {tokens[4]} {tokens[5]}"
+                    : $"NEXIRC SESSION ROTATE <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[3])}> {tokens[4]} {tokens[5]}";
+            }
+
             return commandIndex >= 0
                 ? line[..(commandIndex + 1)] + $"NEXIRC SESSION <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[2])}> {tokens[3]}"
                 : $"NEXIRC SESSION <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[2])}> {tokens[3]}";

@@ -2303,7 +2303,16 @@ public sealed class ServerSession : IAsyncDisposable
             : message.Parameters[0].ToUpperInvariant();
         if (subcommand == NexIrcResumeProtocol.SessionSubcommand)
         {
-            HandleNativeSessionAnnouncement(message, epoch.Generation);
+            if (message.Parameters.Count >= 3
+                && string.Equals(message.Parameters[1], NexIrcResumeProtocol.SessionRotateSubcommand, StringComparison.OrdinalIgnoreCase))
+            {
+                return HandleNativeSessionRotationAsync(message, epoch, connectionCts);
+            }
+            else
+            {
+                HandleNativeSessionAnnouncement(message, epoch.Generation);
+            }
+
             return Task.CompletedTask;
         }
 
@@ -2373,13 +2382,10 @@ public sealed class ServerSession : IAsyncDisposable
             }
             else if (_nativeResumeAttempt is { ReplayAccepted: true })
             {
-                // Token rotation is deliberately not enabled in the prototype.
-                // A production server may issue a replacement in a future
-                // protocol version after the completion barrier.
                 _continuity.RecordDiagnostic(
                     generation,
                     ContinuityDiagnosticKind.RecoveryRequestCompleted,
-                    "NexIrcResume token rotation was ignored because version 1 retains the original opaque token.");
+                    "A duplicate nexIRC session announcement was ignored after replay acceptance; ROTATE carries replacements.");
             }
         }
     }
@@ -2433,6 +2439,9 @@ public sealed class ServerSession : IAsyncDisposable
             "INVALIDATED" or "SESSION_INVALIDATED" => NexIrcResumeRejectionReason.SessionInvalidated,
             "RESTARTED" or "SERVER_RESTARTED" => NexIrcResumeRejectionReason.ServerRestarted,
             "TOO_LARGE" or "REPLAY_TOO_LARGE" => NexIrcResumeRejectionReason.ReplayTooLarge,
+            "RATE_LIMITED" => NexIrcResumeRejectionReason.RateLimited,
+            "AUTH_REQUIRED" => NexIrcResumeRejectionReason.AuthenticationRequired,
+            "TEMPORARY_FAILURE" => NexIrcResumeRejectionReason.TemporaryFailure,
             "NEW" or "NEW_SESSION" => NexIrcResumeRejectionReason.NewSessionRequired,
             _ => NexIrcResumeRejectionReason.Malformed
         };
@@ -2440,6 +2449,73 @@ public sealed class ServerSession : IAsyncDisposable
             ? "The server rejected the native resume request."
             : $"The server rejected the native resume request: {reason}.";
         CompleteNativeResumeRejected(rejection, detail, generation);
+    }
+
+    private async Task HandleNativeSessionRotationAsync(
+        IrcMessage message,
+        ConnectionEpoch epoch,
+        CancellationTokenSource connectionCts)
+    {
+        if (message.Parameters.Count < 5
+            || !NexIrcResumeProtocol.IsSafeOpaqueValue(message.Parameters[2])
+            || !NexIrcResumeProtocol.IsSafeOpaqueValue(message.Parameters[3])
+            || !int.TryParse(message.Parameters[4], out var generation)
+            || generation < 1)
+        {
+            FailNativeResumeAttempt(
+                epoch.Generation,
+                NexIrcResumeOutcome.Failed,
+                "The server sent a malformed nexIRC token rotation.",
+                fallbackSafe: false,
+                reason: NexIrcResumeRejectionReason.Malformed);
+            return;
+        }
+
+        var token = message.Parameters[2];
+        var boundary = message.Parameters[3];
+        bool accepted;
+        lock (_gate)
+        {
+            if (_nativeResumeSession is not { } current)
+            {
+                accepted = false;
+            }
+            else
+            {
+                accepted = string.Equals(boundary, current.AuthoritativeBoundary, StringComparison.Ordinal)
+                    && generation > current.EstablishedGeneration;
+                if (accepted)
+                {
+                    _nativeResumeSession = current.Rotate(token, boundary, generation);
+                    _continuity.RecordDiagnostic(
+                        epoch.Generation,
+                        ContinuityDiagnosticKind.RecoveryRequestCompleted,
+                        $"NexIrcResume token rotation accepted; session={_nativeResumeSession.TokenFingerprint}; generation={generation}");
+                }
+            }
+        }
+
+        if (!accepted)
+        {
+            FailNativeResumeAttempt(
+                epoch.Generation,
+                NexIrcResumeOutcome.Failed,
+                "The server sent a token rotation that did not match the current durable boundary.",
+                fallbackSafe: false,
+                reason: NexIrcResumeRejectionReason.Malformed);
+            return;
+        }
+
+        // The in-memory session replacement is the client commit point.  The
+        // acknowledgement only tells the server that it may retire the old
+        // token; losing the connection before this write leaves both tokens
+        // usable and therefore cannot strand the client.
+        await QueueOutboundAsync(
+            new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build(
+                NexIrcResumeProtocol.Command,
+                [NexIrcResumeProtocol.SessionSubcommand, NexIrcResumeProtocol.SessionAckSubcommand, generation.ToString(System.Globalization.CultureInfo.InvariantCulture)]),
+            connectionCts.Token,
+            epoch).ConfigureAwait(false);
     }
 
     private void CompleteNativeResumeRejected(

@@ -26,6 +26,29 @@ public sealed class Phase34NativeResumeTests
     }
 
     [Fact]
+    public async Task RotationReplacesClientTokenAndAcknowledgesGenerationWithoutLoggingIt()
+    {
+        await using var fixture = CreateFixture(DeterministicReplayProfile.NativeResume, []);
+        await using var session = await StartRegisteredAsync(fixture);
+        var oldToken = session.NativeResumeSession!.Token;
+        var raw = new List<string>();
+        session.RawLineReceived += (_, item) => raw.Add(item.RawLine);
+
+        fixture.Transport.EnqueueInboundLine(":deterministic.fixture NEXIRC SESSION ROTATE replacement-token resume-0 2");
+        await WaitForAsync(() => fixture.Transport.OutboundLines.Contains("NEXIRC SESSION ACK 2", StringComparer.Ordinal));
+
+        Assert.Equal("replacement-token", session.NativeResumeSession!.Token);
+        Assert.Equal(2, session.NativeResumeSession.EstablishedGeneration);
+        Assert.Contains(fixture.Transport.OutboundLines, line => line == "NEXIRC SESSION ACK 2");
+        Assert.DoesNotContain(raw, line => line.Contains("replacement-token", StringComparison.Ordinal));
+        Assert.Contains(raw, line => line.Contains("<redacted:", StringComparison.Ordinal));
+
+        await session.DisconnectAsync();
+        await session.Completion;
+        Assert.NotEqual(oldToken, session.NativeResumeSession.Token);
+    }
+
+    [Fact]
     public async Task NativeResumeEmitsHandshakeReplaysOrderedEventsAndCompletesStrongly()
     {
         await using var fixture = CreateFixture(DeterministicReplayProfile.NativeResume,

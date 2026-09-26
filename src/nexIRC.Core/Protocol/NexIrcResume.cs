@@ -16,6 +16,8 @@ public static class NexIrcResumeProtocol
     public const string CapabilityVersion = "1";
     public const string Command = "NEXIRC";
     public const string SessionSubcommand = "SESSION";
+    public const string SessionRotateSubcommand = "ROTATE";
+    public const string SessionAckSubcommand = "ACK";
     public const string ResumeSubcommand = "RESUME";
     public const string BatchType = "nexirc/resume";
     public const string ResumeSequenceTag = "resume-seq";
@@ -133,6 +135,9 @@ public enum NexIrcResumeRejectionReason
     SessionInvalidated,
     ServerRestarted,
     ReplayTooLarge,
+    RateLimited,
+    AuthenticationRequired,
+    TemporaryFailure,
     Unsupported,
     NewSessionRequired,
     Malformed
