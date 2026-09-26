@@ -638,7 +638,9 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
     private readonly long _maximumSegmentBytes;
     private readonly Channel<PendingWrite> _queue = Channel.CreateBounded<PendingWrite>(new BoundedChannelOptions(2048)
     {
-        FullMode = BoundedChannelFullMode.DropWrite,
+        // AppendAsync awaits each pending record's completion; dropping a write
+        // here could leave that caller waiting forever on an unqueued TCS.
+        FullMode = BoundedChannelFullMode.Wait,
         SingleReader = true,
         SingleWriter = false
     });
@@ -702,7 +704,7 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         }
     }
 
-    public ValueTask<bool> AppendAsync(ConversationLogRecord record, CancellationToken cancellationToken = default)
+    public async ValueTask<bool> AppendAsync(ConversationLogRecord record, CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         ArgumentNullException.ThrowIfNull(record);
@@ -711,16 +713,21 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
         if (bytes.Length > _maximumRecordBytes)
         {
             SetDiagnostic("A conversation log record exceeded the supported size and was dropped.");
-            return ValueTask.FromResult(false);
+            return false;
         }
 
         var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!_queue.Writer.TryWrite(new PendingWrite(record, completion)))
+        try
         {
-            completion.TrySetResult(false);
+            await _queue.Writer.WriteAsync(new PendingWrite(record, completion), cancellationToken).ConfigureAwait(false);
+        }
+        catch (ChannelClosedException)
+        {
+            SetDiagnostic("Conversation history writer stopped before the record could be accepted.");
+            return false;
         }
 
-        return new ValueTask<bool>(completion.Task);
+        return await completion.Task.ConfigureAwait(false);
     }
 
     public async ValueTask<IReadOnlyList<ConversationLogRecord>> ReadPageAsync(Guid scopeId, LogConversationKind kind, string conversationName, int pageSize = ConfigurationLimits.MaximumHistoryPageSize, DateTimeOffset? before = null, CancellationToken cancellationToken = default)
