@@ -19,6 +19,7 @@ public enum DeterministicReplayProfile
     NativeResumeExpired,
     NativeResumeAccountMismatch,
     NativeResumeBoundaryTooOld,
+    NativeResumeReplayTooLarge,
     NativeResumeInvalidated,
     NativeResumeServerRestarted,
     NativeResumeOutOfOrder,
@@ -336,6 +337,7 @@ public sealed class DeterministicServerHistoryFixture : IAsyncDisposable
             DeterministicReplayProfile.NativeResumeExpired => "EXPIRED_TOKEN",
             DeterministicReplayProfile.NativeResumeAccountMismatch => "ACCOUNT_MISMATCH",
             DeterministicReplayProfile.NativeResumeBoundaryTooOld => "BOUNDARY_TOO_OLD",
+            DeterministicReplayProfile.NativeResumeReplayTooLarge => "TOO_LARGE",
             DeterministicReplayProfile.NativeResumeInvalidated => "SESSION_INVALIDATED",
             DeterministicReplayProfile.NativeResumeServerRestarted => "SERVER_RESTARTED",
             _ when !_resumeStateAvailable => "UNKNOWN_TOKEN",
@@ -413,6 +415,7 @@ public sealed class DeterministicServerHistoryFixture : IAsyncDisposable
         or DeterministicReplayProfile.NativeResumeExpired
         or DeterministicReplayProfile.NativeResumeAccountMismatch
         or DeterministicReplayProfile.NativeResumeBoundaryTooOld
+        or DeterministicReplayProfile.NativeResumeReplayTooLarge
         or DeterministicReplayProfile.NativeResumeInvalidated
         or DeterministicReplayProfile.NativeResumeServerRestarted
         or DeterministicReplayProfile.NativeResumeOutOfOrder

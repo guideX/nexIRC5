@@ -2101,7 +2101,10 @@ public sealed class NetworkWorkspace : ObservableObject
         return view;
     }
 
-    internal QueryView EnsureIncomingQuery(string nickname, string? account = null)
+    internal QueryView EnsureIncomingQuery(
+        string nickname,
+        string? account = null,
+        IdentityEvidenceSource? accountEvidenceSource = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
         var mapping = _snapshot.Features.CaseMapping;
@@ -2112,6 +2115,7 @@ public sealed class NetworkWorkspace : ObservableObject
             .Where(item => item.HasObservedNickname(nickname, mapping))
             .ToArray();
         var normalizedAccount = ConversationIdentityEvidence.NormalizeAccount(account);
+        var liveAccountSource = accountEvidenceSource ?? IdentityEvidenceSource.LiveAccountTag;
         if (normalizedAccount is not null)
         {
             var accountMatches = Queries.Where(item => item.HasAccountEvidence(normalizedAccount)).ToArray();
@@ -2133,7 +2137,7 @@ public sealed class NetworkWorkspace : ObservableObject
                     null,
                     _snapshot.ConnectionGeneration,
                     DateTimeOffset.UtcNow,
-                    IdentityEvidenceSource.LiveAccountTag));
+                    liveAccountSource));
                 ReopenView(accountMatch);
                 return accountMatch;
             }
@@ -2162,7 +2166,7 @@ public sealed class NetworkWorkspace : ObservableObject
                 null,
                 _snapshot.ConnectionGeneration,
                 DateTimeOffset.UtcNow,
-                normalizedAccount is null ? IdentityEvidenceSource.LivePrefix : IdentityEvidenceSource.LiveAccountTag));
+                normalizedAccount is null ? IdentityEvidenceSource.LivePrefix : liveAccountSource));
             ReopenView(existing);
             return existing;
         }

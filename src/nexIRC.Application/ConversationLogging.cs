@@ -2168,20 +2168,6 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
                 return null;
             }
 
-            lock (_searchIndexGate)
-            {
-                if (_searchIndexes.TryGetValue(path, out var cached)
-                    && cached.SourceLength == sourceInfo.Length
-                    && cached.SourceLastWriteTicks == sourceInfo.LastWriteTimeUtc.Ticks
-                    && JsonlSearchIndex.IsSidecarCurrent(JsonlSearchIndex.GetSidecarPath(path), cached))
-                {
-                    // The sidecar and every source block were validated when
-                    // this snapshot entered the cache. Metadata checks keep
-                    // the warm search path free of a full source rehash.
-                    return new SearchIndexLoadResult(cached, 0);
-                }
-            }
-
             if (!JsonlSearchIndex.TryLoad(path, out var loaded) || loaded is null)
             {
                 return null;
@@ -2212,17 +2198,6 @@ public sealed class JsonlConversationLogStore : IConversationLogStore
             if (!sourceInfo.Exists || sourceInfo.Length != sourceLength)
             {
                 return null;
-            }
-
-            lock (_searchIndexGate)
-            {
-                if (_searchIndexes.TryGetValue(path, out var cached)
-                    && cached.SourceLength == sourceLength
-                    && cached.SourceLastWriteTicks == sourceInfo.LastWriteTimeUtc.Ticks
-                    && JsonlSearchIndex.IsSidecarCurrent(JsonlSearchIndex.GetSidecarPath(path), cached))
-                {
-                    return cached;
-                }
             }
 
             if (!JsonlSearchIndex.TryLoad(path, out var loaded) || loaded is null)

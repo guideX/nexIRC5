@@ -108,6 +108,7 @@ public sealed class Phase34NativeResumeTests
     [InlineData(DeterministicReplayProfile.NativeResumeExpired, NexIrcResumeRejectionReason.ExpiredToken)]
     [InlineData(DeterministicReplayProfile.NativeResumeAccountMismatch, NexIrcResumeRejectionReason.AccountMismatch)]
     [InlineData(DeterministicReplayProfile.NativeResumeBoundaryTooOld, NexIrcResumeRejectionReason.BoundaryTooOld)]
+    [InlineData(DeterministicReplayProfile.NativeResumeReplayTooLarge, NexIrcResumeRejectionReason.ReplayTooLarge)]
     [InlineData(DeterministicReplayProfile.NativeResumeInvalidated, NexIrcResumeRejectionReason.SessionInvalidated)]
     [InlineData(DeterministicReplayProfile.NativeResumeServerRestarted, NexIrcResumeRejectionReason.ServerRestarted)]
     public async Task ResumeRejectionIsTypedAndFallbackSafeBeforeReplay(

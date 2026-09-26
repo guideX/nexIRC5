@@ -2432,6 +2432,7 @@ public sealed class ServerSession : IAsyncDisposable
             "TOO_OLD" or "BOUNDARY_TOO_OLD" => NexIrcResumeRejectionReason.BoundaryTooOld,
             "INVALIDATED" or "SESSION_INVALIDATED" => NexIrcResumeRejectionReason.SessionInvalidated,
             "RESTARTED" or "SERVER_RESTARTED" => NexIrcResumeRejectionReason.ServerRestarted,
+            "TOO_LARGE" or "REPLAY_TOO_LARGE" => NexIrcResumeRejectionReason.ReplayTooLarge,
             "NEW" or "NEW_SESSION" => NexIrcResumeRejectionReason.NewSessionRequired,
             _ => NexIrcResumeRejectionReason.Malformed
         };

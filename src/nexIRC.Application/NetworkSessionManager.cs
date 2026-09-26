@@ -4850,7 +4850,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                     && join.Account is { Length: > 0 }
                     && workspace.FindQuery(join.Nickname) is not null)
                 {
-                    var extendedJoinQuery = workspace.EnsureIncomingQuery(join.Nickname, join.Account);
+                    var extendedJoinQuery = workspace.EnsureIncomingQuery(
+                        join.Nickname,
+                        join.Account,
+                        IdentityEvidenceSource.LiveExtendedJoin);
                     ObserveQueryIdentity(
                         extendedJoinQuery,
                         join.Nickname,

@@ -132,6 +132,7 @@ public enum NexIrcResumeRejectionReason
     BoundaryTooOld,
     SessionInvalidated,
     ServerRestarted,
+    ReplayTooLarge,
     Unsupported,
     NewSessionRequired,
     Malformed
