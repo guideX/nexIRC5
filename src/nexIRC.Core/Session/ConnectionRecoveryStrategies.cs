@@ -10,6 +10,7 @@ namespace nexIRC.Core.Session;
 public enum ConnectionRecoveryStrategyId
 {
     None,
+    NexIrcResume,
     Ircv3ChatHistory,
     BestEffortNoHistory
 }
@@ -76,5 +77,27 @@ public static class ConnectionRecoveryStrategyPolicy
             : new(
                 ConnectionRecoveryStrategyId.BestEffortNoHistory,
                 "The current generation did not negotiate usable history; live readiness will use bounded best-effort degradation.");
+    }
+
+    public static ConnectionRecoveryStrategySelection Select(
+        bool recoveryRequired,
+        NexIrcResumeSupport nativeResumeSupport,
+        ChathistorySupport historySupport)
+    {
+        ArgumentNullException.ThrowIfNull(nativeResumeSupport);
+        ArgumentNullException.ThrowIfNull(historySupport);
+        if (!recoveryRequired)
+        {
+            return ConnectionRecoveryStrategySelection.InitialConnection;
+        }
+
+        if (nativeResumeSupport.IsUsable)
+        {
+            return new(
+                ConnectionRecoveryStrategyId.NexIrcResume,
+                "The current generation negotiated nexIRC native resume and retained a usable logical session.");
+        }
+
+        return Select(recoveryRequired, historySupport);
     }
 }

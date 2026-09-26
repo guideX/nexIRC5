@@ -122,6 +122,13 @@ public static class IrcCapabilityCatalog
     public const string AccountTag = "account-tag";
     public const string LabeledResponse = "labeled-response";
     public const string Sasl = "sasl";
+    /// <summary>
+    /// Experimental nexIRC-native inbound continuity replay. The version is
+    /// carried as the advertised capability value, not in the capability
+    /// name, so a future version can be negotiated without changing the IRC
+    /// command namespace.
+    /// </summary>
+    public const string NexIrcResume = "nexirc/resume";
 
     public static IReadOnlyList<string> PreferredPhase1V { get; } =
     [MessageTags, EchoMessage, ServerTime, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
@@ -135,10 +142,10 @@ public static class IrcCapabilityCatalog
     [MessageTags, EchoMessage, ServerTime, Batch, Chathistory, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
 
     public static IReadOnlyList<string> PreferredPhase1Y { get; } =
-    [MessageTags, EchoMessage, ServerTime, Batch, Chathistory, EventPlayback, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
+    [MessageTags, EchoMessage, ServerTime, Batch, Chathistory, EventPlayback, NexIrcResume, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
 
     public static IReadOnlySet<string> Known { get; } =
-        new HashSet<string>(PreferredPhase1Y.Concat([AccountTag, Sasl]), StringComparer.Ordinal);
+        new HashSet<string>(PreferredPhase1Y.Concat([AccountTag, Sasl, NexIrcResume]), StringComparer.Ordinal);
 }
 
 public enum CapNegotiationState

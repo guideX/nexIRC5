@@ -1,4 +1,5 @@
 using nexIRC.Core.Networking;
+using nexIRC.Core.Protocol;
 
 namespace nexIRC.Core.Session;
 
@@ -94,6 +95,14 @@ public sealed record ConnectionContinuityRecoveryResult(
     public bool UnresolvedGap { get; init; }
 
     public int CommandsIssued { get; init; }
+
+    public NexIrcResumeOutcome? NativeResumeOutcome { get; init; }
+
+    public NexIrcResumeRejectionReason? NativeResumeRejectionReason { get; init; }
+
+    public bool FallbackRecommended { get; init; }
+
+    public string? FallbackReason { get; init; }
 
     public bool IsFinal => Kind is not ContinuityRecoveryResultKind.InProgress;
 

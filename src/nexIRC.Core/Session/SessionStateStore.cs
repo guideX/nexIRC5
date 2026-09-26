@@ -176,7 +176,7 @@ internal sealed class SessionStateStore
         if (command != "BATCH"
             && message.BatchId is { } batchId
             && _batches.TryGetValue(batchId, out var activeBatch)
-            && string.Equals(activeBatch.Type, "chathistory", StringComparison.OrdinalIgnoreCase))
+            && IsHistoricalReplayBatchType(activeBatch.Type))
         {
             if (historicalPlayback)
             {
@@ -1347,6 +1347,10 @@ internal sealed class SessionStateStore
         parameters = Array.Empty<string>();
         return false;
     }
+
+    private static bool IsHistoricalReplayBatchType(string type) =>
+        string.Equals(type, "chathistory", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(type, NexIrcResumeProtocol.BatchType, StringComparison.OrdinalIgnoreCase);
 
     private sealed class MutableBatch(string type, IReadOnlyList<string> parameters)
     {

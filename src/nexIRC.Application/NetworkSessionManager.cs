@@ -3732,7 +3732,9 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             session,
             boundary,
             cancellation => new ValueTask<ConnectionRecoveryExecutionResult>(
-                RecoverReconnectHistoryAsync(entry, session, generation, cancellation)));
+                RecoverReconnectHistoryAsync(entry, session, generation, cancellation)),
+            cancellation => new ValueTask<ConnectionRecoveryExecutionResult>(
+                RecoverNativeResumeAsync(session, generation, cancellation)));
         var selected = _recoveryStrategySelector.Select(context, recoveryRequired: true);
         session.RecordContinuityStrategySelected(
             selected.Selection.Strategy,
@@ -3773,6 +3775,32 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             return;
         }
 
+        if (result.FallbackRecommended
+            && selected.Selection.Strategy == ConnectionRecoveryStrategyId.NexIrcResume)
+        {
+            var fallback = _recoveryStrategySelector.SelectFallback(context, recoveryRequired: true);
+            session.RecordContinuityStrategySelected(
+                fallback.Selection.Strategy,
+                fallback.Selection.Reason,
+                $"native-resume-fallback={result.FallbackReason ?? "rejected"}; generation={generation}",
+                generation);
+            try
+            {
+                result = await fallback.Strategy.RecoverAsync(context, fallback.Selection.Reason, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                return;
+            }
+            catch
+            {
+                result = CreateStrategyFailureResult(
+                    fallback,
+                    generation,
+                    "Native resume was rejected and the bounded fallback strategy failed.");
+            }
+        }
+
         session.CompleteSynchronization(generation, result, result.Detail);
     }
 
@@ -3784,7 +3812,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 generation,
                 recoveryRequired: true,
                 ContinuitySynchronizationOutcome.Failed,
-                historyAvailable: selected.Selection.Strategy == ConnectionRecoveryStrategyId.Ircv3ChatHistory,
+                historyAvailable: selected.Selection.Strategy is ConnectionRecoveryStrategyId.Ircv3ChatHistory or ConnectionRecoveryStrategyId.NexIrcResume,
                 recoveryImpossible: true,
                 detail: detail) with
         {
@@ -4246,6 +4274,42 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         && (summary.Reason is null
             || summary.Reason.StartsWith("Local history already filled", StringComparison.Ordinal)
             || summary.Reason.StartsWith("The exact BETWEEN interval is empty", StringComparison.Ordinal));
+
+    private static async Task<ConnectionRecoveryExecutionResult> RecoverNativeResumeAsync(
+        ServerSession session,
+        int generation,
+        CancellationToken cancellationToken)
+    {
+        var native = await session.RequestNativeResumeAsync(generation, cancellationToken).ConfigureAwait(false);
+        var outcome = native.Outcome switch
+        {
+            NexIrcResumeOutcome.Completed => ContinuitySynchronizationOutcome.Recovered,
+            NexIrcResumeOutcome.Rejected => ContinuitySynchronizationOutcome.Unsupported,
+            NexIrcResumeOutcome.Unsupported => ContinuitySynchronizationOutcome.Unsupported,
+            NexIrcResumeOutcome.Accepted => ContinuitySynchronizationOutcome.Partial,
+            NexIrcResumeOutcome.Cancelled => ContinuitySynchronizationOutcome.Failed,
+            _ => ContinuitySynchronizationOutcome.Failed
+        };
+        var fallbackRecommended = native.Outcome == NexIrcResumeOutcome.Rejected && native.FallbackSafe;
+        return new ConnectionRecoveryExecutionResult(
+            outcome,
+            HistoryAvailable: native.CapabilityNegotiated,
+            RecoveryRequestSent: native.RequestSent,
+            ReplayCompleted: native.ReplayCompleted,
+            ExactGapRecovered: native.ExactBoundaryRecovered,
+            RecoveryImpossible: outcome is ContinuitySynchronizationOutcome.Unsupported or ContinuitySynchronizationOutcome.Failed,
+            Detail: native.Detail,
+            RecoveredEventCount: native.ReplayedEventCount,
+            UnresolvedGap: !native.ExactBoundaryRecovered,
+            CommandsIssued: native.RequestSent ? 1 : 0)
+        {
+            NativeResume = native,
+            FallbackRecommended = fallbackRecommended,
+            FallbackReason = fallbackRecommended
+                ? native.Detail ?? "The server rejected native resume before replay began."
+                : null
+        };
+    }
 
     private async Task<ConnectionRecoveryExecutionResult> RecoverReconnectHistoryAsync(
         SessionEntry entry,

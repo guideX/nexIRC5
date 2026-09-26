@@ -27,7 +27,20 @@ public sealed record IrcTranscriptEntry(
         DateTimeOffset timestamp,
         ReadOnlyMemory<byte> bytes,
         int connectionGeneration) =>
-        new(timestamp, IrcTranscriptDirection.Inbound, DecodeLine(bytes.Span), Convert.ToBase64String(bytes.Span), connectionGeneration);
+        CreateInbound(timestamp, bytes, connectionGeneration);
+
+    private static IrcTranscriptEntry CreateInbound(
+        DateTimeOffset timestamp,
+        ReadOnlyMemory<byte> bytes,
+        int connectionGeneration)
+    {
+        var decodedLine = DecodeLine(bytes.Span);
+        var redactedLine = IrcSensitiveData.RedactLine(decodedLine);
+        var storedBytes = string.Equals(decodedLine, redactedLine, StringComparison.Ordinal)
+            ? bytes.ToArray()
+            : System.Text.Encoding.UTF8.GetBytes(redactedLine + "\r\n");
+        return new(timestamp, IrcTranscriptDirection.Inbound, redactedLine, Convert.ToBase64String(storedBytes), connectionGeneration);
+    }
 
     public static IrcTranscriptEntry FromOutbound(
         DateTimeOffset timestamp,
@@ -58,7 +71,8 @@ public static class IrcSensitiveData
         var separator = withoutLineEnd.IndexOfAny([' ', '\t']);
         var command = separator < 0 ? withoutLineEnd : withoutLineEnd[..separator];
         return command.Equals("PASS", StringComparison.OrdinalIgnoreCase)
-            || command.Equals("AUTHENTICATE", StringComparison.OrdinalIgnoreCase);
+            || command.Equals("AUTHENTICATE", StringComparison.OrdinalIgnoreCase)
+            || command.Equals("NEXIRC", StringComparison.OrdinalIgnoreCase);
     }
 
     public static string RedactLine(string line)
@@ -71,6 +85,12 @@ public static class IrcSensitiveData
         if (command.Equals("PASS", StringComparison.OrdinalIgnoreCase))
         {
             return "PASS :<redacted>";
+        }
+
+        if (command.Equals("NEXIRC", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains(" NEXIRC ", StringComparison.OrdinalIgnoreCase))
+        {
+            return RedactNexIrcResumeLine(withoutLineEnd);
         }
 
         if (!command.Equals("AUTHENTICATE", StringComparison.OrdinalIgnoreCase))
@@ -90,6 +110,33 @@ public static class IrcSensitiveData
         }
 
         return "AUTHENTICATE <redacted>";
+    }
+
+    private static string RedactNexIrcResumeLine(string line)
+    {
+        var commandIndex = line.IndexOf(" NEXIRC ", StringComparison.OrdinalIgnoreCase);
+        var commandText = commandIndex >= 0 ? line[(commandIndex + 1)..] : line;
+        var tokens = commandText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (tokens.Length >= 4
+            && tokens[1].Equals("RESUME", StringComparison.OrdinalIgnoreCase)
+            && !tokens[2].Equals("ACCEPT", StringComparison.OrdinalIgnoreCase)
+            && !tokens[2].Equals("COMPLETE", StringComparison.OrdinalIgnoreCase)
+            && !tokens[2].Equals("REJECT", StringComparison.OrdinalIgnoreCase))
+        {
+            return commandIndex >= 0
+                ? line[..(commandIndex + 1)] + $"NEXIRC RESUME <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[2])}> {tokens[3]}"
+                : $"NEXIRC RESUME <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[2])}> {tokens[3]}";
+        }
+
+        if (tokens.Length >= 4
+            && tokens[1].Equals("SESSION", StringComparison.OrdinalIgnoreCase))
+        {
+            return commandIndex >= 0
+                ? line[..(commandIndex + 1)] + $"NEXIRC SESSION <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[2])}> {tokens[3]}"
+                : $"NEXIRC SESSION <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[2])}> {tokens[3]}";
+        }
+
+        return line;
     }
 
     public static byte[] RedactFramedBytes(ReadOnlySpan<byte> bytes)

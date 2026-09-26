@@ -153,5 +153,19 @@ public sealed class Phase1BProtocolTests
         Assert.Equal("AUTHENTICATE <redacted>", IrcSensitiveData.RedactLine(" AUTHENTICATE\tprivate-secret"));
     }
 
+    [Fact]
+    public void SensitiveInboundTranscriptRecordsRedactNativeResumeSessionTokens()
+    {
+        var token = "fixture-resume-token";
+        var entry = IrcTranscriptEntry.FromInbound(
+            DateTimeOffset.UnixEpoch,
+            Encoding.UTF8.GetBytes($":server NEXIRC SESSION {token} resume-0\r\n"),
+            1);
+
+        Assert.DoesNotContain(token, entry.RawLine, StringComparison.Ordinal);
+        Assert.Equal($":server NEXIRC SESSION <redacted:{NexIrcResumeProtocol.FingerprintToken(token)}> resume-0", entry.RawLine);
+        Assert.DoesNotContain(token, Encoding.UTF8.GetString(entry.RawBytes.Span), StringComparison.Ordinal);
+    }
+
     private static IrcMessage Parse(string line) => IrcMessageParser.Parse(line).Message!;
 }

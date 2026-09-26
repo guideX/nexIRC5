@@ -69,6 +69,12 @@ public sealed class ServerSession : IAsyncDisposable
     private PendingChathistoryRequest? _activeHistoryRequest;
     private readonly HashSet<string> _acceptedHistoryBatches = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ChathistoryConversationState> _historyStates = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _acceptedNativeResumeBatches = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _nativeLiveSequenceMessageIds = new(StringComparer.Ordinal);
+    private NexIrcResumeSession? _nativeResumeSession;
+    private NativeResumeAttempt? _nativeResumeAttempt;
+    private string? _nativeLivePendingSequence;
+    private string? _nativeLivePendingMessageId;
 
     public ServerSession(ServerSessionOptions options, IIrcTransportFactory transportFactory)
     {
@@ -200,6 +206,121 @@ public sealed class ServerSession : IAsyncDisposable
     public int MaximumChathistoryRequestSize => Math.Clamp(_options.MaximumChathistoryRequestSize, 1, 10000);
 
     public ChathistorySupport ChathistorySupport => Snapshot.Features.Chathistory;
+
+    public NexIrcResumeSupport NativeResumeSupport
+    {
+        get
+        {
+            lock (_gate)
+            {
+                var capabilities = _capabilities.Snapshot;
+                var version = capabilities.Available.TryGetValue(NexIrcResumeProtocol.CapabilityName, out var capability)
+                    ? capability.Value
+                    : null;
+                return new(
+                    capabilities.IsEnabled(NexIrcResumeProtocol.CapabilityName),
+                    _nativeResumeSession is not null,
+                    version);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Session-memory identity for the logical resumable session. The token is
+    /// opaque and is never included in continuity diagnostics; callers should
+    /// use <see cref="NexIrcResumeSession.TokenFingerprint"/> for display.
+    /// </summary>
+    public NexIrcResumeSession? NativeResumeSession
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _nativeResumeSession;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Starts the bounded native resume handshake for one registered
+    /// generation. Protocol parsing completes the task; this method never
+    /// transitions continuity lifecycle state.
+    /// </summary>
+    public async ValueTask<NexIrcResumeExecutionResult> RequestNativeResumeAsync(
+        int connectionGeneration,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ConnectionEpoch epoch;
+        NativeResumeAttempt attempt;
+        NexIrcResumeSession sessionIdentity;
+        lock (_gate)
+        {
+            if (_registration != RegistrationState.Registered
+                || _activeEpoch is not { IsActive: true } currentEpoch
+                || currentEpoch.Generation != connectionGeneration)
+            {
+                throw new InvalidOperationException("The native resume request belongs to a non-current IRC generation.");
+            }
+
+            if (!NexIrcResumeProtocol.IsSupported(_capabilities.Snapshot)
+                || _nativeResumeSession is null)
+            {
+                return NexIrcResumeExecutionResult.Unsupported(
+                    "The current generation did not negotiate nexIRC native resume or has no retained logical session.");
+            }
+
+            if (_nativeResumeAttempt is not null)
+            {
+                throw new InvalidOperationException("A native resume request is already active for this connection generation.");
+            }
+
+            epoch = currentEpoch;
+            sessionIdentity = _nativeResumeSession;
+            attempt = new NativeResumeAttempt(connectionGeneration, sessionIdentity.AuthoritativeBoundary);
+            _nativeResumeAttempt = attempt;
+        }
+
+        _continuity.RecordDiagnostic(
+            connectionGeneration,
+            ContinuityDiagnosticKind.RecoveryRequestStarted,
+            $"NexIrcResume requested boundary={sessionIdentity.AuthoritativeBoundary}; session={sessionIdentity.TokenFingerprint}");
+
+        try
+        {
+            var command = new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build(
+                NexIrcResumeProtocol.Command,
+                [NexIrcResumeProtocol.ResumeSubcommand, sessionIdentity.Token, sessionIdentity.AuthoritativeBoundary]);
+            await QueueOutboundAsync(command, cancellationToken, epoch).ConfigureAwait(false);
+            attempt.RequestSent = true;
+            var result = await attempt.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            _continuity.RecordDiagnostic(
+                connectionGeneration,
+                result.Outcome == NexIrcResumeOutcome.Completed
+                    ? ContinuityDiagnosticKind.RecoveryRequestCompleted
+                    : ContinuityDiagnosticKind.RecoveryRequestFailed,
+                $"NexIrcResume {result.Outcome}; requested={result.RequestedBoundary}; final={result.FinalBoundary}; events={result.ReplayedEventCount}; duplicates={result.DuplicateEventsSuppressed}");
+            return result;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            CancelNativeResumeAttempt(connectionGeneration, "Native resume was cancelled by the owning generation.");
+            _continuity.RecordDiagnostic(
+                connectionGeneration,
+                ContinuityDiagnosticKind.RecoveryRequestCancelled,
+                "NexIrcResume cancellation was fenced to the current generation.");
+            throw;
+        }
+        catch
+        {
+            FailNativeResumeAttempt(
+                connectionGeneration,
+                NexIrcResumeOutcome.Failed,
+                "The native resume request could not be written.",
+                fallbackSafe: false);
+            throw;
+        }
+    }
 
     public ChathistoryConversationState GetChathistoryState(string conversation)
     {
@@ -1313,20 +1434,33 @@ public sealed class ServerSession : IAsyncDisposable
             connectionCts.Cancel();
         }
 
+        if (message.Command == NexIrcResumeProtocol.Command)
+        {
+            await HandleNativeResumeMessageAsync(message, epoch, connectionCts).ConfigureAwait(false);
+            return;
+        }
+
         IReadOnlyList<IrcSemanticEvent> stateEvents;
         var historicalPlayback = false;
+        var nativeResumePlayback = false;
+        var nativeResumeDuplicate = false;
+        var nativeLiveEvent = false;
+        var nativeLiveDuplicate = false;
         var suppressBatchedState = false;
         var historyLimitExceeded = false;
         lock (_gate)
         {
             if (message.BatchId is { } batchId
                 && _stateStore.TryGetActiveBatch(batchId, out var batchType, out _)
-                && IsAcceptedHistoryBatchType(batchType))
+                && IsAcceptedReplayBatchType(batchType))
             {
                 historicalPlayback = _acceptedHistoryBatches.Contains(batchId)
                     && _activeHistoryRequest is { ConnectionGeneration: var generation }
                     && generation == epoch.Generation;
-                suppressBatchedState = !historicalPlayback;
+                nativeResumePlayback = _acceptedNativeResumeBatches.Contains(batchId)
+                    && _nativeResumeAttempt is { ConnectionGeneration: var resumeGeneration }
+                    && resumeGeneration == epoch.Generation;
+                suppressBatchedState = !historicalPlayback && !nativeResumePlayback;
                 if (historicalPlayback
                     && message.Command is "PRIVMSG" or "NOTICE"
                     && !ChathistoryContext.IsContextRow(message)
@@ -1336,9 +1470,52 @@ public sealed class ServerSession : IAsyncDisposable
                     historicalPlayback = false;
                     suppressBatchedState = true;
                 }
+
+                if (nativeResumePlayback && !ValidateNativeReplayEnvelopeUnsafe(message, epoch.Generation, out nativeResumeDuplicate))
+                {
+                    return;
+                }
+
             }
 
-            stateEvents = _stateStore.Apply(message, _features, historicalPlayback, suppressBatchedState);
+            if (message.BatchId is null
+                && _nativeResumeSession is not null
+                && message.TagValues.ContainsKey(NexIrcResumeProtocol.ResumeSequenceTag))
+            {
+                nativeLiveEvent = true;
+                if (!ValidateNativeLiveEnvelopeUnsafe(message, epoch.Generation, out nativeLiveDuplicate))
+                {
+                    return;
+                }
+            }
+
+            stateEvents = _stateStore.Apply(message, _features, historicalPlayback || nativeResumePlayback, suppressBatchedState);
+        }
+
+        if (nativeResumeDuplicate)
+        {
+            return;
+        }
+
+        if (nativeLiveDuplicate)
+        {
+            return;
+        }
+
+        if (nativeResumePlayback && message.Command != "BATCH" && stateEvents.Count == 0)
+        {
+            FailNativeResumeAttempt(
+                epoch.Generation,
+                NexIrcResumeOutcome.Failed,
+                $"A native replay event did not enter the canonical semantic pipeline (command={message.Command}; batch={message.BatchId}).",
+                fallbackSafe: false,
+                reason: NexIrcResumeRejectionReason.Malformed);
+            return;
+        }
+
+        if (nativeLiveEvent && stateEvents.Count > 0)
+        {
+            CommitNativeLiveEvent(message, epoch.Generation);
         }
 
         if (historyLimitExceeded)
@@ -1349,6 +1526,11 @@ public sealed class ServerSession : IAsyncDisposable
         foreach (var semanticEvent in stateEvents)
         {
             var deliveryEvent = semanticEvent;
+
+            if (nativeResumePlayback && semanticEvent.IsHistorical)
+            {
+                CommitNativeReplayEvent(message, epoch.Generation);
+            }
 
             if (semanticEvent.IsHistorical)
             {
@@ -1378,6 +1560,16 @@ public sealed class ServerSession : IAsyncDisposable
                         }
                     }
                 }
+
+                if (nativeResumePlayback)
+                {
+                    deliveryEvent = semanticEvent with
+                    {
+                        Source = IrcSemanticEventSource.ServerPlayback,
+                        NetworkId = _options.NetworkId,
+                        HistoricalConversation = NativeResumeConversation(message)
+                    };
+                }
             }
 
             await PublishSemanticAsync(deliveryEvent, epoch, receivedAt).ConfigureAwait(false);
@@ -1394,6 +1586,7 @@ public sealed class ServerSession : IAsyncDisposable
         if (message.Command == "BATCH")
         {
             ObserveHistoryBatch(message, epoch);
+            ObserveNativeResumeBatch(message, epoch);
         }
 
         if (message.Command is "FAIL" or "WARN" or "NOTE"
@@ -1904,6 +2097,18 @@ public sealed class ServerSession : IAsyncDisposable
             }
             _saslResponseSent = false;
             DisposeActiveCredentialUnsafe();
+
+            if (_nativeResumeAttempt is { ConnectionGeneration: var nativeGeneration } nativeAttempt
+                && nativeGeneration == epoch.Generation)
+            {
+                FailNativeResumeAttemptUnsafe(
+                    nativeAttempt,
+                    NexIrcResumeOutcome.Failed,
+                    "The IRC transport ended before native replay completed.",
+                    fallbackSafe: false);
+            }
+
+            _acceptedNativeResumeBatches.Clear();
         }
 
         CompleteHistoryRequest(
@@ -2082,6 +2287,572 @@ public sealed class ServerSession : IAsyncDisposable
             }
         }
     }
+
+    private Task HandleNativeResumeMessageAsync(
+        IrcMessage message,
+        ConnectionEpoch epoch,
+        CancellationTokenSource connectionCts)
+    {
+        if (!IsCurrentEpoch(epoch))
+        {
+            return Task.CompletedTask;
+        }
+
+        var subcommand = message.Parameters.Count == 0
+            ? string.Empty
+            : message.Parameters[0].ToUpperInvariant();
+        if (subcommand == NexIrcResumeProtocol.SessionSubcommand)
+        {
+            HandleNativeSessionAnnouncement(message, epoch.Generation);
+            return Task.CompletedTask;
+        }
+
+        if (subcommand != NexIrcResumeProtocol.ResumeSubcommand || message.Parameters.Count < 2)
+        {
+            FailNativeResumeAttempt(
+                epoch.Generation,
+                NexIrcResumeOutcome.Failed,
+                "The server sent a malformed nexIRC resume response.",
+                fallbackSafe: false,
+                 reason: NexIrcResumeRejectionReason.Malformed);
+            return Task.CompletedTask;
+        }
+
+        var response = message.Parameters[1].ToUpperInvariant();
+        switch (response)
+        {
+            case "ACCEPT" when message.Parameters.Count >= 3:
+                HandleNativeResumeAccepted(message.Parameters[2], epoch.Generation);
+                break;
+            case "REJECT":
+                HandleNativeResumeRejected(
+                    message.Parameters.Count >= 3 ? message.Parameters[2] : string.Empty,
+                    epoch.Generation);
+                break;
+            case "UNSUPPORTED":
+            case "NEW":
+                CompleteNativeResumeRejected(
+                    NexIrcResumeRejectionReason.Unsupported,
+                    "The server requires a new session instead of resuming the prior logical session.",
+                    epoch.Generation);
+                break;
+            case "COMPLETE" when message.Parameters.Count >= 3:
+                HandleNativeResumeComplete(message.Parameters[2], epoch.Generation);
+                break;
+            default:
+                FailNativeResumeAttempt(
+                    epoch.Generation,
+                    NexIrcResumeOutcome.Failed,
+                    "The server sent a malformed nexIRC resume response.",
+                    fallbackSafe: false,
+                     reason: NexIrcResumeRejectionReason.Malformed);
+                break;
+        }
+
+        _ = connectionCts;
+        return Task.CompletedTask;
+    }
+
+    private void HandleNativeSessionAnnouncement(IrcMessage message, int generation)
+    {
+        if (!NexIrcResumeProtocol.IsSupported(_capabilities.Snapshot)
+            || !NexIrcResumeProtocol.TryReadOpaqueParameters(message, 1, out var token, out var boundary))
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_nativeResumeSession is null)
+            {
+                _nativeResumeSession = new NexIrcResumeSession(token, boundary, generation);
+                _continuity.RecordDiagnostic(
+                    generation,
+                    ContinuityDiagnosticKind.RegistrationCompleted,
+                    $"NexIrcResume session established session={_nativeResumeSession.TokenFingerprint}; boundary={boundary}");
+            }
+            else if (_nativeResumeAttempt is { ReplayAccepted: true })
+            {
+                // Token rotation is deliberately not enabled in the prototype.
+                // A production server may issue a replacement in a future
+                // protocol version after the completion barrier.
+                _continuity.RecordDiagnostic(
+                    generation,
+                    ContinuityDiagnosticKind.RecoveryRequestCompleted,
+                    "NexIrcResume token rotation was ignored because version 1 retains the original opaque token.");
+            }
+        }
+    }
+
+    private void HandleNativeResumeAccepted(string boundary, int generation)
+    {
+        if (!NexIrcResumeProtocol.IsSafeOpaqueValue(boundary))
+        {
+            FailNativeResumeAttempt(
+                generation,
+                NexIrcResumeOutcome.Failed,
+                "The native resume acceptance boundary is malformed.",
+                fallbackSafe: false,
+                 reason: NexIrcResumeRejectionReason.Malformed);
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_nativeResumeAttempt is not { ConnectionGeneration: var attemptGeneration } attempt
+                || attemptGeneration != generation)
+            {
+                _continuity.RecordStaleCallback(generation, "A stale native resume acceptance was ignored.");
+                return;
+            }
+
+            if (!string.Equals(boundary, attempt.RequestedBoundary, StringComparison.Ordinal))
+            {
+                FailNativeResumeAttemptUnsafe(
+                    attempt,
+                    NexIrcResumeOutcome.Failed,
+                    "The server accepted a different replay anchor than the client requested.",
+                    fallbackSafe: false,
+                     reason: NexIrcResumeRejectionReason.Malformed);
+                return;
+            }
+
+            attempt.ReplayAccepted = true;
+            attempt.AcceptedBoundary = boundary;
+        }
+    }
+
+    private void HandleNativeResumeRejected(string reason, int generation)
+    {
+        var rejection = reason.ToUpperInvariant() switch
+        {
+            "UNKNOWN" or "UNKNOWN_TOKEN" => NexIrcResumeRejectionReason.UnknownToken,
+            "EXPIRED" or "EXPIRED_TOKEN" => NexIrcResumeRejectionReason.ExpiredToken,
+            "ACCOUNT" or "ACCOUNT_MISMATCH" => NexIrcResumeRejectionReason.AccountMismatch,
+            "TOO_OLD" or "BOUNDARY_TOO_OLD" => NexIrcResumeRejectionReason.BoundaryTooOld,
+            "INVALIDATED" or "SESSION_INVALIDATED" => NexIrcResumeRejectionReason.SessionInvalidated,
+            "RESTARTED" or "SERVER_RESTARTED" => NexIrcResumeRejectionReason.ServerRestarted,
+            "NEW" or "NEW_SESSION" => NexIrcResumeRejectionReason.NewSessionRequired,
+            _ => NexIrcResumeRejectionReason.Malformed
+        };
+        var detail = string.IsNullOrWhiteSpace(reason)
+            ? "The server rejected the native resume request."
+            : $"The server rejected the native resume request: {reason}.";
+        CompleteNativeResumeRejected(rejection, detail, generation);
+    }
+
+    private void CompleteNativeResumeRejected(
+        NexIrcResumeRejectionReason reason,
+        string detail,
+        int generation)
+    {
+        lock (_gate)
+        {
+            if (_nativeResumeAttempt is not { ConnectionGeneration: var attemptGeneration } attempt
+                || attemptGeneration != generation)
+            {
+                _continuity.RecordStaleCallback(generation, "A stale native resume rejection was ignored.");
+                return;
+            }
+
+            FailNativeResumeAttemptUnsafe(
+                attempt,
+                NexIrcResumeOutcome.Rejected,
+                detail,
+                fallbackSafe: !attempt.ReplayAccepted,
+                reason);
+        }
+    }
+
+    private void HandleNativeResumeComplete(string boundary, int generation)
+    {
+        if (!NexIrcResumeProtocol.IsSafeOpaqueValue(boundary))
+        {
+            FailNativeResumeAttempt(
+                generation,
+                NexIrcResumeOutcome.Failed,
+                "The native resume completion boundary is malformed.",
+                fallbackSafe: false,
+                 reason: NexIrcResumeRejectionReason.Malformed);
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_nativeResumeAttempt is not { ConnectionGeneration: var attemptGeneration } attempt
+                || attemptGeneration != generation)
+            {
+                _continuity.RecordStaleCallback(generation, "A stale native replay completion was ignored.");
+                return;
+            }
+
+            if (!attempt.ReplayAccepted
+                || attempt.ActiveBatchIds.Count > 0
+                || !string.Equals(boundary, attempt.CurrentBoundary, StringComparison.Ordinal))
+            {
+                FailNativeResumeAttemptUnsafe(
+                    attempt,
+                    NexIrcResumeOutcome.Failed,
+                    "The native replay completion did not match the accepted authoritative boundary.",
+                    fallbackSafe: false,
+                     reason: NexIrcResumeRejectionReason.Malformed);
+                return;
+            }
+
+            _nativeResumeSession = _nativeResumeSession?.Advance(boundary);
+            var result = new NexIrcResumeExecutionResult(
+                NexIrcResumeOutcome.Completed,
+                CapabilityNegotiated: true,
+                RequestSent: attempt.RequestSent,
+                ReplayAccepted: true,
+                ReplayCompleted: true,
+                ExactBoundaryRecovered: true,
+                attempt.ReplayedEventCount,
+                attempt.DuplicateEventsSuppressed,
+                attempt.RequestedBoundary,
+                boundary,
+                "Authoritative native replay completed through the server boundary.",
+                null,
+                FallbackSafe: false);
+            _nativeResumeAttempt = null;
+            _acceptedNativeResumeBatches.Clear();
+            attempt.Completion.TrySetResult(result);
+        }
+    }
+
+    private bool ValidateNativeReplayEnvelopeUnsafe(
+        IrcMessage message,
+        int generation,
+        out bool duplicate)
+    {
+        duplicate = false;
+        if (_nativeResumeAttempt is not { ConnectionGeneration: var attemptGeneration } attempt
+            || attemptGeneration != generation)
+        {
+            return false;
+        }
+
+        var sequence = message.TagValues.TryGetValue(NexIrcResumeProtocol.ResumeSequenceTag, out var rawSequence)
+            ? rawSequence
+            : null;
+        var previous = message.TagValues.TryGetValue(NexIrcResumeProtocol.ResumePreviousSequenceTag, out var rawPrevious)
+            ? rawPrevious
+            : null;
+        if (!NexIrcResumeProtocol.IsSafeOpaqueValue(sequence)
+            || !NexIrcResumeProtocol.IsSafeOpaqueValue(previous))
+        {
+            FailNativeResumeAttemptUnsafe(
+                attempt,
+                NexIrcResumeOutcome.Failed,
+                "A native replay event did not carry safe authoritative sequence metadata.",
+                fallbackSafe: false,
+                     reason: NexIrcResumeRejectionReason.Malformed);
+            return false;
+        }
+
+        var messageId = message.ServerMessageId;
+        if (attempt.SequenceMessageIds.TryGetValue(sequence!, out var existingMessageId))
+        {
+            if (messageId is null || !string.Equals(existingMessageId, messageId, StringComparison.Ordinal))
+            {
+                FailNativeResumeAttemptUnsafe(
+                    attempt,
+                    NexIrcResumeOutcome.Failed,
+                    "A native replay sequence was reused for a different canonical event.",
+                    fallbackSafe: false,
+                     reason: NexIrcResumeRejectionReason.Malformed);
+                return false;
+            }
+
+            attempt.DuplicateEventsSuppressed++;
+            duplicate = true;
+            return true;
+        }
+
+        if (string.Equals(sequence, attempt.CurrentBoundary, StringComparison.Ordinal))
+        {
+            if (messageId is null)
+            {
+                FailNativeResumeAttemptUnsafe(
+                    attempt,
+                    NexIrcResumeOutcome.Failed,
+                    "A replayed boundary event did not carry a canonical msgid for deduplication.",
+                    fallbackSafe: false,
+                 reason: NexIrcResumeRejectionReason.Malformed);
+                return false;
+            }
+
+            if (_nativeLiveSequenceMessageIds.TryGetValue(sequence!, out var committedMessageId)
+                && !string.Equals(committedMessageId, messageId, StringComparison.Ordinal))
+            {
+                FailNativeResumeAttemptUnsafe(
+                    attempt,
+                    NexIrcResumeOutcome.Failed,
+                    "A replayed boundary sequence conflicted with the committed canonical msgid.",
+                    fallbackSafe: false,
+                    reason: NexIrcResumeRejectionReason.Malformed);
+                return false;
+            }
+
+            attempt.SequenceMessageIds[sequence!] = messageId;
+            attempt.DuplicateEventsSuppressed++;
+            duplicate = true;
+            return true;
+        }
+
+        if (!string.Equals(previous, attempt.CurrentBoundary, StringComparison.Ordinal))
+        {
+                FailNativeResumeAttemptUnsafe(
+                    attempt,
+                    NexIrcResumeOutcome.Failed,
+                    $"A native replay event was out of order or referenced an unknown boundary (previous={previous}; current={attempt.CurrentBoundary}; sequence={sequence}; committed={attempt.ReplayedEventCount}; known={string.Join(',', attempt.SequenceMessageIds.Keys)}).",
+                fallbackSafe: false,
+                reason: NexIrcResumeRejectionReason.Malformed);
+            return false;
+        }
+
+        attempt.PendingSequence = sequence;
+        attempt.PendingMessageId = messageId;
+        return true;
+    }
+
+    private bool ValidateNativeLiveEnvelopeUnsafe(
+        IrcMessage message,
+        int generation,
+        out bool duplicate)
+    {
+        duplicate = false;
+        var sequence = message.TagValues.TryGetValue(NexIrcResumeProtocol.ResumeSequenceTag, out var rawSequence)
+            ? rawSequence
+            : null;
+        var previous = message.TagValues.TryGetValue(NexIrcResumeProtocol.ResumePreviousSequenceTag, out var rawPrevious)
+            ? rawPrevious
+            : null;
+        if (!NexIrcResumeProtocol.IsSafeOpaqueValue(sequence)
+            || !NexIrcResumeProtocol.IsSafeOpaqueValue(previous)
+            || message.ServerMessageId is null)
+        {
+            _continuity.RecordDiagnostic(generation, ContinuityDiagnosticKind.RecoveryRequestFailed, "A live native event lacked safe authoritative sequence metadata.");
+            return false;
+        }
+
+        if (_nativeLiveSequenceMessageIds.TryGetValue(sequence!, out var existingMessageId))
+        {
+            if (!string.Equals(existingMessageId, message.ServerMessageId, StringComparison.Ordinal))
+            {
+                _continuity.RecordDiagnostic(generation, ContinuityDiagnosticKind.RecoveryRequestFailed, "A live native sequence was reused for a different canonical event.");
+                return false;
+            }
+
+            _continuity.RecordHistoricalDuplicateSuppressed(generation, $"live:{message.ServerMessageId}");
+            duplicate = true;
+            return true;
+        }
+
+        var currentBoundary = _nativeResumeSession!.AuthoritativeBoundary;
+        if (string.Equals(sequence, currentBoundary, StringComparison.Ordinal))
+        {
+            _nativeLiveSequenceMessageIds[sequence!] = message.ServerMessageId;
+            _continuity.RecordHistoricalDuplicateSuppressed(generation, $"live-boundary:{message.ServerMessageId}");
+            duplicate = true;
+            return true;
+        }
+
+        if (!string.Equals(previous, currentBoundary, StringComparison.Ordinal))
+        {
+            _continuity.RecordDiagnostic(generation, ContinuityDiagnosticKind.RecoveryRequestFailed, "A live native event referenced an unknown authoritative boundary.");
+            return false;
+        }
+
+        _nativeLivePendingSequence = sequence;
+        _nativeLivePendingMessageId = message.ServerMessageId;
+        return true;
+    }
+
+    private void CommitNativeLiveEvent(IrcMessage message, int generation)
+    {
+        lock (_gate)
+        {
+            if (_nativeResumeSession is null
+                || _nativeLivePendingSequence is not { } sequence
+                || !string.Equals(_nativeLivePendingMessageId, message.ServerMessageId, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _nativeLiveSequenceMessageIds[sequence] = message.ServerMessageId!;
+            _nativeResumeSession = _nativeResumeSession.Advance(sequence);
+            _nativeLivePendingSequence = null;
+            _nativeLivePendingMessageId = null;
+        }
+    }
+
+    private void CommitNativeReplayEvent(IrcMessage message, int generation)
+    {
+        lock (_gate)
+        {
+            if (_nativeResumeAttempt is not { ConnectionGeneration: var attemptGeneration } attempt
+                || attemptGeneration != generation
+                || attempt.PendingSequence is not { } sequence)
+            {
+                return;
+            }
+
+            if (string.Equals(attempt.CurrentBoundary, sequence, StringComparison.Ordinal))
+            {
+                attempt.PendingSequence = null;
+                attempt.PendingMessageId = null;
+                return;
+            }
+
+            if (!string.Equals(attempt.PendingMessageId, message.ServerMessageId, StringComparison.Ordinal))
+            {
+                FailNativeResumeAttemptUnsafe(
+                    attempt,
+                    NexIrcResumeOutcome.Failed,
+                    "A native replay event changed while crossing the canonical acceptance boundary.",
+                    fallbackSafe: false,
+                    reason: NexIrcResumeRejectionReason.Malformed);
+                return;
+            }
+
+            attempt.SequenceMessageIds[sequence] = message.ServerMessageId!;
+            _nativeLiveSequenceMessageIds[sequence] = message.ServerMessageId!;
+            attempt.CurrentBoundary = sequence;
+            attempt.ReplayedEventCount++;
+            attempt.PendingSequence = null;
+            attempt.PendingMessageId = null;
+            _nativeResumeSession = _nativeResumeSession?.Advance(sequence);
+        }
+    }
+
+    private void ObserveNativeResumeBatch(IrcMessage message, ConnectionEpoch epoch)
+    {
+        var token = message.Parameters.Count == 0 ? null : message.Parameters[0];
+        if (string.IsNullOrWhiteSpace(token) || token.Length < 2)
+        {
+            return;
+        }
+
+        var batchId = token[1..];
+        if (batchId.Length == 0)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_nativeResumeAttempt is not { ConnectionGeneration: var generation } attempt
+                || generation != epoch.Generation)
+            {
+                return;
+            }
+
+            if (token[0] == '+')
+            {
+                if (!_stateStore.TryGetActiveBatch(batchId, out var type, out _)
+                    || !string.Equals(type, NexIrcResumeProtocol.BatchType, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                if (!attempt.ReplayAccepted)
+                {
+                    return;
+                }
+
+                _acceptedNativeResumeBatches.Add(batchId);
+                attempt.ActiveBatchIds.Add(batchId);
+            }
+            else if (token[0] == '-')
+            {
+                if (_acceptedNativeResumeBatches.Remove(batchId))
+                {
+                    attempt.ActiveBatchIds.Remove(batchId);
+                }
+            }
+        }
+    }
+
+    private string NativeResumeConversation(IrcMessage message)
+    {
+        if (message.BatchId is { } batchId
+            && _stateStore.TryGetActiveBatch(batchId, out var type, out var parameters)
+            && string.Equals(type, NexIrcResumeProtocol.BatchType, StringComparison.OrdinalIgnoreCase)
+            && parameters.Count > 0)
+        {
+            return parameters[0];
+        }
+
+        return string.Empty;
+    }
+
+    private void CancelNativeResumeAttempt(int generation, string detail)
+    {
+        lock (_gate)
+        {
+            if (_nativeResumeAttempt is not { ConnectionGeneration: var attemptGeneration } attempt
+                || attemptGeneration != generation)
+            {
+                return;
+            }
+
+            FailNativeResumeAttemptUnsafe(
+                attempt,
+                NexIrcResumeOutcome.Cancelled,
+                detail,
+                fallbackSafe: false);
+        }
+    }
+
+    private void FailNativeResumeAttempt(
+        int generation,
+        NexIrcResumeOutcome outcome,
+        string detail,
+        bool fallbackSafe,
+        NexIrcResumeRejectionReason? reason = null)
+    {
+        lock (_gate)
+        {
+            if (_nativeResumeAttempt is not { ConnectionGeneration: var attemptGeneration } attempt
+                || attemptGeneration != generation)
+            {
+                return;
+            }
+
+            FailNativeResumeAttemptUnsafe(attempt, outcome, detail, fallbackSafe, reason);
+        }
+    }
+
+    private void FailNativeResumeAttemptUnsafe(
+        NativeResumeAttempt attempt,
+        NexIrcResumeOutcome outcome,
+        string detail,
+        bool fallbackSafe,
+        NexIrcResumeRejectionReason? reason = null)
+    {
+        var result = new NexIrcResumeExecutionResult(
+            outcome,
+            CapabilityNegotiated: true,
+            RequestSent: attempt.RequestSent,
+            ReplayAccepted: attempt.ReplayAccepted,
+            ReplayCompleted: false,
+            ExactBoundaryRecovered: false,
+            attempt.ReplayedEventCount,
+            attempt.DuplicateEventsSuppressed,
+            attempt.RequestedBoundary,
+            attempt.CurrentBoundary,
+            detail,
+            reason,
+            fallbackSafe);
+        _nativeResumeAttempt = null;
+        _acceptedNativeResumeBatches.Clear();
+        attempt.Completion.TrySetResult(result);
+    }
+
+    private bool IsAcceptedReplayBatchType(string type) =>
+        IsAcceptedHistoryBatchType(type)
+        || string.Equals(type, NexIrcResumeProtocol.BatchType, StringComparison.OrdinalIgnoreCase);
 
     private void ObserveHistoryError(IrcMessage message, ConnectionEpoch epoch)
     {
@@ -2517,6 +3288,36 @@ public sealed class ServerSession : IAsyncDisposable
         public string? BatchTarget { get; set; }
 
         public bool EndMarker { get; set; }
+    }
+
+    private sealed class NativeResumeAttempt(int connectionGeneration, string requestedBoundary)
+    {
+        public int ConnectionGeneration { get; } = connectionGeneration;
+
+        public string RequestedBoundary { get; } = requestedBoundary;
+
+        public string CurrentBoundary { get; set; } = requestedBoundary;
+
+        public string? AcceptedBoundary { get; set; }
+
+        public bool RequestSent { get; set; }
+
+        public bool ReplayAccepted { get; set; }
+
+        public string? PendingSequence { get; set; }
+
+        public string? PendingMessageId { get; set; }
+
+        public int ReplayedEventCount { get; set; }
+
+        public int DuplicateEventsSuppressed { get; set; }
+
+        public HashSet<string> ActiveBatchIds { get; } = new(StringComparer.Ordinal);
+
+        public Dictionary<string, string> SequenceMessageIds { get; } = new(StringComparer.Ordinal);
+
+        public TaskCompletionSource<NexIrcResumeExecutionResult> Completion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
     private static void ValidateOptions(ServerSessionOptions options)
