@@ -13,12 +13,14 @@ namespace nexIRC.Core.Protocol;
 public static class NexIrcResumeProtocol
 {
     public const string CapabilityName = IrcCapabilityCatalog.NexIrcResume;
+    public const string AttachmentsCapabilityName = IrcCapabilityCatalog.NexIrcAttachments;
     public const string CapabilityVersion = "1";
     public const string Command = "NEXIRC";
     public const string SessionSubcommand = "SESSION";
     public const string SessionRotateSubcommand = "ROTATE";
     public const string SessionAckSubcommand = "ACK";
     public const string ResumeSubcommand = "RESUME";
+    public const string AttachSubcommand = "ATTACH";
     public const string BatchType = "nexirc/resume";
     public const string ResumeSequenceTag = "resume-seq";
     public const string ResumePreviousSequenceTag = "resume-prev";
@@ -27,6 +29,12 @@ public static class NexIrcResumeProtocol
     public static bool IsSupported(CapabilitySnapshot capabilities) =>
         capabilities.IsEnabled(CapabilityName)
         && capabilities.Available.TryGetValue(CapabilityName, out var capability)
+        && string.Equals(capability.Value ?? CapabilityVersion, CapabilityVersion, StringComparison.Ordinal);
+
+    public static bool AreAttachmentsSupported(CapabilitySnapshot capabilities) =>
+        IsSupported(capabilities)
+        && capabilities.IsEnabled(AttachmentsCapabilityName)
+        && capabilities.Available.TryGetValue(AttachmentsCapabilityName, out var capability)
         && string.Equals(capability.Value ?? CapabilityVersion, CapabilityVersion, StringComparison.Ordinal);
 
     public static string FingerprintToken(string token)
@@ -85,7 +93,9 @@ public sealed class NexIrcResumeSession
         string authoritativeBoundary,
         int establishedGeneration,
         string? previousToken = null,
-        int? previousGeneration = null)
+        int? previousGeneration = null,
+        Guid? attachmentId = null,
+        string? sessionCredential = null)
     {
         if (!NexIrcResumeProtocol.IsSafeOpaqueValue(token))
         {
@@ -108,11 +118,23 @@ public sealed class NexIrcResumeSession
             throw new ArgumentException("A previous resume token and generation must be supplied together.", nameof(previousGeneration));
         }
 
+        if (attachmentId == Guid.Empty)
+        {
+            throw new ArgumentException("An attachment ID must be a non-empty GUID when supplied.", nameof(attachmentId));
+        }
+
+        if (sessionCredential is not null && !NexIrcResumeProtocol.IsSafeOpaqueValue(sessionCredential))
+        {
+            throw new ArgumentException("The session attachment credential is not a safe opaque IRC value.", nameof(sessionCredential));
+        }
+
         Token = token;
         AuthoritativeBoundary = authoritativeBoundary;
         EstablishedGeneration = establishedGeneration;
         PreviousToken = previousToken;
         PreviousGeneration = previousGeneration;
+        AttachmentId = attachmentId;
+        SessionCredential = sessionCredential;
     }
 
     /// <summary>Opaque protocol material; never include this property in diagnostics.</summary>
@@ -134,6 +156,11 @@ public sealed class NexIrcResumeSession
 
     public int? PreviousGeneration { get; }
 
+    public Guid? AttachmentId { get; }
+
+    /// <summary>Session-scoped grant used only to create another attachment; never log this value.</summary>
+    public string? SessionCredential { get; }
+
     public bool HasPendingRotation => PreviousToken is not null;
 
     public string DurableCurrentToken => PreviousToken ?? Token;
@@ -141,23 +168,31 @@ public sealed class NexIrcResumeSession
     public int DurableCurrentGeneration => PreviousGeneration ?? EstablishedGeneration;
 
     public NexIrcResumeSession Advance(string authoritativeBoundary) =>
-        new(Token, authoritativeBoundary, EstablishedGeneration, PreviousToken, PreviousGeneration);
+        new(Token, authoritativeBoundary, EstablishedGeneration, PreviousToken, PreviousGeneration, AttachmentId, SessionCredential);
 
     public NexIrcResumeSession Rotate(string token, string authoritativeBoundary, int generation) =>
-        new(token, authoritativeBoundary, generation, Token, EstablishedGeneration);
+        new(token, authoritativeBoundary, generation, Token, EstablishedGeneration, AttachmentId, SessionCredential);
 
     public NexIrcResumeSession MarkRotationAcknowledged() =>
-        new(Token, AuthoritativeBoundary, EstablishedGeneration);
+        new(Token, AuthoritativeBoundary, EstablishedGeneration, attachmentId: AttachmentId, sessionCredential: SessionCredential);
+
+    public NexIrcResumeSession WithAttachment(Guid attachmentId) =>
+        new(Token, AuthoritativeBoundary, EstablishedGeneration, PreviousToken, PreviousGeneration, attachmentId, SessionCredential);
+
+    public NexIrcResumeSession WithSessionCredential(string sessionCredential) =>
+        new(Token, AuthoritativeBoundary, EstablishedGeneration, PreviousToken, PreviousGeneration, AttachmentId, sessionCredential);
 
     public static NexIrcResumeSession FromDurableState(
         string currentToken,
         string? pendingToken,
         string authoritativeBoundary,
         int tokenGeneration,
-        int? pendingTokenGeneration) =>
+        int? pendingTokenGeneration,
+        Guid? attachmentId = null,
+        string? sessionCredential = null) =>
         pendingToken is { Length: > 0 } pending && pendingTokenGeneration is { } pendingGeneration
-            ? new(pending, authoritativeBoundary, pendingGeneration, currentToken, tokenGeneration)
-            : new(currentToken, authoritativeBoundary, tokenGeneration);
+            ? new(pending, authoritativeBoundary, pendingGeneration, currentToken, tokenGeneration, attachmentId, sessionCredential)
+            : new(currentToken, authoritativeBoundary, tokenGeneration, attachmentId: attachmentId, sessionCredential: sessionCredential);
 
     public override string ToString() =>
         $"session={TokenFingerprint}; boundary={AuthoritativeBoundary}; generation={EstablishedGeneration}";
@@ -183,6 +218,7 @@ public enum NexIrcResumeRejectionReason
     ServerRestarted,
     ReplayTooLarge,
     RateLimited,
+    AttachmentLimit,
     AuthenticationRequired,
     TemporaryFailure,
     Unsupported,
@@ -205,6 +241,8 @@ public sealed record NexIrcResumeExecutionResult(
     NexIrcResumeRejectionReason? RejectionReason,
     bool FallbackSafe)
 {
+    public bool AttachmentCreated { get; init; }
+
     public static NexIrcResumeExecutionResult Unsupported(string detail) => new(
         NexIrcResumeOutcome.Unsupported,
         CapabilityNegotiated: false,

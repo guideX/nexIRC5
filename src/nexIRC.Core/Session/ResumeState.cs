@@ -20,10 +20,13 @@ public sealed record ClientResumeStateRecord(
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
     DateTimeOffset? ExpiresAt = null,
-    string? ServerGeneration = null)
+    string? ServerGeneration = null,
+    Guid? AttachmentId = null,
+    byte[]? ProtectedSessionCredential = null)
 {
-    public const int CurrentVersion = 1;
+    public const int CurrentVersion = 2;
     public const int MaximumProtectedTokenBytes = 16 * 1024;
+    public const int MaximumProtectedSessionCredentialBytes = 16 * 1024;
 
     public bool IsSupported => Version == CurrentVersion;
 
@@ -37,6 +40,9 @@ public sealed record ClientResumeStateRecord(
         && AcknowledgedTokenGeneration > 0
         && AcknowledgedTokenGeneration <= TokenGeneration
         && !string.IsNullOrWhiteSpace(AuthoritativeBoundary)
+        && (AttachmentId is null || AttachmentId != Guid.Empty)
+        && (ProtectedSessionCredential is null
+            || ProtectedSessionCredential.Length is > 0 and <= MaximumProtectedSessionCredentialBytes)
         && (ProtectedPendingToken is null
             ? PendingTokenGeneration is null
             : ProtectedPendingToken.Length is > 0 and <= MaximumProtectedTokenBytes
@@ -154,7 +160,8 @@ public sealed class InMemoryResumeStateStore : IResumeStateStore
             _states[state.NetworkIdentity] = state with
             {
                 ProtectedCurrentToken = state.ProtectedCurrentToken.ToArray(),
-                ProtectedPendingToken = state.ProtectedPendingToken?.ToArray()
+                ProtectedPendingToken = state.ProtectedPendingToken?.ToArray(),
+                ProtectedSessionCredential = state.ProtectedSessionCredential?.ToArray()
             };
         }
 

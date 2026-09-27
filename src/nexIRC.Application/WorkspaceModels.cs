@@ -218,6 +218,9 @@ public sealed record NetworkConnectionOptions
 
     public bool AutoConnect { get; init; }
 
+    /// <summary>Start this client instance as a new attachment to the stored logical session.</summary>
+    public bool CreateNewAttachmentOnConnect { get; init; }
+
     public ReconnectPolicy Reconnect { get; init; } = new();
 
     public ServerProfileSet? Profiles { get; init; }
@@ -270,7 +273,8 @@ public sealed record NetworkConnectionOptions
         SaslCredentialProvider = SaslCredentialProvider,
         PasswordProvider = PasswordProvider,
         SaslMechanisms = SaslMechanisms,
-        SaslPolicy = SaslPolicy
+        SaslPolicy = SaslPolicy,
+        CreateNewAttachmentOnConnect = CreateNewAttachmentOnConnect
     };
 }
 

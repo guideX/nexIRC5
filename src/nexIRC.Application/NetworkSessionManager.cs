@@ -206,7 +206,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         ValidateOptions(options);
 
         var networkId = options.ProfileId is Guid profileId && profileId != Guid.Empty ? profileId : Guid.NewGuid();
-        var session = new ServerSession(options.ToSessionOptions(networkId, resumeStateStore: _resumeStateStore, resumeSecretProtector: _resumeSecretProtector), _transportFactory);
+        var session = new ServerSession(options.ToSessionOptions(
+            networkId,
+            continuityRecoveryRequired: options.CreateNewAttachmentOnConnect,
+            resumeStateStore: options.ResumeStateStore ?? _resumeStateStore,
+            resumeSecretProtector: _resumeSecretProtector), _transportFactory);
         var workspace = new NetworkWorkspace(networkId, options, session);
         var entry = new SessionEntry(workspace, options, session);
         lock (_entriesGate)
@@ -3504,7 +3508,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 entry.Workspace.Id,
                 entry.ContinuityRecoveryRequired,
                 entry.ContinuityRecoveryRequired ? entry.ContinuityPreviousGeneration ?? previousGeneration : null,
-                _resumeStateStore,
+                entry.Options.ResumeStateStore ?? _resumeStateStore,
                 _resumeSecretProtector),
             _transportFactory);
         entry.Workspace.Options = entry.Options;
@@ -3743,7 +3747,12 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             cancellation => new ValueTask<ConnectionRecoveryExecutionResult>(
                 RecoverReconnectHistoryAsync(entry, session, generation, cancellation)),
             cancellation => new ValueTask<ConnectionRecoveryExecutionResult>(
-                RecoverNativeResumeAsync(session, generation, cancellation)));
+                RecoverNativeResumeAsync(
+                    session,
+                    generation,
+                    entry,
+                    entry.Options.CreateNewAttachmentOnConnect && !entry.NativeAttachmentEstablished,
+                    cancellation)));
         var selected = _recoveryStrategySelector.Select(context, recoveryRequired: true);
         session.RecordContinuityStrategySelected(
             selected.Selection.Strategy,
@@ -4287,9 +4296,17 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private static async Task<ConnectionRecoveryExecutionResult> RecoverNativeResumeAsync(
         ServerSession session,
         int generation,
+        SessionEntry entry,
+        bool createNewAttachment,
         CancellationToken cancellationToken)
     {
-        var native = await session.RequestNativeResumeAsync(generation, cancellationToken).ConfigureAwait(false);
+        var native = createNewAttachment
+            ? await session.RequestNativeAttachmentAsync(generation, cancellationToken).ConfigureAwait(false)
+            : await session.RequestNativeResumeAsync(generation, cancellationToken).ConfigureAwait(false);
+        if (createNewAttachment && native is { Outcome: NexIrcResumeOutcome.Completed, AttachmentCreated: true })
+        {
+            entry.NativeAttachmentEstablished = true;
+        }
         var outcome = native.Outcome switch
         {
             NexIrcResumeOutcome.Completed => ContinuitySynchronizationOutcome.Recovered,
@@ -5759,6 +5776,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         public Task? RunTask { get; set; }
 
         public bool NeedsReplacement { get; set; }
+
+        public bool NativeAttachmentEstablished { get; set; }
 
         public Task[] EventDrainTasks { get; set; } = [];
 

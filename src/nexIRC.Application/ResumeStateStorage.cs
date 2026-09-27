@@ -308,6 +308,19 @@ public sealed class JsonResumeStateStore : IResumeStateStore, IDisposable
                         throw new FormatException("The protected resume metadata binding was invalid.");
                     }
 
+                    if (state.Version == 1)
+                    {
+                        // Version 1 contains one protected attachment token and
+                        // no attachment ID or session grant. Preserve it as the
+                        // primary attachment while making the schema upgrade explicit.
+                        if (state.AttachmentId is not null || state.ProtectedSessionCredential is not null)
+                        {
+                            throw new FormatException("Version 1 resume metadata contained version 2 attachment fields.");
+                        }
+
+                        state = state with { Version = ClientResumeStateRecord.CurrentVersion };
+                    }
+
                     if (!state.IsSupported)
                     {
                         failure = ResumeStateLoadStatus.Unsupported;

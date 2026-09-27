@@ -43,6 +43,108 @@ public sealed class Phase37ResumeStateStoreTests
     }
 
     [Fact]
+    public async Task VersionOneStateMigratesExplicitlyAndPreservesItsPrimaryAttachmentToken()
+    {
+        var root = Directory.CreateTempSubdirectory("nexirc-phase40-v1-migration-");
+        try
+        {
+            var state = CreateState("phase40-legacy-token");
+            using var store = new JsonResumeStateStore(root.FullName);
+            Assert.Equal(ResumeStateStoreStatus.Stored, (await store.SaveAsync(state)).Status);
+            var path = Directory.EnumerateFiles(root.FullName, "*.json").Single();
+            var legacyJson = JsonSerializer.Serialize(new
+            {
+                Version = 1,
+                state.NetworkIdentity,
+                state.AccountIdentity,
+                state.ProtocolVersion,
+                state.ProtectedCurrentToken,
+                state.ProtectedPendingToken,
+                state.TokenGeneration,
+                state.PendingTokenGeneration,
+                state.AcknowledgedTokenGeneration,
+                state.AuthoritativeBoundary,
+                state.CreatedAt,
+                state.UpdatedAt,
+                state.ExpiresAt,
+                state.ServerGeneration
+            });
+            File.WriteAllText(path, legacyJson);
+            if (File.Exists(path + ".bak")) File.Delete(path + ".bak");
+
+            var loaded = await store.LoadAsync(state.NetworkIdentity);
+
+            Assert.True(loaded.IsUsable);
+            Assert.Equal(ClientResumeStateRecord.CurrentVersion, loaded.State!.Version);
+            Assert.Null(loaded.State.AttachmentId);
+            Assert.Null(loaded.State.ProtectedSessionCredential);
+            Assert.Equal("phase40-legacy-token", new TestProtector().Unprotect(loaded.State.ProtectedCurrentToken, state.NetworkIdentity));
+        }
+        finally
+        {
+            Directory.Delete(root.FullName, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task VersionOneStateWithAttachmentFieldsIsRejectedAsCorrupt()
+    {
+        var root = Directory.CreateTempSubdirectory("nexirc-phase40-v1-malformed-");
+        try
+        {
+            var state = CreateState("phase40-legacy-token");
+            using var store = new JsonResumeStateStore(root.FullName);
+            Assert.Equal(ResumeStateStoreStatus.Stored, (await store.SaveAsync(state)).Status);
+            var path = Directory.EnumerateFiles(root.FullName, "*.json").Single();
+            var malformed = JsonSerializer.Serialize(state with
+            {
+                Version = 1,
+                AttachmentId = Guid.NewGuid(),
+                ProtectedSessionCredential = new TestProtector().Protect("unexpected-grant", state.NetworkIdentity)
+            });
+            File.WriteAllText(path, malformed);
+            if (File.Exists(path + ".bak")) File.Delete(path + ".bak");
+
+            var loaded = await store.LoadAsync(state.NetworkIdentity);
+
+            Assert.Equal(ResumeStateLoadStatus.Corrupt, loaded.Status);
+            Assert.Null(loaded.State);
+        }
+        finally
+        {
+            Directory.Delete(root.FullName, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task VersionTwoAttachmentAndSessionGrantRoundTripOnlyAsProtectedBytes()
+    {
+        var root = Directory.CreateTempSubdirectory("nexirc-phase40-v2-state-");
+        try
+        {
+            var state = CreateState("phase40-device-token") with
+            {
+                AttachmentId = Guid.Parse("b667e890-020f-4226-a6c5-d14e7fb8c6c0"),
+                ProtectedSessionCredential = new TestProtector().Protect("phase40-session-grant", "profile=phase37;host=example.test;port=6697;tls=true")
+            };
+            using var store = new JsonResumeStateStore(root.FullName);
+            Assert.Equal(ResumeStateStoreStatus.Stored, (await store.SaveAsync(state)).Status);
+            var loaded = await store.LoadAsync(state.NetworkIdentity);
+
+            Assert.True(loaded.IsUsable);
+            Assert.Equal(state.AttachmentId, loaded.State!.AttachmentId);
+            Assert.Equal("phase40-session-grant", new TestProtector().Unprotect(loaded.State.ProtectedSessionCredential!, state.NetworkIdentity));
+            var json = File.ReadAllText(Directory.EnumerateFiles(root.FullName, "*.json").Single());
+            Assert.DoesNotContain("phase40-device-token", json, StringComparison.Ordinal);
+            Assert.DoesNotContain("phase40-session-grant", json, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(root.FullName, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task CorruptPrimaryFallsBackToAtomicBackupAndUnsupportedStateIsRejected()
     {
         var root = Directory.CreateTempSubdirectory("nexirc-phase37-");

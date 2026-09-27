@@ -78,6 +78,18 @@ public sealed record DeterministicHistoryFixtureOptions
     public string NativeResumeToken { get; init; } = "fixture-resume-token";
 
     public string NativeResumeInitialBoundary { get; init; } = "resume-0";
+
+    public bool NativeAttachmentsEnabled { get; init; }
+
+    public string NativeSessionCredential { get; init; } = "fixture-session-grant";
+
+    public string NativeAttachmentToken { get; init; } = "fixture-attachment-token";
+
+    public string NativeAttachmentSessionCredential { get; init; } = "fixture-device-grant";
+
+    public Guid NativePrimaryAttachmentId { get; init; } = Guid.Parse("7e6716d9-cd1f-46e2-bbe2-70aa4cd38a90");
+
+    public Guid NativeAttachmentId { get; init; } = Guid.Parse("38e35d88-7de3-43a5-aabb-799737222d5e");
 }
 
 /// <summary>
@@ -92,12 +104,14 @@ public sealed class DeterministicServerHistoryFixture : IAsyncDisposable
     private readonly List<DeterministicServerHistoryEvent> _history;
     private readonly List<string> _historyRequests = [];
     private readonly List<string> _nativeResumeRequests = [];
+    private readonly List<string> _nativeAttachmentRequests = [];
     private readonly Queue<DeterministicServerHistoryEvent> _heldLiveEvents = [];
     private readonly Queue<DeterministicServerHistoryEvent> _scheduledLiveDuringReplay = [];
     private int _batchSequence;
     private int _resumeSequence;
     private bool _welcomeSent;
     private bool _nativeClientEnabled;
+    private bool _nativeAttachmentsClientEnabled;
     private bool _nativeReplayInProgress;
     private bool _resumeStateAvailable = true;
     private bool _resumeOwnerActive;
@@ -121,7 +135,11 @@ public sealed class DeterministicServerHistoryFixture : IAsyncDisposable
 
     public IReadOnlyList<string> NativeResumeRequests => _nativeResumeRequests;
 
+    public IReadOnlyList<string> NativeAttachmentRequests => _nativeAttachmentRequests;
+
     public string NativeResumeToken => _options.NativeResumeToken;
+
+    public Guid NativeAttachmentId => _options.NativeAttachmentId;
 
     public string CurrentResumeBoundary => _serverBoundary ?? _options.NativeResumeInitialBoundary;
 
@@ -197,6 +215,7 @@ public sealed class DeterministicServerHistoryFixture : IAsyncDisposable
                         candidate.Split('=', 2)[0].Equals(item.TrimStart('-'), StringComparison.OrdinalIgnoreCase)))
                     .ToArray();
                 _nativeClientEnabled = acknowledged.Any(item => item.Equals(NexIrcResumeProtocol.CapabilityName, StringComparison.OrdinalIgnoreCase));
+                _nativeAttachmentsClientEnabled = acknowledged.Any(item => item.Split('=', 2)[0].Equals(NexIrcResumeProtocol.AttachmentsCapabilityName, StringComparison.OrdinalIgnoreCase));
                 if (acknowledged.Length > 0)
                 {
                     Transport.EnqueueInboundLine($":{_options.ServerName} CAP * ACK :{string.Join(' ', acknowledged)}");
@@ -218,7 +237,14 @@ public sealed class DeterministicServerHistoryFixture : IAsyncDisposable
                 HandleHistoryRequest(line, parts);
                 break;
             case "NEXIRC":
-                HandleNativeResumeRequest(line, parts);
+                if (parts.Length > 1 && parts[1].Equals(NexIrcResumeProtocol.AttachSubcommand, StringComparison.OrdinalIgnoreCase))
+                {
+                    HandleNativeAttachmentRequest(line, parts);
+                }
+                else
+                {
+                    HandleNativeResumeRequest(line, parts);
+                }
                 break;
         }
     }
@@ -244,6 +270,11 @@ public sealed class DeterministicServerHistoryFixture : IAsyncDisposable
             capabilities.Add($"{NexIrcResumeProtocol.CapabilityName}={NexIrcResumeProtocol.CapabilityVersion}");
         }
 
+        if (_options.NativeAttachmentsEnabled)
+        {
+            capabilities.Add($"{NexIrcResumeProtocol.AttachmentsCapabilityName}={NexIrcResumeProtocol.CapabilityVersion}");
+        }
+
         return capabilities.OrderBy(static value => value, StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
@@ -263,7 +294,34 @@ public sealed class DeterministicServerHistoryFixture : IAsyncDisposable
         if (_nativeClientEnabled && _resumeStateAvailable)
         {
             Transport.EnqueueInboundLine($":{_options.ServerName} NEXIRC SESSION {_options.NativeResumeToken} {CurrentResumeBoundary}");
+            if (_nativeAttachmentsClientEnabled && _options.NativeAttachmentsEnabled)
+            {
+                Transport.EnqueueInboundLine($":{_options.ServerName} NEXIRC SESSION ATTACHMENT {_options.NativePrimaryAttachmentId:N} 1");
+                Transport.EnqueueInboundLine($":{_options.ServerName} NEXIRC SESSION KEY {_options.NativeSessionCredential}");
+            }
         }
+    }
+
+    private void HandleNativeAttachmentRequest(string line, string[] parts)
+    {
+        if (parts.Length < 4 || !_nativeAttachmentsClientEnabled)
+        {
+            return;
+        }
+
+        _nativeAttachmentRequests.Add(line);
+        if (!string.Equals(parts[2], _options.NativeSessionCredential, StringComparison.Ordinal)
+            && !string.Equals(parts[2], _options.NativeAttachmentSessionCredential, StringComparison.Ordinal)
+            || !IsKnownResumeBoundary(parts[3]))
+        {
+            Transport.EnqueueInboundLine($":{_options.ServerName} NEXIRC ATTACH REJECT UNKNOWN_TOKEN");
+            return;
+        }
+
+        _nativeReplayInProgress = true;
+        var ordered = PrepareHistoryForResume();
+        Transport.EnqueueInboundLine($":{_options.ServerName} NEXIRC ATTACH ACCEPT {_options.NativeAttachmentId:N} {_options.NativeAttachmentToken} {parts[3]} 1 {_options.NativeAttachmentSessionCredential}");
+        SendNativeResumeReplay(parts[3], ordered);
     }
 
     private void HandleHistoryRequest(string line, string[] parts)

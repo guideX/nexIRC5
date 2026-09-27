@@ -11,6 +11,115 @@ namespace nexIRC.Networking.Tests;
 public sealed class Phase37ProtectedResumeTests
 {
     [Fact]
+    public async Task ExplicitNewAttachmentUsesProtectedGrantAndRetainsIndependentAttachmentCredential()
+    {
+        var store = new InMemoryResumeStateStore();
+        var protector = new TestResumeSecretProtector();
+        var networkId = Guid.Parse("e8b72083-5899-48c3-8a9a-714c398cc6fd");
+        await using var fixture = new DeterministicServerHistoryFixture(new DeterministicHistoryFixtureOptions
+        {
+            Endpoint = new IrcEndpoint("phase40-attachment.example", 6697, true),
+            Profile = DeterministicReplayProfile.NativeResume,
+            NativeAttachmentsEnabled = true,
+            NativeSessionCredential = "phase40-session-grant",
+            NativeAttachmentSessionCredential = "phase40-secondary-grant",
+            NativeAttachmentToken = "phase40-secondary-token"
+        });
+        await using var session = CreateSession(fixture, networkId, store, protector);
+        var raw = new List<string>();
+        var outbound = new List<string>();
+        session.RawLineReceived += (_, item) => raw.Add(item.RawLine);
+        session.OutboundCommandSent += (_, item) => outbound.Add(item.RawLine);
+
+        _ = session.RunAsync();
+        await WaitForAsync(() => session.Snapshot.Registration == RegistrationState.Registered
+            && session.NativeResumeSession?.SessionCredential is not null
+            && session.NativeResumeSession.AttachmentId is not null);
+        var primaryAttachmentId = session.NativeResumeSession!.AttachmentId;
+        var initial = await store.LoadAsync(ResumeStateIdentity.For(fixture.Transport.Endpoint, networkId));
+        Assert.True(initial.IsUsable);
+        Assert.Equal("phase40-session-grant", protector.Unprotect(initial.State!.ProtectedSessionCredential!, initial.State.NetworkIdentity));
+
+        var result = await session.RequestNativeAttachmentAsync(session.Snapshot.ConnectionGeneration);
+
+        Assert.Equal(NexIrcResumeOutcome.Completed, result.Outcome);
+        Assert.True(result.AttachmentCreated);
+        Assert.Equal("phase40-secondary-token", session.NativeResumeSession!.Token);
+        Assert.Equal(fixture.NativeAttachmentId, session.NativeResumeSession.AttachmentId);
+        Assert.NotEqual(primaryAttachmentId, session.NativeResumeSession.AttachmentId);
+        Assert.Equal("phase40-secondary-grant", session.NativeResumeSession.SessionCredential);
+        Assert.Contains(fixture.NativeAttachmentRequests, line => line == "NEXIRC ATTACH phase40-session-grant resume-0");
+        Assert.DoesNotContain(raw, line => line.Contains("phase40-session-grant", StringComparison.Ordinal)
+            || line.Contains("phase40-secondary-token", StringComparison.Ordinal));
+        Assert.DoesNotContain(outbound, line => line.Contains("phase40-session-grant", StringComparison.Ordinal));
+
+        var persisted = await store.LoadAsync(ResumeStateIdentity.For(fixture.Transport.Endpoint, networkId));
+        Assert.True(persisted.IsUsable);
+        Assert.Equal(fixture.NativeAttachmentId, persisted.State!.AttachmentId);
+        Assert.Equal("phase40-secondary-token", protector.Unprotect(persisted.State.ProtectedCurrentToken, persisted.State.NetworkIdentity));
+        Assert.Equal("phase40-secondary-grant", protector.Unprotect(persisted.State.ProtectedSessionCredential!, persisted.State.NetworkIdentity));
+
+        await session.DisconnectAsync();
+        await session.Completion;
+    }
+
+    [Fact]
+    public async Task AttachmentGrantAndIndependentCredentialAreProtectedAndAttachedThroughReplay()
+    {
+        var store = new InMemoryResumeStateStore();
+        var protector = new TestResumeSecretProtector();
+        var networkId = Guid.Parse("4a3d9d6b-fbcf-4acf-a557-6307d44be00b");
+        await using var fixture = new DeterministicServerHistoryFixture(new DeterministicHistoryFixtureOptions
+        {
+            Endpoint = new IrcEndpoint("phase40-attach.example", 6697, true),
+            Profile = DeterministicReplayProfile.NativeResume,
+            NativeAttachmentsEnabled = true,
+            NativeSessionCredential = "phase40-session-grant",
+            NativeAttachmentSessionCredential = "phase40-secondary-grant",
+            NativeAttachmentToken = "phase40-secondary-token"
+        });
+        await using var session = CreateSession(fixture, networkId, store, protector);
+        var publicRaw = new List<string>();
+        var publicOutbound = new List<string>();
+        session.RawLineReceived += (_, item) => publicRaw.Add(item.RawLine);
+        session.OutboundCommandSent += (_, item) => publicOutbound.Add(item.RawLine);
+
+        _ = session.RunAsync();
+        await WaitForAsync(() => session.Snapshot.Registration == RegistrationState.Registered
+            && session.NativeResumeSession?.SessionCredential is not null
+            && session.NativeResumeSession.AttachmentId is not null);
+
+        var primaryId = session.NativeResumeSession!.AttachmentId;
+        var initialState = await store.LoadAsync(ResumeStateIdentity.For(fixture.Transport.Endpoint, networkId));
+        Assert.True(initialState.IsUsable);
+        Assert.Equal("phase40-session-grant", protector.Unprotect(initialState.State!.ProtectedSessionCredential!, initialState.State.NetworkIdentity));
+        Assert.DoesNotContain("phase40-session-grant", Convert.ToBase64String(initialState.State.ProtectedSessionCredential!), StringComparison.Ordinal);
+
+        var result = await session.RequestNativeAttachmentAsync(session.Snapshot.ConnectionGeneration);
+        var current = session.NativeResumeSession!;
+
+        Assert.Equal(NexIrcResumeOutcome.Completed, result.Outcome);
+        Assert.True(result.AttachmentCreated);
+        Assert.NotEqual(primaryId, current.AttachmentId);
+        Assert.Equal(fixture.NativeAttachmentId, current.AttachmentId);
+        Assert.Equal("phase40-secondary-token", current.Token);
+        Assert.Equal("phase40-secondary-grant", current.SessionCredential);
+        Assert.Contains(fixture.NativeAttachmentRequests, line => line == "NEXIRC ATTACH phase40-session-grant resume-0");
+        Assert.DoesNotContain(publicRaw, line => line.Contains("phase40-session-grant", StringComparison.Ordinal)
+            || line.Contains("phase40-secondary-token", StringComparison.Ordinal));
+        Assert.DoesNotContain(publicOutbound, line => line.Contains("phase40-session-grant", StringComparison.Ordinal));
+
+        var persisted = await store.LoadAsync(ResumeStateIdentity.For(fixture.Transport.Endpoint, networkId));
+        Assert.True(persisted.IsUsable);
+        Assert.Equal(current.AttachmentId, persisted.State!.AttachmentId);
+        Assert.Equal("phase40-secondary-token", protector.Unprotect(persisted.State.ProtectedCurrentToken, persisted.State.NetworkIdentity));
+        Assert.Equal("phase40-secondary-grant", protector.Unprotect(persisted.State.ProtectedSessionCredential!, persisted.State.NetworkIdentity));
+
+        await session.DisconnectAsync();
+        await session.Completion;
+    }
+
+    [Fact]
     public async Task FreshSessionInstanceLoadsProtectedStateAndResumesExactGap()
     {
         var store = new InMemoryResumeStateStore();

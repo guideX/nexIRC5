@@ -167,5 +167,24 @@ public sealed class Phase1BProtocolTests
         Assert.DoesNotContain(token, Encoding.UTF8.GetString(entry.RawBytes.Span), StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void AttachmentCredentialsAreRedactedFromCommandsAndSessionAnnouncements()
+    {
+        const string sessionGrant = "phase40-session-grant";
+        const string attachmentToken = "phase40-device-token";
+        var attachRequest = IrcSensitiveData.RedactLine($"NEXIRC ATTACH {sessionGrant} resume-4");
+        var grantAnnouncement = IrcSensitiveData.RedactLine($":server NEXIRC SESSION KEY {sessionGrant}");
+        var accepted = IrcSensitiveData.RedactLine($":server NEXIRC ATTACH ACCEPT b667e890020f4226a6c5d14e7fb8c6c0 {attachmentToken} resume-4 1");
+
+        Assert.DoesNotContain(sessionGrant, attachRequest, StringComparison.Ordinal);
+        Assert.DoesNotContain(sessionGrant, grantAnnouncement, StringComparison.Ordinal);
+        Assert.DoesNotContain(attachmentToken, accepted, StringComparison.Ordinal);
+        Assert.Contains(NexIrcResumeProtocol.FingerprintToken(sessionGrant), attachRequest, StringComparison.Ordinal);
+        Assert.Contains(NexIrcResumeProtocol.FingerprintToken(sessionGrant), grantAnnouncement, StringComparison.Ordinal);
+        Assert.Contains(NexIrcResumeProtocol.FingerprintToken(attachmentToken), accepted, StringComparison.Ordinal);
+        Assert.Equal(":server NEXIRC SESSION ATTACHMENT b667e890020f4226a6c5d14e7fb8c6c0 1",
+            IrcSensitiveData.RedactLine(":server NEXIRC SESSION ATTACHMENT b667e890020f4226a6c5d14e7fb8c6c0 1"));
+    }
+
     private static IrcMessage Parse(string line) => IrcMessageParser.Parse(line).Message!;
 }

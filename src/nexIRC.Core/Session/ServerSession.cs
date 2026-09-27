@@ -349,6 +349,106 @@ public sealed class ServerSession : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Creates a new physical attachment to the retained logical session.
+    /// This is an explicit new-device operation and uses the session-scoped
+    /// grant; ordinary reconnects continue to use the attachment token.
+    /// </summary>
+    public async ValueTask<NexIrcResumeExecutionResult> RequestNativeAttachmentAsync(
+        int connectionGeneration,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ConnectionEpoch epoch;
+        NativeResumeAttempt attempt;
+        NexIrcResumeSession sessionIdentity;
+        lock (_gate)
+        {
+            if (_registration != RegistrationState.Registered
+                || _activeEpoch is not { IsActive: true } currentEpoch
+                || currentEpoch.Generation != connectionGeneration)
+            {
+                throw new InvalidOperationException("The native attachment request belongs to a non-current IRC generation.");
+            }
+
+            if (!NexIrcResumeProtocol.AreAttachmentsSupported(_capabilities.Snapshot)
+                || _nativeResumeSession is null
+                || _nativeResumeSession.SessionCredential is null)
+            {
+                return NexIrcResumeExecutionResult.Unsupported(
+                    "The current generation did not negotiate native attachments or has no retained session grant.");
+            }
+
+            if (_restoredResumeActive && !TryActivateRestoredResumeStateUnsafe())
+            {
+                return NexIrcResumeExecutionResult.Unsupported(
+                    "The protected attachment record does not match the authenticated account context; the session grant was not offered.");
+            }
+
+            if (_options.SaslPolicy != SaslAuthenticationPolicy.Disabled
+                && _authenticationState != SaslAuthenticationState.Succeeded)
+            {
+                return NexIrcResumeExecutionResult.Unsupported(
+                    "The authenticated account context was not established; the session grant was not offered.");
+            }
+
+            if (!_options.Endpoint.UseTls)
+            {
+                return NexIrcResumeExecutionResult.Unsupported(
+                    "Native attachment credentials are only sent over TLS.");
+            }
+
+            if (_nativeResumeAttempt is not null)
+            {
+                throw new InvalidOperationException("A native resume or attachment request is already active for this connection generation.");
+            }
+
+            epoch = currentEpoch;
+            sessionIdentity = _nativeResumeSession;
+            attempt = new NativeResumeAttempt(connectionGeneration, sessionIdentity.AuthoritativeBoundary)
+            {
+                IsAttachmentRequest = true
+            };
+            _nativeResumeAttempt = attempt;
+        }
+
+        _continuity.RecordDiagnostic(
+            connectionGeneration,
+            ContinuityDiagnosticKind.RecoveryRequestStarted,
+            $"NexIrcResume attachment requested boundary={sessionIdentity.AuthoritativeBoundary}; session={sessionIdentity.TokenFingerprint}");
+
+        try
+        {
+            var command = new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build(
+                NexIrcResumeProtocol.Command,
+                [NexIrcResumeProtocol.AttachSubcommand, sessionIdentity.SessionCredential!, sessionIdentity.AuthoritativeBoundary]);
+            await QueueOutboundAsync(command, cancellationToken, epoch).ConfigureAwait(false);
+            attempt.RequestSent = true;
+            var result = await attempt.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            _continuity.RecordDiagnostic(
+                connectionGeneration,
+                result.Outcome == NexIrcResumeOutcome.Completed
+                    ? ContinuityDiagnosticKind.RecoveryRequestCompleted
+                    : ContinuityDiagnosticKind.RecoveryRequestFailed,
+                $"NexIrcResume attachment {result.Outcome}; requested={result.RequestedBoundary}; final={result.FinalBoundary}; events={result.ReplayedEventCount}; duplicates={result.DuplicateEventsSuppressed}");
+            return result;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            CancelNativeResumeAttempt(connectionGeneration, "Native attachment was cancelled by the owning generation.");
+            throw;
+        }
+        catch
+        {
+            FailNativeResumeAttempt(
+                connectionGeneration,
+                NexIrcResumeOutcome.Failed,
+                "The native attachment request could not be written.",
+                fallbackSafe: false);
+            throw;
+        }
+    }
+
     public ChathistoryConversationState GetChathistoryState(string conversation)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(conversation);
@@ -944,12 +1044,17 @@ public sealed class ServerSession : IAsyncDisposable
             var pendingToken = state.ProtectedPendingToken is { Length: > 0 } protectedPending
                 ? _resumeSecretProtector.Unprotect(protectedPending, _resumeNetworkIdentity)
                 : null;
+            var sessionCredential = state.ProtectedSessionCredential is { Length: > 0 } protectedSessionCredential
+                ? _resumeSecretProtector.Unprotect(protectedSessionCredential, _resumeNetworkIdentity)
+                : null;
             var restored = NexIrcResumeSession.FromDurableState(
                 currentToken,
                 pendingToken,
                 state.AuthoritativeBoundary,
                 state.TokenGeneration,
-                state.PendingTokenGeneration);
+                state.PendingTokenGeneration,
+                state.AttachmentId,
+                sessionCredential);
             lock (_gate)
             {
                 _loadedResumeState = state;
@@ -1026,7 +1131,11 @@ public sealed class ServerSession : IAsyncDisposable
                 session.HasPendingRotation ? session.DurableCurrentGeneration : session.EstablishedGeneration,
                 session.AuthoritativeBoundary,
                 createdAt,
-                now);
+                now,
+                AttachmentId: session.AttachmentId,
+                ProtectedSessionCredential: session.SessionCredential is { } sessionCredential
+                    ? _resumeSecretProtector.Protect(sessionCredential, _resumeNetworkIdentity)
+                    : null);
             var result = await _resumeStateStore.SaveAsync(state, cancellationToken).ConfigureAwait(false);
             if (!result.Succeeded)
             {
@@ -2566,9 +2675,46 @@ public sealed class ServerSession : IAsyncDisposable
             {
                 await HandleNativeSessionAcknowledgementAsync(message, epoch).ConfigureAwait(false);
             }
+            else if (message.Parameters.Count >= 4
+                && string.Equals(message.Parameters[1], "ATTACHMENT", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleNativeAttachmentAnnouncementAsync(message, epoch.Generation).ConfigureAwait(false);
+            }
+            else if (message.Parameters.Count >= 3
+                && string.Equals(message.Parameters[1], "KEY", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleNativeSessionCredentialAnnouncementAsync(message, epoch.Generation).ConfigureAwait(false);
+            }
             else
             {
                 await HandleNativeSessionAnnouncementAsync(message, epoch.Generation).ConfigureAwait(false);
+            }
+
+            return;
+        }
+
+        if (subcommand == NexIrcResumeProtocol.AttachSubcommand)
+        {
+            var attachResponse = message.Parameters.Count >= 2 ? message.Parameters[1].ToUpperInvariant() : string.Empty;
+            if (attachResponse == "ACCEPT")
+            {
+                await HandleNativeAttachmentAcceptedAsync(message, epoch.Generation, connectionCts).ConfigureAwait(false);
+            }
+            else if (attachResponse == "REJECT")
+            {
+                CompleteNativeResumeRejected(
+                    ParseNativeResumeRejection(message.Parameters.Count >= 3 ? message.Parameters[2] : string.Empty),
+                    "The server rejected the native attachment request.",
+                    epoch.Generation);
+            }
+            else
+            {
+                FailNativeResumeAttempt(
+                    epoch.Generation,
+                    NexIrcResumeOutcome.Failed,
+                    "The server sent a malformed nexIRC attachment response.",
+                    fallbackSafe: false,
+                    reason: NexIrcResumeRejectionReason.Malformed);
             }
 
             return;
@@ -2617,6 +2763,158 @@ public sealed class ServerSession : IAsyncDisposable
         }
 
         _ = connectionCts;
+    }
+
+    private async Task HandleNativeAttachmentAcceptedAsync(
+        IrcMessage message,
+        int generation,
+        CancellationTokenSource connectionCts)
+    {
+        if (message.Parameters.Count < 7
+            || !Guid.TryParseExact(message.Parameters[2], "N", out var attachmentId)
+            || attachmentId == Guid.Empty
+            || !NexIrcResumeProtocol.IsSafeOpaqueValue(message.Parameters[3])
+            || !NexIrcResumeProtocol.IsSafeOpaqueValue(message.Parameters[4])
+            || !int.TryParse(message.Parameters[5], out var tokenGeneration)
+            || tokenGeneration < 1
+            || !NexIrcResumeProtocol.IsSafeOpaqueValue(message.Parameters[6]))
+        {
+            FailNativeResumeAttempt(
+                generation,
+                NexIrcResumeOutcome.Failed,
+                "The server sent a malformed nexIRC attachment credential.",
+                fallbackSafe: false,
+                reason: NexIrcResumeRejectionReason.Malformed);
+            return;
+        }
+
+        NexIrcResumeSession? attached = null;
+        var requestMismatch = false;
+        lock (_gate)
+        {
+            if (_nativeResumeAttempt is not { ConnectionGeneration: var attemptGeneration, IsAttachmentRequest: true } attempt
+                || attemptGeneration != generation
+                || !string.Equals(message.Parameters[4], attempt.RequestedBoundary, StringComparison.Ordinal)
+                || _nativeResumeSession is not { SessionCredential: { } })
+            {
+                requestMismatch = true;
+            }
+            else
+            {
+                attached = new NexIrcResumeSession(
+                    message.Parameters[3],
+                    message.Parameters[4],
+                    tokenGeneration,
+                    attachmentId: attachmentId,
+                    sessionCredential: message.Parameters[6]);
+            }
+        }
+
+        if (requestMismatch || attached is null)
+        {
+            FailNativeResumeAttempt(
+                generation,
+                NexIrcResumeOutcome.Failed,
+                "The native attachment acceptance did not match the outstanding request.",
+                fallbackSafe: false,
+                reason: NexIrcResumeRejectionReason.Malformed);
+            return;
+        }
+
+        if (!await PersistNativeResumeStateAsync(attached).ConfigureAwait(false))
+        {
+            FailNativeResumeAttempt(
+                generation,
+                NexIrcResumeOutcome.Failed,
+                "The new attachment credential could not be durably committed.",
+                fallbackSafe: false);
+            connectionCts.Cancel();
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_nativeResumeAttempt is not { ConnectionGeneration: var attemptGeneration, IsAttachmentRequest: true } attempt
+                || attemptGeneration != generation)
+            {
+                return;
+            }
+
+            _nativeResumeSession = attached;
+            _restoredResumeActive = false;
+            _freshSessionAfterRestoredResume = null;
+            attempt.AttachmentCreated = true;
+            attempt.ReplayAccepted = true;
+            attempt.AcceptedBoundary = attached.AuthoritativeBoundary;
+        }
+    }
+
+    private async Task HandleNativeAttachmentAnnouncementAsync(IrcMessage message, int generation)
+    {
+        if (!NexIrcResumeProtocol.AreAttachmentsSupported(_capabilities.Snapshot)
+            || !_options.Endpoint.UseTls
+            || !Guid.TryParseExact(message.Parameters[2], "N", out var attachmentId)
+            || attachmentId == Guid.Empty
+            || !int.TryParse(message.Parameters[3], out var attachmentGeneration)
+            || attachmentGeneration < 1)
+        {
+            return;
+        }
+
+        NexIrcResumeSession? updated = null;
+        var persist = false;
+        lock (_gate)
+        {
+            if (_restoredResumeActive && _freshSessionAfterRestoredResume is { } fallback)
+            {
+                _freshSessionAfterRestoredResume = updated = fallback.WithAttachment(attachmentId);
+            }
+            else if (_nativeResumeSession is { } current)
+            {
+                _nativeResumeSession = updated = current.WithAttachment(attachmentId);
+                persist = true;
+            }
+        }
+
+        if (persist && updated is not null)
+        {
+            await PersistNativeResumeStateAsync(updated).ConfigureAwait(false);
+        }
+
+        _ = generation;
+        _ = attachmentGeneration;
+    }
+
+    private async Task HandleNativeSessionCredentialAnnouncementAsync(IrcMessage message, int generation)
+    {
+        if (!NexIrcResumeProtocol.AreAttachmentsSupported(_capabilities.Snapshot)
+            || !_options.Endpoint.UseTls
+            || !NexIrcResumeProtocol.IsSafeOpaqueValue(message.Parameters[2]))
+        {
+            return;
+        }
+
+        NexIrcResumeSession? updated = null;
+        var persist = false;
+        lock (_gate)
+        {
+            if (_restoredResumeActive && _freshSessionAfterRestoredResume is { } fallback)
+            {
+                _freshSessionAfterRestoredResume = updated = fallback.WithSessionCredential(message.Parameters[2]);
+            }
+            else if (_nativeResumeSession is { } current)
+            {
+                _nativeResumeSession = updated = current.WithSessionCredential(message.Parameters[2]);
+                persist = true;
+            }
+        }
+
+        if (persist && updated is not null)
+        {
+            await PersistNativeResumeStateAsync(updated).ConfigureAwait(false);
+        }
+
+        _ = generation;
     }
 
     private async Task HandleNativeSessionAnnouncementAsync(IrcMessage message, int generation)
@@ -2707,21 +3005,7 @@ public sealed class ServerSession : IAsyncDisposable
 
     private async Task HandleNativeResumeRejectedAsync(string reason, int generation)
     {
-        var rejection = reason.ToUpperInvariant() switch
-        {
-            "UNKNOWN" or "UNKNOWN_TOKEN" => NexIrcResumeRejectionReason.UnknownToken,
-            "EXPIRED" or "EXPIRED_TOKEN" => NexIrcResumeRejectionReason.ExpiredToken,
-            "ACCOUNT" or "ACCOUNT_MISMATCH" => NexIrcResumeRejectionReason.AccountMismatch,
-            "TOO_OLD" or "BOUNDARY_TOO_OLD" => NexIrcResumeRejectionReason.BoundaryTooOld,
-            "INVALIDATED" or "SESSION_INVALIDATED" => NexIrcResumeRejectionReason.SessionInvalidated,
-            "RESTARTED" or "SERVER_RESTARTED" => NexIrcResumeRejectionReason.ServerRestarted,
-            "TOO_LARGE" or "REPLAY_TOO_LARGE" => NexIrcResumeRejectionReason.ReplayTooLarge,
-            "RATE_LIMITED" => NexIrcResumeRejectionReason.RateLimited,
-            "AUTH_REQUIRED" => NexIrcResumeRejectionReason.AuthenticationRequired,
-            "TEMPORARY_FAILURE" => NexIrcResumeRejectionReason.TemporaryFailure,
-            "NEW" or "NEW_SESSION" => NexIrcResumeRejectionReason.NewSessionRequired,
-            _ => NexIrcResumeRejectionReason.Malformed
-        };
+        var rejection = ParseNativeResumeRejection(reason);
         var detail = string.IsNullOrWhiteSpace(reason)
             ? "The server rejected the native resume request."
             : $"The server rejected the native resume request: {reason}.";
@@ -2764,6 +3048,24 @@ public sealed class ServerSession : IAsyncDisposable
         // it cannot observe a rejected result alongside the stale credential.
         CompleteNativeResumeRejected(rejection, detail, generation);
     }
+
+    private static NexIrcResumeRejectionReason ParseNativeResumeRejection(string reason) => reason.ToUpperInvariant() switch
+    {
+        "UNKNOWN" or "UNKNOWN_TOKEN" => NexIrcResumeRejectionReason.UnknownToken,
+        "EXPIRED" or "EXPIRED_TOKEN" => NexIrcResumeRejectionReason.ExpiredToken,
+        "ACCOUNT" or "ACCOUNT_MISMATCH" => NexIrcResumeRejectionReason.AccountMismatch,
+        "TOO_OLD" or "BOUNDARY_TOO_OLD" => NexIrcResumeRejectionReason.BoundaryTooOld,
+        "INVALIDATED" or "SESSION_INVALIDATED" => NexIrcResumeRejectionReason.SessionInvalidated,
+        "RESTARTED" or "SERVER_RESTARTED" => NexIrcResumeRejectionReason.ServerRestarted,
+        "TOO_LARGE" or "REPLAY_TOO_LARGE" => NexIrcResumeRejectionReason.ReplayTooLarge,
+        "RATE_LIMITED" => NexIrcResumeRejectionReason.RateLimited,
+        "ATTACHMENT_LIMIT" => NexIrcResumeRejectionReason.AttachmentLimit,
+        "AUTH_REQUIRED" => NexIrcResumeRejectionReason.AuthenticationRequired,
+        "TEMPORARY_FAILURE" => NexIrcResumeRejectionReason.TemporaryFailure,
+        "UNSUPPORTED" => NexIrcResumeRejectionReason.Unsupported,
+        "NEW" or "NEW_SESSION" => NexIrcResumeRejectionReason.NewSessionRequired,
+        _ => NexIrcResumeRejectionReason.Malformed
+    };
 
     private async Task HandleNativeSessionRotationAsync(
         IrcMessage message,
@@ -2979,7 +3281,10 @@ public sealed class ServerSession : IAsyncDisposable
                 boundary,
                 "Authoritative native replay completed through the server boundary.",
                 null,
-                FallbackSafe: false);
+                FallbackSafe: false)
+            {
+                AttachmentCreated = attempt.AttachmentCreated
+            };
             _nativeResumeAttempt = null;
             _acceptedNativeResumeBatches.Clear();
             completion = attempt.Completion;
@@ -3782,6 +4087,10 @@ public sealed class ServerSession : IAsyncDisposable
     private sealed class NativeResumeAttempt(int connectionGeneration, string requestedBoundary)
     {
         public int ConnectionGeneration { get; } = connectionGeneration;
+
+        public bool IsAttachmentRequest { get; init; }
+
+        public bool AttachmentCreated { get; set; }
 
         public string RequestedBoundary { get; } = requestedBoundary;
 

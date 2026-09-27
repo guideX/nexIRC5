@@ -151,15 +151,31 @@ public static class IrcSensitiveData
         var commandIndex = line.IndexOf(" NEXIRC ", StringComparison.OrdinalIgnoreCase);
         var commandText = commandIndex >= 0 ? line[(commandIndex + 1)..] : line;
         var tokens = commandText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var prefix = commandIndex >= 0 ? line[..(commandIndex + 1)] : string.Empty;
+
+        if (tokens.Length >= 4 && tokens[1].Equals("ATTACH", StringComparison.OrdinalIgnoreCase))
+        {
+            if (tokens[2].Equals("ACCEPT", StringComparison.OrdinalIgnoreCase) && tokens.Length >= 7)
+            {
+                tokens[4] = $"<redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[4])}>";
+                return prefix + string.Join(' ', tokens);
+            }
+
+            if (!tokens[2].Equals("REJECT", StringComparison.OrdinalIgnoreCase)
+                && !tokens[2].Equals("ACCEPT", StringComparison.OrdinalIgnoreCase))
+            {
+                tokens[2] = $"<redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[2])}>";
+                return prefix + string.Join(' ', tokens);
+            }
+        }
+
         if (tokens.Length >= 4
             && tokens[1].Equals("RESUME", StringComparison.OrdinalIgnoreCase)
             && !tokens[2].Equals("ACCEPT", StringComparison.OrdinalIgnoreCase)
             && !tokens[2].Equals("COMPLETE", StringComparison.OrdinalIgnoreCase)
             && !tokens[2].Equals("REJECT", StringComparison.OrdinalIgnoreCase))
         {
-            return commandIndex >= 0
-                ? line[..(commandIndex + 1)] + $"NEXIRC RESUME <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[2])}> {tokens[3]}"
-                : $"NEXIRC RESUME <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[2])}> {tokens[3]}";
+            return prefix + $"NEXIRC RESUME <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[2])}> {tokens[3]}";
         }
 
         if (tokens.Length >= 4
@@ -168,14 +184,20 @@ public static class IrcSensitiveData
             if (tokens.Length >= 6
                 && tokens[2].Equals(NexIrcResumeProtocol.SessionRotateSubcommand, StringComparison.OrdinalIgnoreCase))
             {
-                return commandIndex >= 0
-                    ? line[..(commandIndex + 1)] + $"NEXIRC SESSION ROTATE <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[3])}> {tokens[4]} {tokens[5]}"
-                    : $"NEXIRC SESSION ROTATE <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[3])}> {tokens[4]} {tokens[5]}";
+                return prefix + $"NEXIRC SESSION ROTATE <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[3])}> {tokens[4]} {tokens[5]}";
             }
 
-            return commandIndex >= 0
-                ? line[..(commandIndex + 1)] + $"NEXIRC SESSION <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[2])}> {tokens[3]}"
-                : $"NEXIRC SESSION <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[2])}> {tokens[3]}";
+            if (tokens[2].Equals("KEY", StringComparison.OrdinalIgnoreCase))
+            {
+                return prefix + $"NEXIRC SESSION KEY <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[3])}>";
+            }
+
+            if (tokens[2].Equals("ATTACHMENT", StringComparison.OrdinalIgnoreCase))
+            {
+                return line;
+            }
+
+            return prefix + $"NEXIRC SESSION <redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[2])}> {tokens[3]}";
         }
 
         return line;

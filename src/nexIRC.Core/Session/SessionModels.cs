@@ -92,6 +92,13 @@ public sealed class ServerSessionOptions
     /// </summary>
     public bool ContinuityRecoveryRequired { get; init; }
 
+    /// <summary>
+    /// When enabled, the first continuity request on this session creates a
+    /// separate attachment using the protected session grant. Later recovery
+    /// requests resume the attachment created for this client instance.
+    /// </summary>
+    public bool CreateNewAttachmentOnConnect { get; init; }
+
     public int? ContinuityPreviousGeneration { get; init; }
 
     public required IrcEndpoint Endpoint { get; init; }
