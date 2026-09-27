@@ -153,6 +153,23 @@ public static class IrcSensitiveData
         var tokens = commandText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var prefix = commandIndex >= 0 ? line[..(commandIndex + 1)] : string.Empty;
 
+        if (tokens.Length >= 4 && tokens[1].Equals("PAIR", StringComparison.OrdinalIgnoreCase))
+        {
+            if (tokens[2].Equals("CREATED", StringComparison.OrdinalIgnoreCase) && tokens.Length >= 5)
+            {
+                tokens[3] = $"<redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[3])}>";
+                return prefix + string.Join(' ', tokens);
+            }
+
+            if ((tokens[2].Equals("USE", StringComparison.OrdinalIgnoreCase)
+                    || tokens[2].Equals("REVOKE", StringComparison.OrdinalIgnoreCase))
+                && tokens.Length >= (tokens[2].Equals("USE", StringComparison.OrdinalIgnoreCase) ? 5 : 4))
+            {
+                tokens[3] = $"<redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[3])}>";
+                return prefix + string.Join(' ', tokens);
+            }
+        }
+
         if (tokens.Length >= 4 && tokens[1].Equals("ATTACH", StringComparison.OrdinalIgnoreCase))
         {
             if (tokens[2].Equals("ACCEPT", StringComparison.OrdinalIgnoreCase) && tokens.Length >= 7)

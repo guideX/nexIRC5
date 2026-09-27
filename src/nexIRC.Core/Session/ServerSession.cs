@@ -82,6 +82,8 @@ public sealed class ServerSession : IAsyncDisposable
     private bool _restoredResumeActive;
     private bool _resumeStateLoadCompleted;
     private NativeResumeAttempt? _nativeResumeAttempt;
+    private TaskCompletionSource<NexIrcPairingAuthorization>? _pairingAuthorizationAttempt;
+    private TaskCompletionSource<bool>? _pairingRevocationAttempt;
     private string? _nativeLivePendingSequence;
     private string? _nativeLivePendingMessageId;
 
@@ -481,6 +483,193 @@ public sealed class ServerSession : IAsyncDisposable
                 "The native attachment request could not be written.",
                 fallbackSafe: false);
             throw;
+        }
+    }
+
+    /// <summary>Creates a short-lived pairing authorization on this live attachment.</summary>
+    public async ValueTask<NexIrcPairingAuthorization> RequestNativePairingAuthorizationAsync(
+        int connectionGeneration,
+        CancellationToken cancellationToken = default)
+    {
+        ConnectionEpoch epoch;
+        TaskCompletionSource<NexIrcPairingAuthorization> completion;
+        lock (_gate)
+        {
+            if (_registration != RegistrationState.Registered
+                || _activeEpoch is not { IsActive: true } currentEpoch
+                || currentEpoch.Generation != connectionGeneration)
+            {
+                throw new InvalidOperationException("The pairing request belongs to a non-current IRC generation.");
+            }
+
+            if (!NexIrcResumeProtocol.AreAttachmentsSupported(_capabilities.Snapshot)
+                || _nativeResumeSession?.AttachmentId is null
+                || !_options.Endpoint.UseTls
+                || _authenticationState != SaslAuthenticationState.Succeeded)
+            {
+                throw new InvalidOperationException("Pairing requires negotiated attachment support, TLS, an established attachment, and successful SASL authentication.");
+            }
+
+            if (_pairingAuthorizationAttempt is not null || _pairingRevocationAttempt is not null || _nativeResumeAttempt is not null)
+            {
+                throw new InvalidOperationException("A native resume, attachment, or pairing request is already active for this connection generation.");
+            }
+
+            epoch = currentEpoch;
+            completion = new TaskCompletionSource<NexIrcPairingAuthorization>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pairingAuthorizationAttempt = completion;
+        }
+
+        try
+        {
+            var command = new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build(
+                NexIrcResumeProtocol.Command,
+                [NexIrcResumeProtocol.PairSubcommand, NexIrcResumeProtocol.PairCreateSubcommand]);
+            await QueueOutboundAsync(command, cancellationToken, epoch).ConfigureAwait(false);
+            return await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                if (ReferenceEquals(_pairingAuthorizationAttempt, completion))
+                {
+                    _pairingAuthorizationAttempt = null;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Imports a user supplied pairing value on an authenticated TLS
+    /// connection. The value is transient and only the resulting attachment
+    /// credentials are protected in client persistence.
+    /// </summary>
+    public async ValueTask<NexIrcResumeExecutionResult> RequestNativeAttachmentWithPairingAsync(
+        int connectionGeneration,
+        string pairingMaterial,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ArgumentException.ThrowIfNullOrWhiteSpace(pairingMaterial);
+        var networkIdentity = Snapshot.Features.NetworkName;
+        if (!NexIrcResumeProtocol.TryParsePairingMaterial(pairingMaterial, networkIdentity, out var code, out var boundary))
+        {
+            return NexIrcResumeExecutionResult.Unsupported("The pairing value is malformed or belongs to another network.");
+        }
+
+        ConnectionEpoch epoch;
+        NativeResumeAttempt attempt;
+        lock (_gate)
+        {
+            if (_registration != RegistrationState.Registered
+                || _activeEpoch is not { IsActive: true } currentEpoch
+                || currentEpoch.Generation != connectionGeneration)
+            {
+                throw new InvalidOperationException("The pairing import belongs to a non-current IRC generation.");
+            }
+
+            if (!NexIrcResumeProtocol.AreAttachmentsSupported(_capabilities.Snapshot)
+                || _nativeResumeSession is null
+                || !_options.Endpoint.UseTls
+                || _authenticationState != SaslAuthenticationState.Succeeded)
+            {
+                return NexIrcResumeExecutionResult.Unsupported("Pairing requires negotiated attachment support, TLS, and successful SASL authentication.");
+            }
+
+            if (_nativeResumeAttempt is not null || _pairingAuthorizationAttempt is not null || _pairingRevocationAttempt is not null)
+            {
+                throw new InvalidOperationException("A native resume, attachment, or pairing request is already active for this connection generation.");
+            }
+
+            epoch = currentEpoch;
+            attempt = new NativeResumeAttempt(connectionGeneration, boundary)
+            {
+                IsAttachmentRequest = true,
+                IsPairingRequest = true
+            };
+            _nativeResumeAttempt = attempt;
+        }
+
+        try
+        {
+            var command = new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build(
+                NexIrcResumeProtocol.Command,
+                [NexIrcResumeProtocol.PairSubcommand, NexIrcResumeProtocol.PairUseSubcommand, code, boundary]);
+            await QueueOutboundAsync(command, cancellationToken, epoch).ConfigureAwait(false);
+            attempt.RequestSent = true;
+            return await attempt.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            CancelNativeResumeAttempt(connectionGeneration, "Native pairing import was cancelled by the owning generation.");
+            throw;
+        }
+        catch
+        {
+            FailNativeResumeAttempt(connectionGeneration, NexIrcResumeOutcome.Failed, "The pairing request could not be written.", fallbackSafe: false);
+            throw;
+        }
+    }
+
+    /// <summary>Revokes an unused pairing authorization issued by this live attachment.</summary>
+    public async ValueTask<bool> RevokeNativePairingAuthorizationAsync(
+        int connectionGeneration,
+        string pairingMaterial,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(pairingMaterial);
+        if (!NexIrcResumeProtocol.TryParsePairingMaterial(pairingMaterial, Snapshot.Features.NetworkName, out var code, out _))
+        {
+            return false;
+        }
+
+        ConnectionEpoch epoch;
+        TaskCompletionSource<bool> completion;
+        lock (_gate)
+        {
+            if (_registration != RegistrationState.Registered
+                || _activeEpoch is not { IsActive: true } currentEpoch
+                || currentEpoch.Generation != connectionGeneration)
+            {
+                throw new InvalidOperationException("The pairing revocation belongs to a non-current IRC generation.");
+            }
+
+            if (!NexIrcResumeProtocol.AreAttachmentsSupported(_capabilities.Snapshot)
+                || _nativeResumeSession?.AttachmentId is null
+                || !_options.Endpoint.UseTls
+                || _authenticationState != SaslAuthenticationState.Succeeded)
+            {
+                return false;
+            }
+
+            if (_nativeResumeAttempt is not null || _pairingAuthorizationAttempt is not null || _pairingRevocationAttempt is not null)
+            {
+                throw new InvalidOperationException("Another native recovery or pairing request is already active for this connection generation.");
+            }
+
+            epoch = currentEpoch;
+            completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pairingRevocationAttempt = completion;
+        }
+
+        try
+        {
+            var command = new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build(
+                NexIrcResumeProtocol.Command,
+                [NexIrcResumeProtocol.PairSubcommand, NexIrcResumeProtocol.PairRevokeSubcommand, code]);
+            await QueueOutboundAsync(command, cancellationToken, epoch).ConfigureAwait(false);
+            return await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                if (ReferenceEquals(_pairingRevocationAttempt, completion))
+                {
+                    _pairingRevocationAttempt = null;
+                }
+            }
         }
     }
 
@@ -2697,6 +2886,81 @@ public sealed class ServerSession : IAsyncDisposable
         var subcommand = message.Parameters.Count == 0
             ? string.Empty
             : message.Parameters[0].ToUpperInvariant();
+        if (subcommand == NexIrcResumeProtocol.PairSubcommand)
+        {
+            var pairResponse = message.Parameters.Count >= 2 ? message.Parameters[1].ToUpperInvariant() : string.Empty;
+            if (pairResponse == "CREATED" && message.Parameters.Count >= 5)
+            {
+                TaskCompletionSource<NexIrcPairingAuthorization>? completion;
+                lock (_gate)
+                {
+                    completion = _pairingAuthorizationAttempt;
+                }
+
+                if (completion is not null
+                    && long.TryParse(message.Parameters[3], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var expiry)
+                    && NexIrcResumeProtocol.IsSafeOpaqueValue(message.Parameters[2])
+                    && NexIrcResumeProtocol.IsSafeOpaqueValue(message.Parameters[4]))
+                {
+                    var material = NexIrcResumeProtocol.CreatePairingMaterial(message.Parameters[2], message.Parameters[4]);
+                    completion.TrySetResult(new NexIrcPairingAuthorization(material, DateTimeOffset.FromUnixTimeSeconds(expiry)));
+                }
+                else
+                {
+                    completion?.TrySetException(new InvalidOperationException("The server returned a malformed pairing authorization."));
+                }
+
+                return;
+            }
+
+            if (pairResponse == "REVOKED")
+            {
+                lock (_gate)
+                {
+                    _pairingRevocationAttempt?.TrySetResult(true);
+                }
+                return;
+            }
+
+            if (pairResponse == "REJECT")
+            {
+                var reasonText = message.Parameters.Count >= 3 ? message.Parameters[2] : "MALFORMED";
+                NativeResumeAttempt? pairingAttempt;
+                TaskCompletionSource<NexIrcPairingAuthorization>? completion;
+                TaskCompletionSource<bool>? revocation;
+                lock (_gate)
+                {
+                    pairingAttempt = _nativeResumeAttempt is { IsPairingRequest: true } active ? active : null;
+                    completion = _pairingAuthorizationAttempt;
+                    revocation = _pairingRevocationAttempt;
+                }
+
+                if (pairingAttempt is not null)
+                {
+                    CompleteNativeResumeRejected(
+                        ParseNativeResumeRejection(reasonText),
+                        "The server rejected the pairing request.",
+                        epoch.Generation);
+                }
+                else
+                {
+                    if (revocation is not null)
+                    {
+                        revocation.TrySetResult(false);
+                    }
+                    else
+                    {
+                        completion?.TrySetException(new InvalidOperationException($"The server rejected pairing authorization ({reasonText})."));
+                    }
+                }
+
+                return;
+            }
+
+            FailNativeResumeAttempt(epoch.Generation, NexIrcResumeOutcome.Failed, "The server sent a malformed pairing response.", fallbackSafe: false, reason: NexIrcResumeRejectionReason.Malformed);
+            return;
+        }
+
         if (subcommand == NexIrcResumeProtocol.SessionSubcommand)
         {
             if (message.Parameters.Count >= 3
@@ -4124,6 +4388,8 @@ public sealed class ServerSession : IAsyncDisposable
         public int ConnectionGeneration { get; } = connectionGeneration;
 
         public bool IsAttachmentRequest { get; init; }
+
+        public bool IsPairingRequest { get; init; }
 
         public bool AttachmentCreated { get; set; }
 

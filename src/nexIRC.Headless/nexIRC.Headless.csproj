@@ -5,6 +5,7 @@
     <RootNamespace>nexIRC.Headless</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="..\nexIRC.Application\nexIRC.Application.csproj" />
     <ProjectReference Include="..\nexIRC.Core\nexIRC.Core.csproj" />
     <ProjectReference Include="..\nexIRC.Networking\nexIRC.Networking.csproj" />
   </ItemGroup>

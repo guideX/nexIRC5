@@ -1,4 +1,5 @@
 using System.Text;
+using System.Security.Cryptography;
 using nexIRC.Core.Protocol;
 using nexIRC.Core.State;
 
@@ -184,6 +185,35 @@ public sealed class Phase1BProtocolTests
         Assert.Contains(NexIrcResumeProtocol.FingerprintToken(attachmentToken), accepted, StringComparison.Ordinal);
         Assert.Equal(":server NEXIRC SESSION ATTACHMENT b667e890020f4226a6c5d14e7fb8c6c0 1",
             IrcSensitiveData.RedactLine(":server NEXIRC SESSION ATTACHMENT b667e890020f4226a6c5d14e7fb8c6c0 1"));
+    }
+
+    [Fact]
+    public void PairingMaterialIsNetworkBoundAndRedactedAtEveryWireBoundary()
+    {
+        const string network = "phase42-network";
+        var networkFingerprint = Convert.ToBase64String(SHA256.HashData(Encoding.UTF8.GetBytes(network)).AsSpan(0, 12))
+            .Replace('+', '-')
+            .Replace('/', '_')
+            .TrimEnd('=');
+        var code = $"np1_{networkFingerprint}_{new string('A', 43)}";
+        var material = NexIrcResumeProtocol.CreatePairingMaterial(code, "s7");
+
+        Assert.True(NexIrcResumeProtocol.TryParsePairingMaterial(material, network, out var parsedCode, out var boundary));
+        Assert.Equal(code, parsedCode);
+        Assert.Equal("s7", boundary);
+        Assert.False(NexIrcResumeProtocol.TryParsePairingMaterial(material, "another-network", out _, out _));
+
+        foreach (var line in new[]
+                 {
+                     $"NEXIRC PAIR USE {code} s7",
+                     $"NEXIRC PAIR REVOKE {code}",
+                     $":server NEXIRC PAIR CREATED {code} 1798761600 s7"
+                 })
+        {
+            var redacted = IrcSensitiveData.RedactLine(line);
+            Assert.False(redacted.Contains(code, StringComparison.Ordinal));
+            Assert.Contains(NexIrcResumeProtocol.FingerprintToken(code), redacted, StringComparison.Ordinal);
+        }
     }
 
     private static IrcMessage Parse(string line) => IrcMessageParser.Parse(line).Message!;

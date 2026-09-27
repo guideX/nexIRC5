@@ -21,6 +21,10 @@ public static class NexIrcResumeProtocol
     public const string SessionAckSubcommand = "ACK";
     public const string ResumeSubcommand = "RESUME";
     public const string AttachSubcommand = "ATTACH";
+    public const string PairSubcommand = "PAIR";
+    public const string PairCreateSubcommand = "CREATE";
+    public const string PairUseSubcommand = "USE";
+    public const string PairRevokeSubcommand = "REVOKE";
     public const string BatchType = "nexirc/resume";
     public const string ResumeSequenceTag = "resume-seq";
     public const string ResumePreviousSequenceTag = "resume-prev";
@@ -49,6 +53,57 @@ public static class NexIrcResumeProtocol
         && value.Length <= MaximumOpaqueValueLength
         && !value.Any(static character => char.IsWhiteSpace(character) || char.IsControl(character) || character == ':');
 
+    public static string CreatePairingMaterial(string code, string boundary)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(code);
+        ArgumentException.ThrowIfNullOrWhiteSpace(boundary);
+        if (!IsSafeOpaqueValue(code) || !IsSafeOpaqueValue(boundary))
+        {
+            throw new ArgumentException("The pairing authorization is malformed.", nameof(code));
+        }
+
+        return $"npair1.{code}.{boundary}";
+    }
+
+    public static bool TryParsePairingMaterial(
+        string? material,
+        string? networkIdentity,
+        out string code,
+        out string boundary)
+    {
+        code = string.Empty;
+        boundary = string.Empty;
+        if (string.IsNullOrWhiteSpace(material)
+            || material.Length > MaximumOpaqueValueLength
+            || string.IsNullOrWhiteSpace(networkIdentity))
+        {
+            return false;
+        }
+
+        var parts = material.Split('.', 3, StringSplitOptions.None);
+        if (parts.Length != 3
+            || !string.Equals(parts[0], "npair1", StringComparison.Ordinal)
+            || !IsSafeOpaqueValue(parts[1])
+            || !IsSafeOpaqueValue(parts[2]))
+        {
+            return false;
+        }
+
+        var networkFingerprint = Convert.ToBase64String(
+                SHA256.HashData(Encoding.UTF8.GetBytes(networkIdentity)).AsSpan(0, 12))
+            .Replace('+', '-')
+            .Replace('/', '_')
+            .TrimEnd('=');
+        if (!parts[1].StartsWith($"np1_{networkFingerprint}_", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        code = parts[1];
+        boundary = parts[2];
+        return true;
+    }
+
     public static bool TryReadOpaqueParameters(
         IrcMessage message,
         int startIndex,
@@ -73,6 +128,17 @@ public static class NexIrcResumeProtocol
         second = candidateSecond;
         return true;
     }
+}
+
+/// <summary>
+/// One-time, user-visible authorization to add a device. The material must be
+/// shown only in the explicit pairing surface and must never be logged.
+/// </summary>
+public sealed record NexIrcPairingAuthorization(string Material, DateTimeOffset ExpiresAt)
+{
+    public string Fingerprint => NexIrcResumeProtocol.FingerprintToken(Material);
+
+    public override string ToString() => $"pairing={Fingerprint}; expires={ExpiresAt:O}";
 }
 
 public sealed record NexIrcResumeSupport(

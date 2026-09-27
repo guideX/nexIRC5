@@ -1,4 +1,5 @@
 using System.Text;
+using nexIRC.Application;
 using nexIRC.Core.Networking;
 using nexIRC.Core.Protocol;
 using nexIRC.Core.Session;
@@ -19,7 +20,16 @@ internal static class Program
 
         if (arguments.Server is null)
         {
-            Console.Error.WriteLine("Usage: nexIRC.Headless --server <host> [--port <port>] [--no-tls] [--nick <nick>] [--whois-self] [--transcript <path>]");
+            Console.Error.WriteLine("Usage: nexIRC.Headless --server <host> [--port <port>] [--no-tls] [--nick <nick>] [--whois-self] [--transcript <path>] [--pairing-console --sasl-account <account> --sasl-password-env <variable>]");
+            return 2;
+        }
+
+        if (arguments.PairingConsole && (!OperatingSystem.IsWindows() || !arguments.UseTls
+            || string.IsNullOrWhiteSpace(arguments.SaslAccount)
+            || string.IsNullOrWhiteSpace(arguments.SaslPasswordEnvironment)
+            || string.IsNullOrEmpty(Environment.GetEnvironmentVariable(arguments.SaslPasswordEnvironment))))
+        {
+            Console.Error.WriteLine("Pairing console requires Windows DPAPI, TLS, --sasl-account, and a password in the named environment variable.");
             return 2;
         }
 
@@ -38,7 +48,17 @@ internal static class Program
             Username = arguments.Nickname,
             RealName = "nexIRC 5 headless diagnostic harness",
             RequestedCapabilities = IrcCapabilityCatalog.PreferredPhase1X,
-            Reconnect = new ReconnectPolicy(Enabled: false)
+            Reconnect = new ReconnectPolicy(Enabled: false),
+            SaslPolicy = arguments.PairingConsole ? SaslAuthenticationPolicy.Required : SaslAuthenticationPolicy.Disabled,
+            SaslCredentialProvider = arguments.PairingConsole
+                ? new EnvironmentSaslCredentialProvider(arguments.SaslAccount!, arguments.SaslPasswordEnvironment!)
+                : null,
+            ResumeStateStore = arguments.PairingConsole
+                ? new JsonResumeStateStore(ResumeStatePaths.GetDefaultRoot())
+                : null,
+            ResumeSecretProtector = arguments.PairingConsole
+                ? new WindowsDpapiResumeSecretProtector()
+                : null
         };
         await using var session = new ServerSession(options, new TcpTlsIrcTransportFactory());
         var registered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -64,6 +84,9 @@ internal static class Program
         var rawTask = PrintRawAsync(session, cancellation.Token);
         var outboundTask = PrintOutboundAsync(session, cancellation.Token);
         var runTask = session.RunAsync(cancellation.Token);
+        var pairingConsoleTask = arguments.PairingConsole
+            ? RunPairingConsoleAsync(session, registered.Task, cancellation.Token)
+            : Task.CompletedTask;
         try
         {
             if (arguments.WhoisSelf)
@@ -91,6 +114,7 @@ internal static class Program
 
         await rawTask.ConfigureAwait(false);
         await outboundTask.ConfigureAwait(false);
+        await pairingConsoleTask.ConfigureAwait(false);
         PrintDiagnostics(session.Snapshot);
         return session.Snapshot.State == ServerSessionState.Failed ? 1 : 0;
     }
@@ -187,7 +211,7 @@ internal static class Program
         {
             await foreach (var item in session.ReadRawEventsAsync(cancellationToken).ConfigureAwait(false))
             {
-                Console.WriteLine($"RAW  {item.RawLine}");
+                Console.WriteLine($"RAW  {IrcSensitiveData.RedactLine(item.RawLine)}");
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -226,6 +250,59 @@ internal static class Program
         Console.WriteLine($"Channels: {snapshot.Channels.Count}; queries: {snapshot.Queries.Count}");
     }
 
+    private static async Task RunPairingConsoleAsync(
+        ServerSession session,
+        Task registered,
+        CancellationToken cancellationToken)
+    {
+        await registered.WaitAsync(cancellationToken).ConfigureAwait(false);
+        Console.WriteLine("PAIRING_READY commands: pair create | pair use <pairing-value> | pair revoke <pairing-value> | exit");
+        while (await Console.In.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+        {
+            var command = line.Trim();
+            if (command.Equals("pair create", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    var authorization = await session.RequestNativePairingAuthorizationAsync(
+                        session.Snapshot.ConnectionGeneration,
+                        cancellationToken).ConfigureAwait(false);
+                    Console.WriteLine($"PAIRING_CODE {authorization.Material} expires={authorization.ExpiresAt:O}");
+                }
+                catch (Exception exception) when (exception is InvalidOperationException or IOException or OperationCanceledException)
+                {
+                    Console.WriteLine($"PAIRING_RESULT outcome=Rejected type={exception.GetType().Name}");
+                }
+            }
+            else if (command.StartsWith("pair use ", StringComparison.OrdinalIgnoreCase))
+            {
+                var material = command["pair use ".Length..].Trim();
+                var result = await session.RequestNativeAttachmentWithPairingAsync(
+                    session.Snapshot.ConnectionGeneration,
+                    material,
+                    cancellationToken).ConfigureAwait(false);
+                Console.WriteLine($"PAIRING_RESULT outcome={result.Outcome} reason={result.RejectionReason?.ToString() ?? "none"} created={result.AttachmentCreated.ToString().ToLowerInvariant()}");
+            }
+            else if (command.StartsWith("pair revoke ", StringComparison.OrdinalIgnoreCase))
+            {
+                var material = command["pair revoke ".Length..].Trim();
+                var revoked = await session.RevokeNativePairingAuthorizationAsync(
+                    session.Snapshot.ConnectionGeneration,
+                    material,
+                    cancellationToken).ConfigureAwait(false);
+                Console.WriteLine($"PAIRING_RESULT outcome={(revoked ? "Revoked" : "Rejected")}");
+            }
+            else if (command.Equals("exit", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+            else
+            {
+                Console.WriteLine("PAIRING_RESULT outcome=Usage");
+            }
+        }
+    }
+
     private static string FormatPrefix(IrcPrefixGrammar? prefix) => prefix is null ? "unknown" : $"({new string(prefix.Modes.ToArray())}){new string(prefix.Prefixes.ToArray())}";
 
     private sealed class Arguments
@@ -236,6 +313,9 @@ internal static class Program
         public bool UseTls { get; private set; } = true;
         public string Nickname { get; private set; } = "nexIRC5";
         public bool WhoisSelf { get; private set; }
+        public bool PairingConsole { get; private set; }
+        public string? SaslAccount { get; private set; }
+        public string? SaslPasswordEnvironment { get; private set; }
 
         public static Arguments Parse(string[] args)
         {
@@ -259,6 +339,15 @@ internal static class Program
                     case "--whois-self":
                         result.WhoisSelf = true;
                         break;
+                    case "--pairing-console":
+                        result.PairingConsole = true;
+                        break;
+                    case "--sasl-account" when index + 1 < args.Length:
+                        result.SaslAccount = args[++index];
+                        break;
+                    case "--sasl-password-env" when index + 1 < args.Length:
+                        result.SaslPasswordEnvironment = args[++index];
+                        break;
                     case "--no-tls":
                         result.UseTls = false;
                         break;
@@ -266,6 +355,21 @@ internal static class Program
             }
 
             return result;
+        }
+    }
+
+    private sealed class EnvironmentSaslCredentialProvider(string account, string passwordEnvironment) : ISaslCredentialProvider
+    {
+        public ValueTask<SaslCredential?> GetCredentialsAsync(
+            IrcEndpoint endpoint,
+            string mechanism,
+            CancellationToken cancellationToken = default)
+        {
+            _ = endpoint;
+            _ = mechanism;
+            cancellationToken.ThrowIfCancellationRequested();
+            var password = Environment.GetEnvironmentVariable(passwordEnvironment);
+            return ValueTask.FromResult(password is null ? null : new SaslCredential(account, password));
         }
     }
 }
