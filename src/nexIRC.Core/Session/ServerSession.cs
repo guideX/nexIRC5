@@ -358,7 +358,41 @@ public sealed class ServerSession : IAsyncDisposable
         int connectionGeneration,
         CancellationToken cancellationToken = default)
     {
+        string? sessionCredential;
+        string? boundary;
+        lock (_gate)
+        {
+            sessionCredential = _nativeResumeSession?.SessionCredential;
+            boundary = _nativeResumeSession?.AuthoritativeBoundary;
+        }
+
+        if (sessionCredential is null || boundary is null)
+        {
+            return NexIrcResumeExecutionResult.Unsupported(
+                "The current generation has no retained session grant for a new attachment.");
+        }
+
+        return await RequestNativeAttachmentAsync(
+            connectionGeneration,
+            sessionCredential,
+            boundary,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Imports a separately transferred attachment grant for this connection.
+    /// The grant is sent only over the already-authenticated TLS generation;
+    /// only the new attachment credentials returned by the server are saved.
+    /// </summary>
+    public async ValueTask<NexIrcResumeExecutionResult> RequestNativeAttachmentAsync(
+        int connectionGeneration,
+        string sessionCredential,
+        string authoritativeBoundary,
+        CancellationToken cancellationToken = default)
+    {
         cancellationToken.ThrowIfCancellationRequested();
+        ArgumentException.ThrowIfNullOrWhiteSpace(sessionCredential);
+        ArgumentException.ThrowIfNullOrWhiteSpace(authoritativeBoundary);
         ConnectionEpoch epoch;
         NativeResumeAttempt attempt;
         NexIrcResumeSession sessionIdentity;
@@ -373,10 +407,11 @@ public sealed class ServerSession : IAsyncDisposable
 
             if (!NexIrcResumeProtocol.AreAttachmentsSupported(_capabilities.Snapshot)
                 || _nativeResumeSession is null
-                || _nativeResumeSession.SessionCredential is null)
+                || !NexIrcResumeProtocol.IsSafeOpaqueValue(sessionCredential)
+                || !NexIrcResumeProtocol.IsSafeOpaqueValue(authoritativeBoundary))
             {
                 return NexIrcResumeExecutionResult.Unsupported(
-                    "The current generation did not negotiate native attachments or has no retained session grant.");
+                    "The current generation did not negotiate native attachments or the imported grant was malformed.");
             }
 
             if (_restoredResumeActive && !TryActivateRestoredResumeStateUnsafe())
@@ -405,7 +440,7 @@ public sealed class ServerSession : IAsyncDisposable
 
             epoch = currentEpoch;
             sessionIdentity = _nativeResumeSession;
-            attempt = new NativeResumeAttempt(connectionGeneration, sessionIdentity.AuthoritativeBoundary)
+            attempt = new NativeResumeAttempt(connectionGeneration, authoritativeBoundary)
             {
                 IsAttachmentRequest = true
             };
@@ -415,13 +450,13 @@ public sealed class ServerSession : IAsyncDisposable
         _continuity.RecordDiagnostic(
             connectionGeneration,
             ContinuityDiagnosticKind.RecoveryRequestStarted,
-            $"NexIrcResume attachment requested boundary={sessionIdentity.AuthoritativeBoundary}; session={sessionIdentity.TokenFingerprint}");
+            $"NexIrcResume attachment requested boundary={authoritativeBoundary}; session={sessionIdentity.TokenFingerprint}");
 
         try
         {
             var command = new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build(
                 NexIrcResumeProtocol.Command,
-                [NexIrcResumeProtocol.AttachSubcommand, sessionIdentity.SessionCredential!, sessionIdentity.AuthoritativeBoundary]);
+                [NexIrcResumeProtocol.AttachSubcommand, sessionCredential, authoritativeBoundary]);
             await QueueOutboundAsync(command, cancellationToken, epoch).ConfigureAwait(false);
             attempt.RequestSent = true;
             var result = await attempt.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
