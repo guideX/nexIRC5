@@ -320,6 +320,10 @@ public sealed class JsonResumeStateStore : IResumeStateStore, IDisposable
 
                         state = state with { Version = ClientResumeStateRecord.CurrentVersion };
                     }
+                    else if (state.Version == 2)
+                    {
+                        state = state with { Version = ClientResumeStateRecord.CurrentVersion };
+                    }
 
                     if (!state.IsSupported)
                     {
@@ -450,7 +454,8 @@ public sealed class JsonResumeStateStore : IResumeStateStore, IDisposable
             state.TokenGeneration,
             state.PendingTokenGeneration,
             state.AcknowledgedTokenGeneration,
-            state.AuthoritativeBoundary));
+            state.AuthoritativeBoundary,
+            state.ProtectedPairingRecoveryCredential is { Length: > 0 }));
 
     public async ValueTask<ResumeStateStoreResult> DeleteAsync(string networkIdentity, CancellationToken cancellationToken = default)
     {
@@ -521,7 +526,8 @@ internal readonly record struct ResumeStatePersistenceObservation(
     int CurrentGeneration,
     int? PendingGeneration,
     int AcknowledgedGeneration,
-    string AuthoritativeBoundary);
+    string AuthoritativeBoundary,
+    bool PairingRecoveryPending);
 
 public static class ResumeStatePaths
 {

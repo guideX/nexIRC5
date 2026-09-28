@@ -1,6 +1,7 @@
 namespace nexIRC.Core.Session;
 
 using nexIRC.Core.Networking;
+using nexIRC.Core.Protocol;
 
 /// <summary>
 /// The only client-side durable resume format currently understood by nexIRC.
@@ -22,11 +23,15 @@ public sealed record ClientResumeStateRecord(
     DateTimeOffset? ExpiresAt = null,
     string? ServerGeneration = null,
     Guid? AttachmentId = null,
-    byte[]? ProtectedSessionCredential = null)
+    byte[]? ProtectedSessionCredential = null,
+    byte[]? ProtectedPairingRecoveryCredential = null,
+    string? PairingRecoveryBoundary = null,
+    bool PairingRecoveryCredentialsDurable = false)
 {
-    public const int CurrentVersion = 2;
+    public const int CurrentVersion = 3;
     public const int MaximumProtectedTokenBytes = 16 * 1024;
     public const int MaximumProtectedSessionCredentialBytes = 16 * 1024;
+    public const int MaximumProtectedPairingRecoveryCredentialBytes = 16 * 1024;
 
     public bool IsSupported => Version == CurrentVersion;
 
@@ -43,6 +48,11 @@ public sealed record ClientResumeStateRecord(
         && (AttachmentId is null || AttachmentId != Guid.Empty)
         && (ProtectedSessionCredential is null
             || ProtectedSessionCredential.Length is > 0 and <= MaximumProtectedSessionCredentialBytes)
+        && (ProtectedPairingRecoveryCredential is null
+            ? PairingRecoveryBoundary is null && !PairingRecoveryCredentialsDurable
+            : ProtectedPairingRecoveryCredential.Length is > 0 and <= MaximumProtectedPairingRecoveryCredentialBytes
+                && !string.IsNullOrWhiteSpace(PairingRecoveryBoundary)
+                && NexIrcResumeProtocol.IsSafeOpaqueValue(PairingRecoveryBoundary))
         && (ProtectedPendingToken is null
             ? PendingTokenGeneration is null
             : ProtectedPendingToken.Length is > 0 and <= MaximumProtectedTokenBytes
@@ -161,7 +171,8 @@ public sealed class InMemoryResumeStateStore : IResumeStateStore
             {
                 ProtectedCurrentToken = state.ProtectedCurrentToken.ToArray(),
                 ProtectedPendingToken = state.ProtectedPendingToken?.ToArray(),
-                ProtectedSessionCredential = state.ProtectedSessionCredential?.ToArray()
+                ProtectedSessionCredential = state.ProtectedSessionCredential?.ToArray(),
+                ProtectedPairingRecoveryCredential = state.ProtectedPairingRecoveryCredential?.ToArray()
             };
         }
 

@@ -24,6 +24,8 @@ public static class NexIrcResumeProtocol
     public const string PairSubcommand = "PAIR";
     public const string PairCreateSubcommand = "CREATE";
     public const string PairUseSubcommand = "USE";
+    public const string PairRecoverSubcommand = "RECOVER";
+    public const string PairCustodySubcommand = "CUSTODY";
     public const string PairRevokeSubcommand = "REVOKE";
     public const string BatchType = "nexirc/resume";
     public const string ResumeSequenceTag = "resume-seq";
@@ -63,6 +65,22 @@ public static class NexIrcResumeProtocol
         }
 
         return $"npair1.{code}.{boundary}";
+    }
+
+    public static string CreatePairingRecoveryCredential()
+    {
+        var bytes = RandomNumberGenerator.GetBytes(32);
+        try
+        {
+            return "phr1_" + Convert.ToBase64String(bytes)
+                .Replace('+', '-')
+                .Replace('/', '_')
+                .TrimEnd('=');
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(bytes);
+        }
     }
 
     public static bool TryParsePairingMaterial(
@@ -323,4 +341,19 @@ public sealed record NexIrcResumeExecutionResult(
         detail,
         NexIrcResumeRejectionReason.Unsupported,
         FallbackSafe: true);
+
+    public static NexIrcResumeExecutionResult Failed(string detail) => new(
+        NexIrcResumeOutcome.Failed,
+        CapabilityNegotiated: true,
+        RequestSent: false,
+        ReplayAccepted: false,
+        ReplayCompleted: false,
+        ExactBoundaryRecovered: false,
+        ReplayedEventCount: 0,
+        DuplicateEventsSuppressed: 0,
+        RequestedBoundary: null,
+        FinalBoundary: null,
+        detail,
+        NexIrcResumeRejectionReason.TemporaryFailure,
+        FallbackSafe: false);
 }

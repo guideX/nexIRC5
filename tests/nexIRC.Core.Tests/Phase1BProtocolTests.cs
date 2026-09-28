@@ -196,6 +196,7 @@ public sealed class Phase1BProtocolTests
             .Replace('/', '_')
             .TrimEnd('=');
         var code = $"np1_{networkFingerprint}_{new string('A', 43)}";
+        var recoveryReceipt = "phr1_" + new string('R', 43);
         var material = NexIrcResumeProtocol.CreatePairingMaterial(code, "s7");
 
         Assert.True(NexIrcResumeProtocol.TryParsePairingMaterial(material, network, out var parsedCode, out var boundary));
@@ -205,7 +206,7 @@ public sealed class Phase1BProtocolTests
 
         foreach (var line in new[]
                  {
-                     $"NEXIRC PAIR USE {code} s7",
+                     $"NEXIRC PAIR USE {code} s7 {recoveryReceipt}",
                      $"NEXIRC PAIR REVOKE {code}",
                      $":server NEXIRC PAIR CREATED {code} 1798761600 s7"
                  })
@@ -214,6 +215,21 @@ public sealed class Phase1BProtocolTests
             Assert.False(redacted.Contains(code, StringComparison.Ordinal));
             Assert.Contains(NexIrcResumeProtocol.FingerprintToken(code), redacted, StringComparison.Ordinal);
         }
+
+        foreach (var line in new[]
+                 {
+                     $"NEXIRC PAIR USE {code} s7 {recoveryReceipt}",
+                     $"NEXIRC PAIR RECOVER {recoveryReceipt}",
+                     $"NEXIRC PAIR CUSTODY {recoveryReceipt} b667e890020f4226a6c5d14e7fb8c6c0"
+                 })
+        {
+            var redacted = IrcSensitiveData.RedactLine(line);
+            Assert.False(redacted.Contains(recoveryReceipt, StringComparison.Ordinal));
+            Assert.Contains(NexIrcResumeProtocol.FingerprintToken(recoveryReceipt), redacted, StringComparison.Ordinal);
+        }
+
+        Assert.Equal(":server NEXIRC PAIR CUSTODY OK b667e890020f4226a6c5d14e7fb8c6c0",
+            IrcSensitiveData.RedactLine(":server NEXIRC PAIR CUSTODY OK b667e890020f4226a6c5d14e7fb8c6c0"));
     }
 
     private static IrcMessage Parse(string line) => IrcMessageParser.Parse(line).Message!;

@@ -78,6 +78,9 @@ public sealed class ServerSession : IAsyncDisposable
     private NexIrcResumeSession? _nativeResumeSession;
     private NexIrcResumeSession? _freshSessionAfterRestoredResume;
     private ClientResumeStateRecord? _loadedResumeState;
+    private string? _pairingRecoveryCredential;
+    private string? _pairingRecoveryBoundary;
+    private bool _pairingRecoveryCredentialsDurable;
     private DateTimeOffset? _resumeStateCreatedAt;
     private bool _restoredResumeActive;
     private bool _resumeStateLoadCompleted;
@@ -253,6 +256,28 @@ public sealed class ServerSession : IAsyncDisposable
             lock (_gate)
             {
                 return _nativeResumeSession;
+            }
+        }
+    }
+
+    public bool HasPendingNativePairingRecovery
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _pairingRecoveryCredential is not null && _pairingRecoveryBoundary is not null;
+            }
+        }
+    }
+
+    public bool NativePairingCredentialsAreDurable
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _pairingRecoveryCredentialsDurable;
             }
         }
     }
@@ -542,8 +567,9 @@ public sealed class ServerSession : IAsyncDisposable
 
     /// <summary>
     /// Imports a user supplied pairing value on an authenticated TLS
-    /// connection. The value is transient and only the resulting attachment
-    /// credentials are protected in client persistence.
+    /// connection. A protected recovery receipt is persisted before submission;
+    /// it is retired only after the resulting attachment credentials are
+    /// durably stored and the server confirms custody.
     /// </summary>
     public async ValueTask<NexIrcResumeExecutionResult> RequestNativeAttachmentWithPairingAsync(
         int connectionGeneration,
@@ -558,8 +584,15 @@ public sealed class ServerSession : IAsyncDisposable
             return NexIrcResumeExecutionResult.Unsupported("The pairing value is malformed or belongs to another network.");
         }
 
+        if (_resumeStateStore is null || _resumeSecretProtector is null)
+        {
+            return NexIrcResumeExecutionResult.Unsupported("Pairing requires an available protected resume-state store so handoff recovery can survive process death.");
+        }
+
         ConnectionEpoch epoch;
         NativeResumeAttempt attempt;
+        NexIrcResumeSession prePairSession;
+        string recoveryCredential;
         lock (_gate)
         {
             if (_registration != RegistrationState.Registered
@@ -582,20 +615,73 @@ public sealed class ServerSession : IAsyncDisposable
                 throw new InvalidOperationException("A native resume, attachment, or pairing request is already active for this connection generation.");
             }
 
-            epoch = currentEpoch;
-            attempt = new NativeResumeAttempt(connectionGeneration, boundary)
+            if (_nativeResumeSession is not { } currentSession)
             {
-                IsAttachmentRequest = true,
-                IsPairingRequest = true
-            };
-            _nativeResumeAttempt = attempt;
+                return NexIrcResumeExecutionResult.Unsupported("Pairing requires a current protected attachment state.");
+            }
+
+            if (_pairingRecoveryCredential is not null
+                && !string.Equals(_pairingRecoveryBoundary, boundary, StringComparison.Ordinal))
+            {
+                return NexIrcResumeExecutionResult.Unsupported("An earlier pairing handoff is still pending recovery or custody confirmation.");
+            }
+
+            recoveryCredential = _pairingRecoveryCredential ?? NexIrcResumeProtocol.CreatePairingRecoveryCredential();
+            _pairingRecoveryCredential = recoveryCredential;
+            _pairingRecoveryBoundary = boundary;
+            _pairingRecoveryCredentialsDurable = false;
+            prePairSession = currentSession;
         }
+
+        ConnectionEpoch? submissionEpoch = null;
+        NativeResumeAttempt? submissionAttempt = null;
+        var sessionToPersist = prePairSession;
+        for (var persistenceAttempt = 0; persistenceAttempt < 4; persistenceAttempt++)
+        {
+            if (!await PersistNativeResumeStateAsync(sessionToPersist).ConfigureAwait(false))
+            {
+                return NexIrcResumeExecutionResult.Failed("The protected pairing handoff receipt could not be durably stored before submission.");
+            }
+
+            lock (_gate)
+            {
+                if (_registration != RegistrationState.Registered
+                    || _activeEpoch is not { IsActive: true } currentEpoch
+                    || currentEpoch.Generation != connectionGeneration
+                    || _nativeResumeSession is not { } latestSession)
+                {
+                    return NexIrcResumeExecutionResult.Failed("The pairing import became stale before submission.");
+                }
+
+                if (ReferenceEquals(latestSession, sessionToPersist))
+                {
+                    submissionEpoch = currentEpoch;
+                    submissionAttempt = new NativeResumeAttempt(connectionGeneration, boundary)
+                    {
+                        IsAttachmentRequest = true,
+                        IsPairingRequest = true
+                    };
+                    _nativeResumeAttempt = submissionAttempt;
+                    break;
+                }
+
+                sessionToPersist = latestSession;
+            }
+        }
+
+        if (submissionEpoch is null || submissionAttempt is null)
+        {
+            return NexIrcResumeExecutionResult.Failed("The pairing import changed too quickly to persist a stable recovery point.");
+        }
+
+        epoch = submissionEpoch;
+        attempt = submissionAttempt;
 
         try
         {
             var command = new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build(
                 NexIrcResumeProtocol.Command,
-                [NexIrcResumeProtocol.PairSubcommand, NexIrcResumeProtocol.PairUseSubcommand, code, boundary]);
+                [NexIrcResumeProtocol.PairSubcommand, NexIrcResumeProtocol.PairUseSubcommand, code, boundary, recoveryCredential]);
             await QueueOutboundAsync(command, cancellationToken, epoch).ConfigureAwait(false);
             attempt.RequestSent = true;
             return await attempt.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -608,6 +694,72 @@ public sealed class ServerSession : IAsyncDisposable
         catch
         {
             FailNativeResumeAttempt(connectionGeneration, NexIrcResumeOutcome.Failed, "The pairing request could not be written.", fallbackSafe: false);
+            throw;
+        }
+    }
+
+    public async ValueTask<NexIrcResumeExecutionResult> RequestNativePairingRecoveryAsync(
+        int connectionGeneration,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ConnectionEpoch epoch;
+        NativeResumeAttempt attempt;
+        string recoveryCredential;
+        string boundary;
+        lock (_gate)
+        {
+            if (_registration != RegistrationState.Registered
+                || _activeEpoch is not { IsActive: true } currentEpoch
+                || currentEpoch.Generation != connectionGeneration)
+            {
+                throw new InvalidOperationException("The pairing recovery belongs to a non-current IRC generation.");
+            }
+
+            if (!NexIrcResumeProtocol.AreAttachmentsSupported(_capabilities.Snapshot)
+                || !_options.Endpoint.UseTls
+                || _authenticationState != SaslAuthenticationState.Succeeded
+                || _nativeResumeSession is null
+                || _pairingRecoveryCredential is not { } receipt
+                || _pairingRecoveryBoundary is not { } savedBoundary)
+            {
+                return NexIrcResumeExecutionResult.Unsupported("No authenticated, protected pairing handoff is available to recover.");
+            }
+
+            if (_nativeResumeAttempt is not null || _pairingAuthorizationAttempt is not null || _pairingRevocationAttempt is not null)
+            {
+                throw new InvalidOperationException("Another native recovery or pairing request is active for this connection generation.");
+            }
+
+            epoch = currentEpoch;
+            recoveryCredential = receipt;
+            boundary = savedBoundary;
+            attempt = new NativeResumeAttempt(connectionGeneration, boundary)
+            {
+                IsAttachmentRequest = true,
+                IsPairingRequest = true,
+                IsPairingRecoveryRequest = true
+            };
+            _nativeResumeAttempt = attempt;
+        }
+
+        try
+        {
+            var command = new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build(
+                NexIrcResumeProtocol.Command,
+                [NexIrcResumeProtocol.PairSubcommand, NexIrcResumeProtocol.PairRecoverSubcommand, recoveryCredential]);
+            await QueueOutboundAsync(command, cancellationToken, epoch).ConfigureAwait(false);
+            attempt.RequestSent = true;
+            return await attempt.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            CancelNativeResumeAttempt(connectionGeneration, "Pairing handoff recovery was cancelled by the owning generation.");
+            throw;
+        }
+        catch
+        {
+            FailNativeResumeAttempt(connectionGeneration, NexIrcResumeOutcome.Failed, "The pairing handoff recovery request could not be written.", fallbackSafe: false);
             throw;
         }
     }
@@ -1271,6 +1423,9 @@ public sealed class ServerSession : IAsyncDisposable
             var sessionCredential = state.ProtectedSessionCredential is { Length: > 0 } protectedSessionCredential
                 ? _resumeSecretProtector.Unprotect(protectedSessionCredential, _resumeNetworkIdentity)
                 : null;
+            var pairingRecoveryCredential = state.ProtectedPairingRecoveryCredential is { Length: > 0 } protectedPairingRecoveryCredential
+                ? _resumeSecretProtector.Unprotect(protectedPairingRecoveryCredential, _resumeNetworkIdentity)
+                : null;
             var restored = NexIrcResumeSession.FromDurableState(
                 currentToken,
                 pendingToken,
@@ -1284,6 +1439,9 @@ public sealed class ServerSession : IAsyncDisposable
                 _loadedResumeState = state;
                 _resumeStateCreatedAt = state.CreatedAt;
                 _nativeResumeSession = restored;
+                _pairingRecoveryCredential = pairingRecoveryCredential;
+                _pairingRecoveryBoundary = state.PairingRecoveryBoundary;
+                _pairingRecoveryCredentialsDurable = state.PairingRecoveryCredentialsDurable;
                 _restoredResumeActive = true;
             }
         }
@@ -1334,9 +1492,15 @@ public sealed class ServerSession : IAsyncDisposable
         var account = accountIdentity ?? _authenticatedAccountHint ?? _options.Username;
         var now = DateTimeOffset.UtcNow;
         DateTimeOffset createdAt;
+        string? pairingRecoveryCredential;
+        string? pairingRecoveryBoundary;
+        bool pairingRecoveryCredentialsDurable;
         lock (_gate)
         {
             createdAt = _resumeStateCreatedAt ?? now;
+            pairingRecoveryCredential = _pairingRecoveryCredential;
+            pairingRecoveryBoundary = _pairingRecoveryBoundary;
+            pairingRecoveryCredentialsDurable = _pairingRecoveryCredentialsDurable;
         }
 
         try
@@ -1359,7 +1523,12 @@ public sealed class ServerSession : IAsyncDisposable
                 AttachmentId: session.AttachmentId,
                 ProtectedSessionCredential: session.SessionCredential is { } sessionCredential
                     ? _resumeSecretProtector.Protect(sessionCredential, _resumeNetworkIdentity)
-                    : null);
+                    : null,
+                ProtectedPairingRecoveryCredential: pairingRecoveryCredential is { } recoveryCredential
+                    ? _resumeSecretProtector.Protect(recoveryCredential, _resumeNetworkIdentity)
+                    : null,
+                PairingRecoveryBoundary: pairingRecoveryBoundary,
+                PairingRecoveryCredentialsDurable: pairingRecoveryCredentialsDurable);
             var result = await _resumeStateStore.SaveAsync(state, cancellationToken).ConfigureAwait(false);
             if (!result.Succeeded)
             {
@@ -1416,6 +1585,9 @@ public sealed class ServerSession : IAsyncDisposable
                     _loadedResumeState = null;
                     _nativeResumeSession = null;
                     _freshSessionAfterRestoredResume = null;
+                    _pairingRecoveryCredential = null;
+                    _pairingRecoveryBoundary = null;
+                    _pairingRecoveryCredentialsDurable = false;
                     _restoredResumeActive = false;
                 }
             }
@@ -2922,6 +3094,15 @@ public sealed class ServerSession : IAsyncDisposable
                 return;
             }
 
+            if (pairResponse == NexIrcResumeProtocol.PairCustodySubcommand
+                && message.Parameters.Count >= 4
+                && string.Equals(message.Parameters[2], "OK", StringComparison.OrdinalIgnoreCase)
+                && Guid.TryParseExact(message.Parameters[3], "N", out var completedAttachmentId))
+            {
+                await HandlePairingCustodyAcceptedAsync(completedAttachmentId).ConfigureAwait(false);
+                return;
+            }
+
             if (pairResponse == "REJECT")
             {
                 var reasonText = message.Parameters.Count >= 3 ? message.Parameters[2] : "MALFORMED";
@@ -3064,6 +3245,33 @@ public sealed class ServerSession : IAsyncDisposable
         _ = connectionCts;
     }
 
+    private async Task HandlePairingCustodyAcceptedAsync(Guid attachmentId)
+    {
+        NexIrcResumeSession? current;
+        lock (_gate)
+        {
+            if (_nativeResumeSession?.AttachmentId != attachmentId
+                || _pairingRecoveryCredential is null
+                || !_pairingRecoveryCredentialsDurable)
+            {
+                return;
+            }
+
+            current = _nativeResumeSession;
+            _pairingRecoveryCredential = null;
+            _pairingRecoveryBoundary = null;
+            _pairingRecoveryCredentialsDurable = false;
+        }
+
+        if (current is not null && !await PersistNativeResumeStateAsync(current).ConfigureAwait(false))
+        {
+            // The server has confirmed custody. Keep the already committed
+            // attachment credentials usable even if retiring the local receipt
+            // record needs another normal state write.
+            _continuity.RecordDiagnostic(_connectionGeneration, ContinuityDiagnosticKind.RecoveryRequestFailed, "Protected pairing receipt cleanup could not be durably committed after server custody confirmation.");
+        }
+    }
+
     private async Task HandleNativeAttachmentAcceptedAsync(
         IrcMessage message,
         int generation,
@@ -3089,6 +3297,7 @@ public sealed class ServerSession : IAsyncDisposable
 
         NexIrcResumeSession? attached = null;
         var requestMismatch = false;
+        var pairingHandoffReceived = false;
         lock (_gate)
         {
             if (_nativeResumeAttempt is not { ConnectionGeneration: var attemptGeneration, IsAttachmentRequest: true } attempt
@@ -3100,6 +3309,12 @@ public sealed class ServerSession : IAsyncDisposable
             }
             else
             {
+                pairingHandoffReceived = attempt.IsPairingRequest && _pairingRecoveryCredential is not null;
+                if (pairingHandoffReceived)
+                {
+                    _pairingRecoveryCredentialsDurable = true;
+                }
+
                 attached = new NexIrcResumeSession(
                     message.Parameters[3],
                     message.Parameters[4],
@@ -3122,6 +3337,14 @@ public sealed class ServerSession : IAsyncDisposable
 
         if (!await PersistNativeResumeStateAsync(attached).ConfigureAwait(false))
         {
+            if (pairingHandoffReceived)
+            {
+                lock (_gate)
+                {
+                    _pairingRecoveryCredentialsDurable = false;
+                }
+            }
+
             FailNativeResumeAttempt(
                 generation,
                 NexIrcResumeOutcome.Failed,
@@ -3146,6 +3369,35 @@ public sealed class ServerSession : IAsyncDisposable
             attempt.ReplayAccepted = true;
             attempt.AcceptedBoundary = attached.AuthoritativeBoundary;
         }
+
+        if (pairingHandoffReceived)
+        {
+            await SendPairingCustodyAcknowledgementAsync(attached, generation, connectionCts.Token).ConfigureAwait(false);
+        }
+    }
+
+    private async Task SendPairingCustodyAcknowledgementAsync(
+        NexIrcResumeSession session,
+        int generation,
+        CancellationToken cancellationToken)
+    {
+        string? recoveryCredential;
+        ConnectionEpoch? epoch;
+        lock (_gate)
+        {
+            recoveryCredential = _pairingRecoveryCredentialsDurable ? _pairingRecoveryCredential : null;
+            epoch = _activeEpoch is { IsActive: true } current && current.Generation == generation ? current : null;
+        }
+
+        if (recoveryCredential is null || epoch is null || session.AttachmentId is not { } attachmentId)
+        {
+            return;
+        }
+
+        var command = new IrcCommandBuilder(_options.MaximumOutboundLineBytes).Build(
+            NexIrcResumeProtocol.Command,
+            [NexIrcResumeProtocol.PairSubcommand, NexIrcResumeProtocol.PairCustodySubcommand, recoveryCredential, attachmentId.ToString("N")]);
+        await QueueOutboundAsync(command, cancellationToken, epoch).ConfigureAwait(false);
     }
 
     private async Task HandleNativeAttachmentAnnouncementAsync(IrcMessage message, int generation)
@@ -3565,6 +3817,13 @@ public sealed class ServerSession : IAsyncDisposable
             }
 
             completedSession = _nativeResumeSession = _nativeResumeSession?.Advance(boundary);
+            if (!attempt.IsPairingRequest && _pairingRecoveryCredentialsDurable)
+            {
+                _pairingRecoveryCredential = null;
+                _pairingRecoveryBoundary = null;
+                _pairingRecoveryCredentialsDurable = false;
+            }
+
             _restoredResumeActive = false;
             _freshSessionAfterRestoredResume = null;
             result = new NexIrcResumeExecutionResult(
@@ -4390,6 +4649,8 @@ public sealed class ServerSession : IAsyncDisposable
         public bool IsAttachmentRequest { get; init; }
 
         public bool IsPairingRequest { get; init; }
+
+        public bool IsPairingRecoveryRequest { get; init; }
 
         public bool AttachmentCreated { get; set; }
 

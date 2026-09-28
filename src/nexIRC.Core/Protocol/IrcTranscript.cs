@@ -166,6 +166,21 @@ public static class IrcSensitiveData
                 && tokens.Length >= (tokens[2].Equals("USE", StringComparison.OrdinalIgnoreCase) ? 5 : 4))
             {
                 tokens[3] = $"<redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[3])}>";
+                if (tokens[2].Equals("USE", StringComparison.OrdinalIgnoreCase) && tokens.Length >= 6)
+                {
+                    tokens[5] = $"<redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[5])}>";
+                }
+
+                return prefix + string.Join(' ', tokens);
+            }
+
+            if ((tokens[2].Equals(NexIrcResumeProtocol.PairRecoverSubcommand, StringComparison.OrdinalIgnoreCase)
+                    || tokens[2].Equals(NexIrcResumeProtocol.PairCustodySubcommand, StringComparison.OrdinalIgnoreCase))
+                && tokens.Length >= 4
+                && !tokens[3].Equals("OK", StringComparison.OrdinalIgnoreCase)
+                && !tokens[3].Equals("REJECT", StringComparison.OrdinalIgnoreCase))
+            {
+                tokens[3] = $"<redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[3])}>";
                 return prefix + string.Join(' ', tokens);
             }
         }

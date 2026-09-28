@@ -4300,10 +4300,24 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         bool createNewAttachment,
         CancellationToken cancellationToken)
     {
-        var native = createNewAttachment
-            ? await session.RequestNativeAttachmentAsync(generation, cancellationToken).ConfigureAwait(false)
-            : await session.RequestNativeResumeAsync(generation, cancellationToken).ConfigureAwait(false);
-        if (createNewAttachment && native is { Outcome: NexIrcResumeOutcome.Completed, AttachmentCreated: true })
+        NexIrcResumeExecutionResult native;
+        if (!createNewAttachment && session.HasPendingNativePairingRecovery && !session.NativePairingCredentialsAreDurable)
+        {
+            native = await session.RequestNativePairingRecoveryAsync(generation, cancellationToken).ConfigureAwait(false);
+            if (native.Outcome == NexIrcResumeOutcome.Rejected
+                && native.RejectionReason == NexIrcResumeRejectionReason.UnknownToken)
+            {
+                native = await session.RequestNativeResumeAsync(generation, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        else
+        {
+            native = createNewAttachment
+                ? await session.RequestNativeAttachmentAsync(generation, cancellationToken).ConfigureAwait(false)
+                : await session.RequestNativeResumeAsync(generation, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (native is { Outcome: NexIrcResumeOutcome.Completed, AttachmentCreated: true })
         {
             entry.NativeAttachmentEstablished = true;
         }
