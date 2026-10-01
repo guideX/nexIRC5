@@ -4317,20 +4317,22 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                 : await session.RequestNativeResumeAsync(generation, cancellationToken).ConfigureAwait(false);
         }
 
-        if (native is { Outcome: NexIrcResumeOutcome.Completed, AttachmentCreated: true })
+        if (native.AttachmentAuthorityRecovered && native.AttachmentCreated)
         {
             entry.NativeAttachmentEstablished = true;
         }
         var outcome = native.Outcome switch
         {
             NexIrcResumeOutcome.Completed => ContinuitySynchronizationOutcome.Recovered,
+            NexIrcResumeOutcome.ReplayUnavailable => ContinuitySynchronizationOutcome.Partial,
             NexIrcResumeOutcome.Rejected => ContinuitySynchronizationOutcome.Unsupported,
             NexIrcResumeOutcome.Unsupported => ContinuitySynchronizationOutcome.Unsupported,
             NexIrcResumeOutcome.Accepted => ContinuitySynchronizationOutcome.Partial,
             NexIrcResumeOutcome.Cancelled => ContinuitySynchronizationOutcome.Failed,
             _ => ContinuitySynchronizationOutcome.Failed
         };
-        var fallbackRecommended = native.Outcome == NexIrcResumeOutcome.Rejected && native.FallbackSafe;
+        var fallbackRecommended = native.Outcome == NexIrcResumeOutcome.ReplayUnavailable
+            || native.Outcome == NexIrcResumeOutcome.Rejected && native.FallbackSafe;
         return new ConnectionRecoveryExecutionResult(
             outcome,
             HistoryAvailable: native.CapabilityNegotiated,
@@ -4346,7 +4348,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             NativeResume = native,
             FallbackRecommended = fallbackRecommended,
             FallbackReason = fallbackRecommended
-                ? native.Detail ?? "The server rejected native resume before replay began."
+                ? native.Detail ?? "Native replay is unavailable for the saved boundary."
                 : null
         };
     }

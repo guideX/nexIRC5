@@ -196,13 +196,14 @@ public sealed class NexIrcResumeRecoveryStrategy : IConnectionRecoveryStrategy
         var execution = await context.ExecuteNativeResumeAsync(cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
         var native = execution.NativeResume;
-        var fallbackRecommended = native is { Outcome: NexIrcResumeOutcome.Rejected, FallbackSafe: true };
+        var fallbackRecommended = native is { Outcome: NexIrcResumeOutcome.ReplayUnavailable }
+            or { Outcome: NexIrcResumeOutcome.Rejected, FallbackSafe: true };
         if (fallbackRecommended)
         {
             execution = execution with
             {
                 FallbackRecommended = true,
-                FallbackReason = native!.Detail ?? "The server rejected the native resume request before replay began."
+                FallbackReason = native!.Detail ?? "The native replay boundary is unavailable."
             };
         }
 
@@ -219,6 +220,10 @@ public sealed class NexIrcResumeRecoveryStrategy : IConnectionRecoveryStrategy
         if (native is { Outcome: NexIrcResumeOutcome.Rejected, FallbackSafe: true })
         {
             outcome = ContinuitySynchronizationOutcome.Unsupported;
+        }
+        else if (native is { Outcome: NexIrcResumeOutcome.ReplayUnavailable })
+        {
+            outcome = ContinuitySynchronizationOutcome.Partial;
         }
         else if (native is { Outcome: NexIrcResumeOutcome.Completed })
         {

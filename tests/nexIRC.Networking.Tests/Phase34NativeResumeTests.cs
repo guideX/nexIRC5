@@ -82,6 +82,30 @@ public sealed class Phase34NativeResumeTests
     }
 
     [Fact]
+    public async Task AuthenticatedAttachmentIsRetainedWhenNativeReplayBoundaryIsUnavailable()
+    {
+        await using var fixture = CreateFixture(DeterministicReplayProfile.NativeResumeUnavailableBelowRetention, []);
+        await using var session = await StartRegisteredAsync(fixture);
+        var original = session.NativeResumeSession!;
+
+        var result = await session.RequestNativeResumeAsync(session.Snapshot.ConnectionGeneration);
+
+        Assert.Equal(NexIrcResumeOutcome.ReplayUnavailable, result.Outcome);
+        Assert.True(result.AttachmentAuthorityRecovered);
+        Assert.False(result.ReplayAccepted);
+        Assert.False(result.ReplayCompleted);
+        Assert.False(result.ExactBoundaryRecovered);
+        Assert.Equal(NexIrcSynchronizationLimitation.BoundaryBelowRetention, result.SynchronizationLimitation);
+        Assert.True(result.FallbackSafe);
+        Assert.Null(result.RejectionReason);
+        Assert.Equal(original, session.NativeResumeSession);
+        Assert.Contains(fixture.Transport.OutboundLines, line => line == "NEXIRC RESUME fixture-resume-token resume-0");
+
+        await session.DisconnectAsync();
+        await session.Completion;
+    }
+
+    [Fact]
     public async Task LiveBoundaryIsCommittedAndHeldLiveTrafficFollowsReplayExactlyOnce()
     {
         await using var fixture = CreateFixture(DeterministicReplayProfile.NativeResume, []);

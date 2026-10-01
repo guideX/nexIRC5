@@ -15,6 +15,7 @@ public enum DeterministicReplayProfile
     MissingParentRecoverable,
     MissingParentUnrecoverable,
     NativeResume,
+    NativeResumeUnavailableBelowRetention,
     NativeResumeRejects,
     NativeResumeExpired,
     NativeResumeAccountMismatch,
@@ -389,6 +390,15 @@ public sealed class DeterministicServerHistoryFixture : IAsyncDisposable
         _nativeResumeRequests.Add(line);
         var token = parts[2];
         var boundary = parts[3];
+        if (_options.Profile == DeterministicReplayProfile.NativeResumeUnavailableBelowRetention
+            && string.Equals(token, _options.NativeResumeToken, StringComparison.Ordinal))
+        {
+            _resumeOwnerActive = true;
+            Transport.EnqueueInboundLine($":{_options.ServerName} NEXIRC RESUME ACCEPT {boundary}");
+            Transport.EnqueueInboundLine($":{_options.ServerName} NEXIRC RESUME UNAVAILABLE BOUNDARY_TOO_OLD");
+            return;
+        }
+
         var rejection = _options.Profile switch
         {
             DeterministicReplayProfile.NativeResumeRejects => "UNKNOWN_TOKEN",
@@ -469,6 +479,7 @@ public sealed class DeterministicServerHistoryFixture : IAsyncDisposable
 
     private bool IsNativeResumeProfile() => _options.Profile is
         DeterministicReplayProfile.NativeResume
+        or DeterministicReplayProfile.NativeResumeUnavailableBelowRetention
         or DeterministicReplayProfile.NativeResumeRejects
         or DeterministicReplayProfile.NativeResumeExpired
         or DeterministicReplayProfile.NativeResumeAccountMismatch

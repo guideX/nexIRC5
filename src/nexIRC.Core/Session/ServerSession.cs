@@ -3180,6 +3180,12 @@ public sealed class ServerSession : IAsyncDisposable
             {
                 await HandleNativeAttachmentAcceptedAsync(message, epoch.Generation, connectionCts).ConfigureAwait(false);
             }
+            else if (attachResponse == "SYNC"
+                && message.Parameters.Count >= 4
+                && string.Equals(message.Parameters[2], "UNAVAILABLE", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleNativeReplayUnavailableAsync(message.Parameters[3], epoch.Generation).ConfigureAwait(false);
+            }
             else if (attachResponse == "REJECT")
             {
                 CompleteNativeResumeRejected(
@@ -3221,6 +3227,9 @@ public sealed class ServerSession : IAsyncDisposable
                 await HandleNativeResumeRejectedAsync(
                     message.Parameters.Count >= 3 ? message.Parameters[2] : string.Empty,
                     epoch.Generation).ConfigureAwait(false);
+                break;
+            case "UNAVAILABLE" when message.Parameters.Count >= 3:
+                await HandleNativeReplayUnavailableAsync(message.Parameters[2], epoch.Generation).ConfigureAwait(false);
                 break;
             case "UNSUPPORTED":
             case "NEW":
@@ -3368,6 +3377,7 @@ public sealed class ServerSession : IAsyncDisposable
             attempt.AttachmentCreated = true;
             attempt.ReplayAccepted = true;
             attempt.AcceptedBoundary = attached.AuthoritativeBoundary;
+            attempt.AttachmentAuthorityRecovered = true;
         }
 
         if (pairingHandoffReceived)
@@ -3551,6 +3561,7 @@ public sealed class ServerSession : IAsyncDisposable
 
             attempt.ReplayAccepted = true;
             attempt.AcceptedBoundary = boundary;
+            attempt.AttachmentAuthorityRecovered = true;
         }
     }
 
@@ -3563,7 +3574,6 @@ public sealed class ServerSession : IAsyncDisposable
         if (rejection is NexIrcResumeRejectionReason.UnknownToken
             or NexIrcResumeRejectionReason.ExpiredToken
             or NexIrcResumeRejectionReason.AccountMismatch
-            or NexIrcResumeRejectionReason.BoundaryTooOld
             or NexIrcResumeRejectionReason.SessionInvalidated
             or NexIrcResumeRejectionReason.ServerRestarted
             or NexIrcResumeRejectionReason.NewSessionRequired)
@@ -3598,6 +3608,97 @@ public sealed class ServerSession : IAsyncDisposable
         // rejection. Finish clearing/adopting durable fallback state first so
         // it cannot observe a rejected result alongside the stale credential.
         CompleteNativeResumeRejected(rejection, detail, generation);
+    }
+
+    private async Task HandleNativeReplayUnavailableAsync(string reason, int generation)
+    {
+        var limitation = reason.ToUpperInvariant() switch
+        {
+            "BOUNDARY_TOO_OLD" => NexIrcSynchronizationLimitation.BoundaryBelowRetention,
+            "TOO_LARGE" or "REPLAY_TOO_LARGE" => NexIrcSynchronizationLimitation.ReplayEventLimitExceeded,
+            "INVALID_BOUNDARY" => NexIrcSynchronizationLimitation.InvalidBoundary,
+            _ => (NexIrcSynchronizationLimitation?)null
+        };
+        if (limitation is null)
+        {
+            FailNativeResumeAttempt(
+                generation,
+                NexIrcResumeOutcome.Failed,
+                "The server reported an unknown native replay limitation.",
+                fallbackSafe: false,
+                reason: NexIrcResumeRejectionReason.Malformed);
+            return;
+        }
+
+        TaskCompletionSource<NexIrcResumeExecutionResult>? completion = null;
+        NexIrcResumeExecutionResult? result = null;
+        NexIrcResumeSession? sessionToPersist = null;
+        lock (_gate)
+        {
+            if (_nativeResumeAttempt is not { ConnectionGeneration: var attemptGeneration } attempt
+                || attemptGeneration != generation)
+            {
+                _continuity.RecordStaleCallback(generation, "A stale native replay limitation was ignored.");
+                return;
+            }
+
+            if (!attempt.AttachmentAuthorityRecovered || attempt.ActiveBatchIds.Count > 0)
+            {
+                FailNativeResumeAttemptUnsafe(
+                    attempt,
+                    NexIrcResumeOutcome.Failed,
+                    "The server reported unavailable replay before attachment authority was established or after replay began.",
+                    fallbackSafe: false,
+                    reason: NexIrcResumeRejectionReason.Malformed);
+                return;
+            }
+
+            // The server has authenticated/bound this attachment, but it could
+            // not serve its saved history boundary. Keep credentials and finish
+            // this request as a separate synchronization outcome.
+            attempt.ReplayAccepted = false;
+            if (!attempt.IsPairingRequest && _pairingRecoveryCredentialsDurable)
+            {
+                _pairingRecoveryCredential = null;
+                _pairingRecoveryBoundary = null;
+                _pairingRecoveryCredentialsDurable = false;
+                sessionToPersist = _nativeResumeSession;
+            }
+
+            result = new NexIrcResumeExecutionResult(
+                NexIrcResumeOutcome.ReplayUnavailable,
+                CapabilityNegotiated: true,
+                RequestSent: attempt.RequestSent,
+                ReplayAccepted: false,
+                ReplayCompleted: false,
+                ExactBoundaryRecovered: false,
+                attempt.ReplayedEventCount,
+                attempt.DuplicateEventsSuppressed,
+                attempt.RequestedBoundary,
+                FinalBoundary: null,
+                $"Attachment authority recovered; native replay is unavailable ({limitation.Value}).",
+                RejectionReason: null,
+                FallbackSafe: true)
+            {
+                AttachmentCreated = attempt.AttachmentCreated,
+                AttachmentAuthorityRecovered = true,
+                SynchronizationLimitation = limitation
+            };
+            _nativeResumeAttempt = null;
+            _acceptedNativeResumeBatches.Clear();
+            completion = attempt.Completion;
+        }
+
+        if (sessionToPersist is not null)
+        {
+            await PersistNativeResumeStateAsync(sessionToPersist).ConfigureAwait(false);
+        }
+
+        _continuity.RecordDiagnostic(
+            generation,
+            ContinuityDiagnosticKind.RecoveryRequestCompleted,
+            $"Attachment authority recovered; native synchronization requires fallback ({limitation.Value}).");
+        completion?.TrySetResult(result!);
     }
 
     private static NexIrcResumeRejectionReason ParseNativeResumeRejection(string reason) => reason.ToUpperInvariant() switch
@@ -3841,7 +3942,8 @@ public sealed class ServerSession : IAsyncDisposable
                 null,
                 FallbackSafe: false)
             {
-                AttachmentCreated = attempt.AttachmentCreated
+                AttachmentCreated = attempt.AttachmentCreated,
+                AttachmentAuthorityRecovered = true
             };
             _nativeResumeAttempt = null;
             _acceptedNativeResumeBatches.Clear();
@@ -4653,6 +4755,8 @@ public sealed class ServerSession : IAsyncDisposable
         public bool IsPairingRecoveryRequest { get; init; }
 
         public bool AttachmentCreated { get; set; }
+
+        public bool AttachmentAuthorityRecovered { get; set; }
 
         public string RequestedBoundary { get; } = requestedBoundary;
 

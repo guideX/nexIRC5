@@ -168,6 +168,72 @@ public sealed class Phase34NativeResumeStrategyTests
     }
 
     [Fact]
+    public async Task RecoveredAttachmentWithUnavailableReplaySelectsHistoryFallback()
+    {
+        var endpoint = new IrcEndpoint("phase44-replay-unavailable.example", 6667, false);
+        var factory = new FakeIrcTransportFactory();
+        factory.Add(new FakeIrcTransport(endpoint));
+        await using var session = new ServerSession(new ServerSessionOptions
+        {
+            Endpoint = endpoint,
+            Nickname = "nex",
+            RequestedCapabilities = Array.Empty<string>(),
+            Reconnect = new ReconnectPolicy(Enabled: false)
+        }, factory);
+        var native = new NexIrcResumeExecutionResult(
+            NexIrcResumeOutcome.ReplayUnavailable,
+            CapabilityNegotiated: true,
+            RequestSent: true,
+            ReplayAccepted: false,
+            ReplayCompleted: false,
+            ExactBoundaryRecovered: false,
+            ReplayedEventCount: 0,
+            DuplicateEventsSuppressed: 0,
+            RequestedBoundary: "s0",
+            FinalBoundary: null,
+            Detail: "Attachment authority recovered; native replay is below the retention floor.",
+            RejectionReason: null,
+            FallbackSafe: true)
+        {
+            AttachmentCreated = true,
+            AttachmentAuthorityRecovered = true,
+            SynchronizationLimitation = NexIrcSynchronizationLimitation.BoundaryBelowRetention
+        };
+        var context = new ConnectionRecoveryStrategyContext(
+            session,
+            ConnectionRecoveryBoundary.Empty(2, DateTimeOffset.UtcNow),
+            _ => ValueTask.FromResult(new ConnectionRecoveryExecutionResult(
+                ContinuitySynchronizationOutcome.Recovered,
+                HistoryAvailable: true,
+                RecoveryRequestSent: true,
+                ReplayCompleted: true,
+                ExactGapRecovered: true,
+                RecoveryImpossible: false,
+                Detail: "CHATHISTORY fallback completed")),
+            _ => ValueTask.FromResult(new ConnectionRecoveryExecutionResult(
+                ContinuitySynchronizationOutcome.Partial,
+                HistoryAvailable: true,
+                RecoveryRequestSent: true,
+                ReplayCompleted: false,
+                ExactGapRecovered: false,
+                RecoveryImpossible: false,
+                Detail: native.Detail)
+            {
+                NativeResume = native
+            }));
+
+        var result = await new NexIrcResumeRecoveryStrategy().RecoverAsync(
+            context,
+            "native attachment authenticated",
+            CancellationToken.None);
+
+        Assert.Equal(ContinuityRecoveryResultKind.Partial, result.Kind);
+        Assert.Equal(NexIrcResumeOutcome.ReplayUnavailable, result.NativeResumeOutcome);
+        Assert.True(result.FallbackRecommended);
+        Assert.False(result.CanClaimLosslessContinuity);
+    }
+
+    [Fact]
     public void ContinuityLifecycleEnumIsUnchangedByNativeStrategy()
     {
         Assert.Equal(

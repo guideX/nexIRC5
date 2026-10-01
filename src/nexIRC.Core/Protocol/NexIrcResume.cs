@@ -287,9 +287,17 @@ public enum NexIrcResumeOutcome
     Unsupported,
     Rejected,
     Accepted,
+    ReplayUnavailable,
     Completed,
     Failed,
     Cancelled
+}
+
+public enum NexIrcSynchronizationLimitation
+{
+    BoundaryBelowRetention,
+    ReplayEventLimitExceeded,
+    InvalidBoundary
 }
 
 public enum NexIrcResumeRejectionReason
@@ -326,6 +334,10 @@ public sealed record NexIrcResumeExecutionResult(
     bool FallbackSafe)
 {
     public bool AttachmentCreated { get; init; }
+
+    public bool AttachmentAuthorityRecovered { get; init; }
+
+    public NexIrcSynchronizationLimitation? SynchronizationLimitation { get; init; }
 
     public static NexIrcResumeExecutionResult Unsupported(string detail) => new(
         NexIrcResumeOutcome.Unsupported,
