@@ -208,7 +208,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         var networkId = options.ProfileId is Guid profileId && profileId != Guid.Empty ? profileId : Guid.NewGuid();
         var session = new ServerSession(options.ToSessionOptions(
             networkId,
-            continuityRecoveryRequired: options.CreateNewAttachmentOnConnect,
+            continuityRecoveryRequired: options.CreateNewAttachmentOnConnect || options.ResumeExistingAttachmentOnConnect,
             resumeStateStore: options.ResumeStateStore ?? _resumeStateStore,
             resumeSecretProtector: _resumeSecretProtector), _transportFactory);
         var workspace = new NetworkWorkspace(networkId, options, session);
@@ -2464,6 +2464,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     public async ValueTask ConnectAsync(Guid networkId, CancellationToken cancellationToken = default)
     {
         var entry = GetEntry(networkId);
+        await RestoreDurableReconnectBoundariesAsync(entry, cancellationToken).ConfigureAwait(false);
         if (!entry.Started && (entry.NeedsReplacement || entry.RunTask?.IsCompleted == true))
         {
             ReplaceSession(entry);
@@ -2478,6 +2479,52 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
 
         await Task.CompletedTask.ConfigureAwait(false);
+    }
+
+    private async ValueTask RestoreDurableReconnectBoundariesAsync(SessionEntry entry, CancellationToken cancellationToken)
+    {
+        if (_logStore is null
+            || !entry.Options.ResumeExistingAttachmentOnConnect
+            || entry.ReconnectBoundaries.Count != 0)
+        {
+            return;
+        }
+
+        var workspace = entry.Workspace;
+        foreach (var channel in workspace.Channels.Where(channel => entry.Options.DesiredChannels.Contains(channel.Channel, StringComparer.OrdinalIgnoreCase)))
+        {
+            var conversation = HistoryConversation(channel);
+            var history = await _logStore.ReadRangeAsync(new HistoryExportRequest
+            {
+                ScopeId = workspace.ProfileId ?? workspace.Id,
+                NetworkId = workspace.Id,
+                ConversationKind = LogConversationKind.Channel,
+                ConversationName = channel.Channel,
+                ConversationKey = conversation,
+                MaximumRecords = ConfigurationLimits.MaximumHistoryExportRecords
+            }, cancellationToken).ConfigureAwait(false);
+            var boundary = history.Records
+                .Where(static record => record.ServerMessageId is not null || record.TimestampSource == ConversationTimestampSource.ServerTime)
+                .OrderByDescending(static record => record.Timestamp)
+                .ThenByDescending(static record => record.DurableSequence)
+                .FirstOrDefault();
+            if (boundary is null)
+            {
+                continue;
+            }
+
+            entry.ReconnectBoundaries[conversation] = new ReconnectHistoryBoundary(
+                conversation,
+                channel.Channel,
+                boundary.ServerMessageId,
+                boundary.Timestamp,
+                boundary.TimestampSource,
+                IsChannel: true,
+                channel.Id,
+                entry.Session.Snapshot.ConnectionGeneration,
+                boundary.DurableSequence);
+            entry.ReconnectBoundarySignals[conversation] = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
     }
 
     public async ValueTask DisconnectAsync(Guid networkId)
@@ -3484,6 +3531,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         entry.Session.StateChanged += OnSessionStateChanged;
         entry.Session.ContinuityStateChanged += OnSessionContinuityStateChanged;
         entry.Session.SemanticEventReceived += OnSessionSemanticEvent;
+        entry.Session.SetNativeEventProjector((item, cancellationToken) => ProjectNativeEventAsync(entry, item, cancellationToken));
         entry.Workspace.ApplySnapshot(entry.Session.Snapshot);
     }
 
@@ -4800,30 +4848,51 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             return;
         }
 
-        var snapshot = session.Snapshot;
         Dispatch(() =>
         {
-            if (_disposed)
-            {
-                return;
-            }
-
-            if (!IsCurrentGeneration(entry, session, item.ConnectionGeneration))
-            {
-                Interlocked.Increment(ref _staleGenerationEventsDiscarded);
-                return;
-            }
-
-            if (!AcceptSemanticEvent(entry, item))
-            {
-                Interlocked.Increment(ref _duplicateSemanticEventsDiscarded);
-                return;
-            }
-
-            entry.Workspace.ApplySnapshot(snapshot);
-            RouteSemanticEvent(entry.Workspace, item.Event, snapshot, item.ReceivedAt);
-            SignalReconnectBoundary(entry, session, item.Event, snapshot, item.ReceivedAt);
+            _ = ApplySemanticEvent(entry, session, item);
         }, DispatchCategory(item.Event));
+    }
+
+    private async ValueTask ProjectNativeEventAsync(
+        SessionEntry entry,
+        SessionSemanticEvent item,
+        CancellationToken cancellationToken)
+    {
+        var session = entry.Session;
+        await InvokeOnDispatcherAsync(
+            () => ApplySemanticEvent(entry, session, item),
+            DispatchCategory(item.Event)).ConfigureAwait(false);
+        if (_logging is not null)
+        {
+            await _logging.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private bool ApplySemanticEvent(SessionEntry entry, ServerSession session, SessionSemanticEvent item)
+    {
+        if (_disposed)
+        {
+            return false;
+        }
+
+        if (!IsCurrentGeneration(entry, session, item.ConnectionGeneration))
+        {
+            Interlocked.Increment(ref _staleGenerationEventsDiscarded);
+            return false;
+        }
+
+        if (!AcceptSemanticEvent(entry, item))
+        {
+            Interlocked.Increment(ref _duplicateSemanticEventsDiscarded);
+            return false;
+        }
+
+        var snapshot = session.Snapshot;
+        entry.Workspace.ApplySnapshot(snapshot);
+        RouteSemanticEvent(entry.Workspace, item.Event, snapshot, item.ReceivedAt);
+        SignalReconnectBoundary(entry, session, item.Event, snapshot, item.ReceivedAt);
+        return true;
     }
 
     private void RouteSemanticEvent(

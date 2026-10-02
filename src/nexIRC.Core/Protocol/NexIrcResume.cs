@@ -297,6 +297,7 @@ public enum NexIrcSynchronizationLimitation
 {
     BoundaryBelowRetention,
     ReplayEventLimitExceeded,
+    ReplayByteLimitExceeded,
     InvalidBoundary
 }
 

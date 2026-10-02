@@ -382,6 +382,9 @@ public sealed class ConversationLoggingService
     };
     private readonly IConversationLogStore _store;
     private readonly Func<ApplicationPreferences> _preferences;
+    private readonly object _appendGate = new();
+    private readonly HashSet<Task> _pendingAppends = [];
+    private int _appendFailures;
 
     public ConversationLoggingService(IConversationLogStore store, Func<ApplicationPreferences> preferences)
     {
@@ -441,7 +444,7 @@ public sealed class ConversationLoggingService
             TimestampSource = entry.TimestampSource,
             BatchId = entry.BatchId
         };
-        _ = AppendSafeAsync(record);
+        TrackAppend(record);
     }
 
     public void RecordReaction(Guid networkId, Guid? profileId, WorkspaceView view, ReactionEvent reaction)
@@ -493,7 +496,37 @@ public sealed class ConversationLoggingService
             TimestampSource = reaction.TimestampSource,
             BatchId = reaction.BatchId
         };
-        _ = AppendSafeAsync(record);
+        TrackAppend(record);
+    }
+
+    /// <summary>
+    /// Waits for Application history writes already scheduled by this service
+    /// and then flushes the store. The native resume cursor uses this barrier
+    /// before advancing past a projected canonical event.
+    /// </summary>
+    public async Task FlushAsync(CancellationToken cancellationToken = default)
+    {
+        while (true)
+        {
+            Task[] pending;
+            lock (_appendGate)
+            {
+                pending = _pendingAppends.ToArray();
+            }
+
+            if (pending.Length == 0)
+            {
+                break;
+            }
+
+            await Task.WhenAll(pending).WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        await _store.FlushAsync(cancellationToken).ConfigureAwait(false);
+        if (Volatile.Read(ref _appendFailures) > 0)
+        {
+            throw new InvalidOperationException("Application conversation history durability could not be confirmed.");
+        }
     }
 
     public static string BuildConversationKey(LogConversationKind kind, string name) =>
@@ -581,11 +614,39 @@ public sealed class ConversationLoggingService
             if (!await _store.AppendAsync(record).ConfigureAwait(false))
             {
                 LastDiagnostic = "Conversation logging queue is full; the message was not persisted.";
+                Interlocked.Increment(ref _appendFailures);
             }
         }
         catch (Exception exception)
         {
             LastDiagnostic = $"Conversation logging failed safely: {exception.Message}";
+            Interlocked.Increment(ref _appendFailures);
+        }
+    }
+
+    private void TrackAppend(ConversationLogRecord record)
+    {
+        var append = AppendSafeAsync(record);
+        lock (_appendGate)
+        {
+            _pendingAppends.Add(append);
+        }
+
+        _ = RetireAppendAsync(append);
+    }
+
+    private async Task RetireAppendAsync(Task append)
+    {
+        try
+        {
+            await append.ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_appendGate)
+            {
+                _pendingAppends.Remove(append);
+            }
         }
     }
 

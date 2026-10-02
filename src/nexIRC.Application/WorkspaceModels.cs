@@ -221,6 +221,9 @@ public sealed record NetworkConnectionOptions
     /// <summary>Start this client instance as a new attachment to the stored logical session.</summary>
     public bool CreateNewAttachmentOnConnect { get; init; }
 
+    /// <summary>Recover this profile's stored attachment during its first connection.</summary>
+    public bool ResumeExistingAttachmentOnConnect { get; init; }
+
     public ReconnectPolicy Reconnect { get; init; } = new();
 
     public ServerProfileSet? Profiles { get; init; }

@@ -89,6 +89,7 @@ public sealed class ServerSession : IAsyncDisposable
     private TaskCompletionSource<bool>? _pairingRevocationAttempt;
     private string? _nativeLivePendingSequence;
     private string? _nativeLivePendingMessageId;
+    private Func<SessionSemanticEvent, CancellationToken, ValueTask>? _nativeEventProjector;
 
     public ServerSession(ServerSessionOptions options, IIrcTransportFactory transportFactory)
     {
@@ -141,6 +142,26 @@ public sealed class ServerSession : IAsyncDisposable
     public event EventHandler<ConnectionContinuityStateChangedEvent>? ContinuityStateChanged;
 
     public event EventHandler<SessionSemanticEvent>? SemanticEventReceived;
+
+    /// <summary>
+    /// Registers an optional Application projection barrier. Native live and
+    /// replay cursors are committed only after this callback completes, so a
+    /// durable Application projection cannot be left behind an advanced
+    /// protected resume boundary.
+    /// </summary>
+    public void SetNativeEventProjector(Func<SessionSemanticEvent, CancellationToken, ValueTask> projector)
+    {
+        ArgumentNullException.ThrowIfNull(projector);
+        lock (_gate)
+        {
+            if (_runTask is not null || _state != ServerSessionState.Disconnected)
+            {
+                throw new InvalidOperationException("The native event projector must be set before the session starts.");
+            }
+
+            _nativeEventProjector = projector;
+        }
+    }
 
     /// <summary>
     /// Developer diagnostics tap for the redacted raw receive path.
@@ -2269,24 +2290,22 @@ public sealed class ServerSession : IAsyncDisposable
             return;
         }
 
-        if (nativeLiveEvent && stateEvents.Count > 0)
-        {
-            await CommitNativeLiveEventAsync(message, epoch.Generation).ConfigureAwait(false);
-        }
-
         if (historyLimitExceeded)
         {
             CompleteHistoryRequest(ChathistoryRequestCompletion.Failed, "The history batch exceeded the bounded request limit.");
         }
 
+        var projectionBarrier = _nativeEventProjector is not null;
+        if (!projectionBarrier && nativeLiveEvent && stateEvents.Count > 0)
+        {
+            await CommitNativeLiveEventAsync(message, epoch.Generation).ConfigureAwait(false);
+        }
+
+        var nativeReplayEventAccepted = false;
+        var deliveryEvents = new List<IrcSemanticEvent>(stateEvents.Count);
         foreach (var semanticEvent in stateEvents)
         {
             var deliveryEvent = semanticEvent;
-
-            if (nativeResumePlayback && semanticEvent.IsHistorical)
-            {
-                await CommitNativeReplayEventAsync(message, epoch.Generation).ConfigureAwait(false);
-            }
 
             if (semanticEvent.IsHistorical)
             {
@@ -2323,11 +2342,43 @@ public sealed class ServerSession : IAsyncDisposable
                     {
                         Source = IrcSemanticEventSource.ServerPlayback,
                         NetworkId = _options.NetworkId,
-                        HistoricalConversation = NativeResumeConversation(message)
+                        // The nexirc/resume batch parameter identifies the
+                        // server's IRC target. It is not the Application's
+                        // canonical history key (for example, `private:peer`).
+                        // Leave this unset so recovered queries resolve from
+                        // the event sender/recipient instead of creating an
+                        // isolated conversation keyed by the IRC target.
+                        HistoricalConversation = null
                     };
                 }
             }
 
+            var nativeReplaySemanticEvent = nativeResumePlayback && semanticEvent.IsHistorical;
+            if (projectionBarrier && (nativeLiveEvent || nativeReplaySemanticEvent))
+            {
+                await ProjectNativeEventAsync(deliveryEvent, epoch, receivedAt, connectionCts.Token).ConfigureAwait(false);
+            }
+            else if (!projectionBarrier && nativeReplaySemanticEvent)
+            {
+                await CommitNativeReplayEventAsync(message, epoch.Generation).ConfigureAwait(false);
+            }
+
+            nativeReplayEventAccepted |= nativeReplaySemanticEvent;
+            deliveryEvents.Add(deliveryEvent);
+        }
+
+        if (projectionBarrier && nativeLiveEvent && stateEvents.Count > 0)
+        {
+            await CommitNativeLiveEventAsync(message, epoch.Generation).ConfigureAwait(false);
+        }
+
+        if (projectionBarrier && nativeReplayEventAccepted)
+        {
+            await CommitNativeReplayEventAsync(message, epoch.Generation).ConfigureAwait(false);
+        }
+
+        foreach (var deliveryEvent in deliveryEvents)
+        {
             await PublishSemanticAsync(deliveryEvent, epoch, receivedAt).ConfigureAwait(false);
 
             if (!deliveryEvent.IsHistorical
@@ -3616,6 +3667,7 @@ public sealed class ServerSession : IAsyncDisposable
         {
             "BOUNDARY_TOO_OLD" => NexIrcSynchronizationLimitation.BoundaryBelowRetention,
             "TOO_LARGE" or "REPLAY_TOO_LARGE" => NexIrcSynchronizationLimitation.ReplayEventLimitExceeded,
+            "BYTE_LIMIT_EXCEEDED" => NexIrcSynchronizationLimitation.ReplayByteLimitExceeded,
             "INVALID_BOUNDARY" => NexIrcSynchronizationLimitation.InvalidBoundary,
             _ => (NexIrcSynchronizationLimitation?)null
         };
@@ -4101,8 +4153,27 @@ public sealed class ServerSession : IAsyncDisposable
 
         if (!string.Equals(previous, currentBoundary, StringComparison.Ordinal))
         {
-            _continuity.RecordDiagnostic(generation, ContinuityDiagnosticKind.RecoveryRequestFailed, "A live native event referenced an unknown authoritative boundary.");
-            return false;
+            if (_nativeLiveSequenceMessageIds.TryGetValue(sequence!, out var observedMessageId))
+            {
+                if (string.Equals(observedMessageId, message.ServerMessageId, StringComparison.Ordinal))
+                {
+                    _continuity.RecordHistoricalDuplicateSuppressed(generation, $"live:{message.ServerMessageId}");
+                    duplicate = true;
+                    return true;
+                }
+
+                _continuity.RecordDiagnostic(generation, ContinuityDiagnosticKind.RecoveryRequestFailed, "A non-contiguous live native sequence was reused for a different canonical event.");
+                return false;
+            }
+
+            _nativeLiveSequenceMessageIds[sequence!] = message.ServerMessageId;
+            _nativeLivePendingSequence = null;
+            _nativeLivePendingMessageId = null;
+            _continuity.RecordDiagnostic(
+                generation,
+                ContinuityDiagnosticKind.RecoveryRequestFailed,
+                "A non-contiguous live native event was delivered while the protected boundary remained unchanged.");
+            return true;
         }
 
         _nativeLivePendingSequence = sequence;
@@ -4179,6 +4250,23 @@ public sealed class ServerSession : IAsyncDisposable
         }
     }
 
+    private async ValueTask ProjectNativeEventAsync(
+        IrcSemanticEvent semanticEvent,
+        ConnectionEpoch epoch,
+        DateTimeOffset? receivedAt,
+        CancellationToken cancellationToken)
+    {
+        var projector = _nativeEventProjector;
+        if (projector is null)
+        {
+            return;
+        }
+
+        await projector(
+            new SessionSemanticEvent(semanticEvent, epoch.Generation, receivedAt ?? DateTimeOffset.UtcNow),
+            cancellationToken).ConfigureAwait(false);
+    }
+
     private void ObserveNativeResumeBatch(IrcMessage message, ConnectionEpoch epoch)
     {
         var token = message.Parameters.Count == 0 ? null : message.Parameters[0];
@@ -4225,19 +4313,6 @@ public sealed class ServerSession : IAsyncDisposable
                 }
             }
         }
-    }
-
-    private string NativeResumeConversation(IrcMessage message)
-    {
-        if (message.BatchId is { } batchId
-            && _stateStore.TryGetActiveBatch(batchId, out var type, out var parameters)
-            && string.Equals(type, NexIrcResumeProtocol.BatchType, StringComparison.OrdinalIgnoreCase)
-            && parameters.Count > 0)
-        {
-            return parameters[0];
-        }
-
-        return string.Empty;
     }
 
     private void CancelNativeResumeAttempt(int generation, string detail)
