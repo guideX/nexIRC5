@@ -85,6 +85,10 @@ public sealed class ServerSession : IAsyncDisposable
     private bool _restoredResumeActive;
     private bool _resumeStateLoadCompleted;
     private NativeResumeAttempt? _nativeResumeAttempt;
+    private ReadStateSnapshotBuilder? _readStateSnapshotBuilder;
+    private readonly Dictionary<string, NexIrcReadMarker> _pendingReadStateUpdates = new(StringComparer.Ordinal);
+    private bool _readStateSnapshotSeen;
+    private bool _readStateSnapshotRequested;
     private TaskCompletionSource<NexIrcPairingAuthorization>? _pairingAuthorizationAttempt;
     private TaskCompletionSource<bool>? _pairingRevocationAttempt;
     private string? _nativeLivePendingSequence;
@@ -263,6 +267,66 @@ public sealed class ServerSession : IAsyncDisposable
                     version);
             }
         }
+    }
+
+    public bool SynchronizedReadStateAvailable
+    {
+        get { lock (_gate) return NexIrcReadStateProtocol.IsSupported(_capabilities.Snapshot); }
+    }
+
+    public async ValueTask<bool> TryRequestSynchronizedReadStateAsync(CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+        {
+            if (!NexIrcReadStateProtocol.IsSupported(_capabilities.Snapshot)
+                || !_options.Endpoint.UseTls
+                || _authenticationState != SaslAuthenticationState.Succeeded
+                || _registration != RegistrationState.Registered
+                || _readStateSnapshotRequested)
+                return false;
+            _readStateSnapshotRequested = true;
+        }
+
+        try
+        {
+            await SendCommandAsync("NEXIRC", ["STATE", "GET"], cancellationToken: cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or OperationCanceledException or IOException)
+        {
+            lock (_gate) _readStateSnapshotRequested = false;
+            return false;
+        }
+    }
+
+    public async ValueTask<bool> TryAdvanceSynchronizedReadStateAsync(
+        string conversationKey,
+        long sequence,
+        string messageId,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(conversationKey) || conversationKey.Length > NexIrcReadStateProtocol.MaximumConversationKeyLength
+            || sequence < 1 || string.IsNullOrWhiteSpace(messageId) || messageId.Length > NexIrcReadStateProtocol.MaximumMessageIdLength)
+            return false;
+
+        lock (_gate)
+        {
+            if (!NexIrcReadStateProtocol.IsSupported(_capabilities.Snapshot)
+                || !_options.Endpoint.UseTls
+                || _authenticationState != SaslAuthenticationState.Succeeded
+                || _registration != RegistrationState.Registered)
+                return false;
+        }
+
+        try
+        {
+            await SendCommandAsync("NEXIRC", ["STATE", "SET", "READ",
+                NexIrcReadStateProtocol.EncodeField(conversationKey), $"s{sequence}",
+                NexIrcReadStateProtocol.EncodeField(messageId), "1"], cancellationToken: cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (InvalidOperationException) { return false; }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return false; }
     }
 
     /// <summary>
@@ -2213,7 +2277,10 @@ public sealed class ServerSession : IAsyncDisposable
 
         if (message.Command == NexIrcResumeProtocol.Command)
         {
-            await HandleNativeResumeMessageAsync(message, epoch, connectionCts).ConfigureAwait(false);
+            if (message.Parameters.Count > 0 && string.Equals(message.Parameters[0], "STATE", StringComparison.OrdinalIgnoreCase))
+                await HandleNexIrcReadStateMessageAsync(message, epoch).ConfigureAwait(false);
+            else
+                await HandleNativeResumeMessageAsync(message, epoch, connectionCts).ConfigureAwait(false);
             return;
         }
 
@@ -2879,6 +2946,10 @@ public sealed class ServerSession : IAsyncDisposable
             _stateStore.SetGeneration(_connectionGeneration);
             _resynchronizationRequested.Clear();
             _historyStates.Clear();
+            _readStateSnapshotBuilder = null;
+            _pendingReadStateUpdates.Clear();
+            _readStateSnapshotSeen = false;
+            _readStateSnapshotRequested = false;
             _capabilities.Reset();
             _isupport.Reset();
             _identityDetector.Reset();
@@ -3094,6 +3165,137 @@ public sealed class ServerSession : IAsyncDisposable
                 CompleteHistoryRequest(ChathistoryRequestCompletion.Succeeded, null, exhausted);
             }
         }
+    }
+
+    private async Task HandleNexIrcReadStateMessageAsync(IrcMessage message, ConnectionEpoch epoch)
+    {
+        CapabilitySnapshot capabilities;
+        lock (_gate)
+        {
+            capabilities = _capabilities.Snapshot;
+        }
+        if (!NexIrcReadStateProtocol.IsSupported(capabilities)) return;
+
+        var parameters = message.Parameters;
+        var subcommand = parameters.Count > 1 ? parameters[1].ToUpperInvariant() : string.Empty;
+        if (subcommand == "BEGIN")
+        {
+            if (parameters.Count == 4
+                && int.TryParse(parameters[2], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var epochValue)
+                && epochValue > 0
+                && int.TryParse(parameters[3], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var count)
+                && count is >= 0 and <= NexIrcReadStateProtocol.MaximumEntries)
+            {
+                _readStateSnapshotBuilder = new ReadStateSnapshotBuilder(epochValue, count);
+            }
+            else
+            {
+                _readStateSnapshotBuilder = null;
+                _readStateSnapshotRequested = false;
+                _readStateSnapshotSeen = true;
+                await FlushPendingReadStateUpdatesAsync(message, epoch).ConfigureAwait(false);
+            }
+            return;
+        }
+
+        if (subcommand == "ENTRY")
+        {
+            if (parameters.Count == 8
+                && string.Equals(parameters[2], "READ", StringComparison.OrdinalIgnoreCase)
+                && NexIrcReadStateProtocol.TryCreateMarker(parameters, 3, out var marker)
+                && marker is not null
+                && _readStateSnapshotBuilder is { } builder
+                && builder.Markers.Count < builder.ExpectedCount
+                && marker.SessionEpoch <= builder.SessionEpoch
+                && builder.Markers.TryAdd(marker.ConversationKey, marker))
+            {
+                return;
+            }
+            _readStateSnapshotBuilder = null;
+            _readStateSnapshotRequested = false;
+            _readStateSnapshotSeen = true;
+            await FlushPendingReadStateUpdatesAsync(message, epoch).ConfigureAwait(false);
+            return;
+        }
+
+        if (subcommand == "END")
+        {
+            var builder = _readStateSnapshotBuilder;
+            _readStateSnapshotBuilder = null;
+            _readStateSnapshotRequested = false;
+            if (parameters.Count == 3
+                && builder is not null
+                && int.TryParse(parameters[2], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var endEpoch)
+                && endEpoch == builder.SessionEpoch
+                && builder.Markers.Count == builder.ExpectedCount)
+            {
+                var snapshot = new NexIrcReadStateSnapshot(builder.SessionEpoch,
+                    builder.Markers.Values.OrderBy(static item => item.ConversationKey, StringComparer.Ordinal).ToArray());
+                await PublishSemanticAsync(new IrcNexIrcReadStateEvent(message, Snapshot: snapshot), epoch).ConfigureAwait(false);
+            }
+            _readStateSnapshotSeen = true;
+            await FlushPendingReadStateUpdatesAsync(message, epoch).ConfigureAwait(false);
+            return;
+        }
+
+        if (subcommand == "UPDATE")
+        {
+            if (parameters.Count == 8
+                && string.Equals(parameters[2], "READ", StringComparison.OrdinalIgnoreCase)
+                && NexIrcReadStateProtocol.TryCreateMarker(parameters, 3, out var marker)
+                && marker is not null)
+            {
+                if (_readStateSnapshotBuilder is not null || !_readStateSnapshotSeen || _readStateSnapshotRequested)
+                {
+                    BufferReadStateUpdate(marker);
+                    return;
+                }
+                await PublishSemanticAsync(new IrcNexIrcReadStateEvent(message, Marker: marker), epoch).ConfigureAwait(false);
+            }
+            return;
+        }
+
+        if (subcommand == "ACK" && parameters.Count == 3)
+        {
+            if (string.Equals(parameters[2], "UNAVAILABLE", StringComparison.OrdinalIgnoreCase)
+                && (_readStateSnapshotRequested || !_readStateSnapshotSeen))
+            {
+                _readStateSnapshotRequested = false;
+                _readStateSnapshotSeen = true;
+                await FlushPendingReadStateUpdatesAsync(message, epoch).ConfigureAwait(false);
+            }
+            await PublishSemanticAsync(new IrcNexIrcReadStateEvent(message, Status: parameters[2]), epoch).ConfigureAwait(false);
+        }
+    }
+
+    private void BufferReadStateUpdate(NexIrcReadMarker marker)
+    {
+        if (_pendingReadStateUpdates.TryGetValue(marker.ConversationKey, out var current))
+        {
+            if (IsNewerReadStateMarker(marker, current))
+                _pendingReadStateUpdates[marker.ConversationKey] = marker;
+            return;
+        }
+
+        if (_pendingReadStateUpdates.Count < NexIrcReadStateProtocol.MaximumEntries)
+            _pendingReadStateUpdates.Add(marker.ConversationKey, marker);
+    }
+
+    private async Task FlushPendingReadStateUpdatesAsync(IrcMessage source, ConnectionEpoch epoch)
+    {
+        var updates = _pendingReadStateUpdates.Values.OrderBy(static marker => marker.ConversationKey, StringComparer.Ordinal).ToArray();
+        _pendingReadStateUpdates.Clear();
+        foreach (var marker in updates)
+            await PublishSemanticAsync(new IrcNexIrcReadStateEvent(source, Marker: marker), epoch).ConfigureAwait(false);
+    }
+
+    private static bool IsNewerReadStateMarker(NexIrcReadMarker candidate, NexIrcReadMarker current)
+    {
+        if (candidate.Revision <= current.Revision || candidate.SessionEpoch < current.SessionEpoch
+            || candidate.SessionEpoch == current.SessionEpoch && candidate.Sequence < current.Sequence)
+            return false;
+        return candidate.SessionEpoch > current.SessionEpoch || candidate.Sequence > current.Sequence
+            || string.Equals(candidate.MessageId, current.MessageId, StringComparison.Ordinal);
     }
 
     private async Task HandleNativeResumeMessageAsync(
@@ -4794,6 +4996,15 @@ public sealed class ServerSession : IAsyncDisposable
         public int Generation { get; } = generation;
 
         public bool IsActive { get; set; } = true;
+    }
+
+    private sealed class ReadStateSnapshotBuilder(int sessionEpoch, int expectedCount)
+    {
+        public int SessionEpoch { get; } = sessionEpoch;
+
+        public int ExpectedCount { get; } = expectedCount;
+
+        public Dictionary<string, NexIrcReadMarker> Markers { get; } = new(StringComparer.Ordinal);
     }
 
     private sealed class PendingChathistoryRequest(long requestId, ChathistoryRequest request, int connectionGeneration)

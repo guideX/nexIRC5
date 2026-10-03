@@ -237,6 +237,13 @@ public sealed record IrcSaslStateChangedEvent(
     string? Mechanism,
     string? Detail) : IrcSemanticEvent(Message);
 
+/// <summary>Atomic snapshot, live marker, or acknowledgement from nexIRC state v1.</summary>
+public sealed record IrcNexIrcReadStateEvent(
+    IrcMessage Message,
+    NexIrcReadStateSnapshot? Snapshot = null,
+    NexIrcReadMarker? Marker = null,
+    string? Status = null) : IrcSemanticEvent(Message);
+
 public sealed record IrcChannelSynchronizationEvent(
     IrcMessage Message,
     string Channel,

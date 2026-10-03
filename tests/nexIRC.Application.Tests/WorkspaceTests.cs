@@ -182,7 +182,8 @@ public sealed class WorkspaceTests
         transport.EnqueueInboundLine(":alice!u@h JOIN #activity");
         transport.EnqueueInboundLine(":bob!u@h PRIVMSG #activity :ordinary activity");
         transport.EnqueueInboundLine(":bob!u@h PRIVMSG alice :private activity");
-        await WaitForAsync(() => network.Channels.Single().Activity == WorkspaceActivity.Unread && network.Queries.Count == 1);
+        await WaitForAsync(() => network.Channels.Single().Activity == WorkspaceActivity.Unread
+            && network.Queries.Count == 1 && network.Queries.Single().Activity == WorkspaceActivity.Important);
 
         Assert.Equal(WorkspaceActivity.Important, network.Queries.Single().Activity);
         Assert.Contains(activityEvents, item => item.ViewId == network.Queries.Single().Id && item.Activity == WorkspaceActivity.Important);

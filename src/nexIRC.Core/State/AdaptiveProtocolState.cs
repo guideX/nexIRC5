@@ -133,6 +133,9 @@ public static class IrcCapabilityCatalog
     /// <summary>Optional multi-attachment extension for native resume v1.</summary>
     public const string NexIrcAttachments = "nexirc/attachments";
 
+    /// <summary>Optional account-owned synchronized client read state v1.</summary>
+    public const string NexIrcState = "nexirc/state";
+
     public static IReadOnlyList<string> PreferredPhase1V { get; } =
     [MessageTags, EchoMessage, ServerTime, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
 
@@ -145,10 +148,10 @@ public static class IrcCapabilityCatalog
     [MessageTags, EchoMessage, ServerTime, Batch, Chathistory, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
 
     public static IReadOnlyList<string> PreferredPhase1Y { get; } =
-    [MessageTags, EchoMessage, ServerTime, Batch, Chathistory, EventPlayback, NexIrcResume, NexIrcAttachments, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
+    [MessageTags, EchoMessage, ServerTime, Batch, Chathistory, EventPlayback, NexIrcResume, NexIrcAttachments, NexIrcState, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
 
     public static IReadOnlySet<string> Known { get; } =
-        new HashSet<string>(PreferredPhase1Y.Concat([AccountTag, Sasl, NexIrcResume, NexIrcAttachments]), StringComparer.Ordinal);
+        new HashSet<string>(PreferredPhase1Y.Concat([AccountTag, Sasl, NexIrcResume, NexIrcAttachments, NexIrcState]), StringComparer.Ordinal);
 }
 
 public enum CapNegotiationState

@@ -113,6 +113,12 @@ public sealed record TranscriptEntry(
     /// <summary>Durable server identity when IRC supplied one.</summary>
     public string? ServerMessageId { get; init; }
 
+    /// <summary>Server canonical replay sequence for synchronized read projection.</summary>
+    public long ServerSequence { get; init; }
+
+    /// <summary>Account read-state epoch attached by a nexIRC state-capable server.</summary>
+    public int ServerSessionEpoch { get; init; }
+
     /// <summary>Opaque server msgid referenced by the IRCv3 +reply tag.</summary>
     public string? ReplyParentMessageId { get; init; }
 
@@ -312,6 +318,14 @@ public abstract class WorkspaceView : ObservableObject
     private int _highlightCount;
     private bool _recoveredUnread;
     private int _recoveredHistoryCount;
+    private int _synchronizedReadEpoch;
+    private long _synchronizedReadSequence;
+    private long _synchronizedReadRevision;
+    private string? _synchronizedReadMessageId;
+    private int _untrackedUnreadCount;
+    private int _untrackedImportantCount;
+    private int _untrackedHighlightCount;
+    private readonly List<SynchronizedUnreadActivity> _synchronizedUnreadActivities = [];
     private bool _isActive;
     private bool _isViewOpen = true;
     private bool _isLoadingOlderHistory;
@@ -603,7 +617,7 @@ public abstract class WorkspaceView : ObservableObject
         {
             MarkActivity(activity ?? (entry.Kind is TranscriptEntryKind.Error or TranscriptEntryKind.Notice
                 ? WorkspaceActivity.Important
-                : WorkspaceActivity.Unread));
+                : WorkspaceActivity.Unread), entry);
         }
     }
 
@@ -1063,10 +1077,20 @@ public abstract class WorkspaceView : ObservableObject
     }
 
     public void MarkActivity(WorkspaceActivity activity)
+        => MarkActivityCore(activity, trackAsUntracked: true);
+
+    private void MarkActivityCore(WorkspaceActivity activity, bool trackAsUntracked)
     {
         if (activity == WorkspaceActivity.None)
         {
             return;
+        }
+
+        if (trackAsUntracked)
+        {
+            _untrackedUnreadCount = Math.Min(ConfigurationLimits.MaximumUnreadCount, _untrackedUnreadCount + 1);
+            if (activity == WorkspaceActivity.Important)
+                _untrackedImportantCount = Math.Min(ConfigurationLimits.MaximumUnreadCount, _untrackedImportantCount + 1);
         }
 
         IncrementCounter(ref _unreadCount, nameof(UnreadCount));
@@ -1080,7 +1104,100 @@ public abstract class WorkspaceView : ObservableObject
 
     internal void MarkHighlight()
     {
+        _untrackedHighlightCount = Math.Min(ConfigurationLimits.MaximumUnreadCount, _untrackedHighlightCount + 1);
         IncrementCounter(ref _highlightCount, nameof(HighlightCount));
+    }
+
+    internal void MarkActivity(WorkspaceActivity activity, TranscriptEntry entry)
+    {
+        if (activity == WorkspaceActivity.None) return;
+        if (entry.ServerSequence < 1 || entry.ServerSessionEpoch < 1)
+        {
+            MarkActivity(activity);
+            return;
+        }
+        if (IsCoveredBySynchronizedReadMarker(entry)) return;
+
+        MarkActivityCore(activity, trackAsUntracked: false);
+        TrackSynchronizedUnreadActivity(entry, activity == WorkspaceActivity.Important, entry.IsHighlight);
+    }
+
+    internal void MarkHighlight(TranscriptEntry entry)
+    {
+        if (entry.ServerSequence < 1 || entry.ServerSessionEpoch < 1)
+        {
+            MarkHighlight();
+            return;
+        }
+        if (IsCoveredBySynchronizedReadMarker(entry)) return;
+
+        IncrementCounter(ref _highlightCount, nameof(HighlightCount));
+        TrackSynchronizedUnreadActivity(entry, Important: false, Highlight: true);
+    }
+
+    internal bool IsCoveredBySynchronizedReadMarker(TranscriptEntry entry) =>
+        _synchronizedReadEpoch > 0 && entry.ServerSessionEpoch > 0
+        && ComparePosition(entry.ServerSessionEpoch, entry.ServerSequence, _synchronizedReadEpoch, _synchronizedReadSequence) <= 0;
+
+    internal void ApplySynchronizedReadMarker(NexIrcReadMarker marker)
+    {
+        ArgumentNullException.ThrowIfNull(marker);
+        if (marker.SessionEpoch < 1 || marker.Sequence < 1 || marker.Revision < 1
+            || _synchronizedReadEpoch > marker.SessionEpoch
+            || marker.Revision <= _synchronizedReadRevision
+            || _synchronizedReadEpoch == marker.SessionEpoch && _synchronizedReadSequence > marker.Sequence
+            || _synchronizedReadEpoch == marker.SessionEpoch && _synchronizedReadSequence == marker.Sequence
+                && !string.Equals(_synchronizedReadMessageId, marker.MessageId, StringComparison.Ordinal))
+            return;
+
+        _synchronizedReadEpoch = marker.SessionEpoch;
+        _synchronizedReadSequence = marker.Sequence;
+        _synchronizedReadRevision = marker.Revision;
+        _synchronizedReadMessageId = marker.MessageId;
+        var remaining = _synchronizedUnreadActivities.Where(item =>
+            ComparePosition(item.SessionEpoch, item.Sequence, _synchronizedReadEpoch, _synchronizedReadSequence) > 0).ToArray();
+        _unreadCount = Math.Min(ConfigurationLimits.MaximumUnreadCount, _untrackedUnreadCount + remaining.Length);
+        _importantCount = Math.Min(ConfigurationLimits.MaximumUnreadCount,
+            _untrackedImportantCount + remaining.Count(static item => item.Important));
+        _highlightCount = Math.Min(ConfigurationLimits.MaximumUnreadCount,
+            _untrackedHighlightCount + remaining.Count(static item => item.Highlight));
+        _synchronizedUnreadActivities.Clear();
+        _synchronizedUnreadActivities.AddRange(remaining.TakeLast(ConfigurationLimits.MaximumUnreadCount));
+        _recoveredUnread = false;
+        _recoveredHistoryCount = 0;
+        OnPropertyChanged(nameof(UnreadCount));
+        OnPropertyChanged(nameof(ImportantCount));
+        OnPropertyChanged(nameof(HighlightCount));
+        OnPropertyChanged(nameof(RecoveredUnread));
+        OnPropertyChanged(nameof(RecoveredHistoryCount));
+        RefreshActivity();
+    }
+
+    private void TrackSynchronizedUnreadActivity(TranscriptEntry entry, bool Important, bool Highlight)
+    {
+        var existingIndex = _synchronizedUnreadActivities.FindIndex(item => item.SessionEpoch == entry.ServerSessionEpoch
+            && item.Sequence == entry.ServerSequence);
+        if (existingIndex >= 0)
+        {
+            var existing = _synchronizedUnreadActivities[existingIndex];
+            _synchronizedUnreadActivities[existingIndex] = existing with
+            {
+                Important = existing.Important || Important,
+                Highlight = existing.Highlight || Highlight
+            };
+            return;
+        }
+
+        _synchronizedUnreadActivities.Add(new SynchronizedUnreadActivity(entry.ServerSessionEpoch,
+            entry.ServerSequence, Important, Highlight));
+        if (_synchronizedUnreadActivities.Count > ConfigurationLimits.MaximumUnreadCount)
+            _synchronizedUnreadActivities.RemoveAt(0);
+    }
+
+    private static int ComparePosition(int leftEpoch, long leftSequence, int rightEpoch, long rightSequence)
+    {
+        var epoch = leftEpoch.CompareTo(rightEpoch);
+        return epoch != 0 ? epoch : leftSequence.CompareTo(rightSequence);
     }
 
     private void IncrementCounter(ref int counter, string propertyName)
@@ -1108,6 +1225,10 @@ public abstract class WorkspaceView : ObservableObject
         _unreadCount = 0;
         _importantCount = 0;
         _highlightCount = 0;
+        _untrackedUnreadCount = 0;
+        _untrackedImportantCount = 0;
+        _untrackedHighlightCount = 0;
+        _synchronizedUnreadActivities.Clear();
         _recoveredUnread = false;
         _recoveredHistoryCount = 0;
         OnPropertyChanged(nameof(UnreadCount));
@@ -1174,6 +1295,8 @@ public abstract class WorkspaceView : ObservableObject
     internal void ReopenView() => IsViewOpen = true;
 
     internal void SetLifecycleState(ConversationLifecycleState state) => LifecycleState = state;
+
+    private sealed record SynchronizedUnreadActivity(int SessionEpoch, long Sequence, bool Important, bool Highlight);
 
     public void SetHistoryContext(IEnumerable<HistoryContextEntry> entries, string? match)
     {

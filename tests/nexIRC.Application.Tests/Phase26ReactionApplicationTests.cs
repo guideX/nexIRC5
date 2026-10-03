@@ -49,6 +49,7 @@ public sealed class Phase26ReactionApplicationTests
         Assert.Equal(1, updated.ReactionSummary[0].Count);
         Assert.True(updated.ReactionSummary[0].CurrentUserReacted);
         Assert.Equal(entryCountBeforeReaction, channel.EntryCount);
+        await WaitForAsync(() => transport.OutboundLines.Contains("@+reply=P;+draft/react=👍 TAGMSG #room"));
         Assert.Contains("@+reply=P;+draft/react=👍 TAGMSG #room", transport.OutboundLines);
 
         transport.EnqueueInboundLine("@+reply=P;+draft/react=👍;account=alice;msgid=Echo.ID :alice!u@h TAGMSG #room");

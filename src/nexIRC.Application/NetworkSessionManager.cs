@@ -2164,6 +2164,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         workspace.Activate(view);
         ActiveNetwork = workspace;
         ActiveView = view;
+        TryAdvanceSynchronizedReadState(workspace, view);
         _navigationHistory.Record(ConversationIdentity.From(view));
         NotifyNavigationChanged();
     }
@@ -3551,6 +3552,13 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private void ReplaceSession(SessionEntry entry)
     {
         var previousGeneration = entry.Workspace.Snapshot.ConnectionGeneration;
+        entry.SynchronizedReadMarkers.Clear();
+        entry.SynchronizedReadSessionEpoch = 0;
+        lock (_pendingGate)
+        {
+            entry.PendingSynchronizedReadAdvances.Clear();
+            entry.ScheduledSynchronizedReadAdvances.Clear();
+        }
         entry.Session = new ServerSession(
             entry.Options.ToSessionOptions(
                 entry.Workspace.Id,
@@ -4854,6 +4862,135 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }, DispatchCategory(item.Event));
     }
 
+    private void ApplySynchronizedReadState(SessionEntry entry, IrcNexIrcReadStateEvent stateEvent, ServerSessionSnapshot snapshot)
+    {
+        if (stateEvent.Snapshot is { } stateSnapshot)
+        {
+            entry.SynchronizedReadMarkers.Clear();
+            entry.SynchronizedReadSessionEpoch = stateSnapshot.SessionEpoch;
+            foreach (var marker in stateSnapshot.ReadMarkers)
+            {
+                if (marker.ConversationKey.Length > NexIrcReadStateProtocol.MaximumConversationKeyLength
+                    || entry.SynchronizedReadMarkers.TryGetValue(marker.ConversationKey, out var existingMarker)
+                    && !IsNewerSynchronizedReadMarker(marker, existingMarker))
+                    continue;
+
+                entry.SynchronizedReadMarkers[marker.ConversationKey] = marker;
+                foreach (var view in entry.Workspace.Channels.Cast<WorkspaceView>().Concat(entry.Workspace.Queries))
+                {
+                    if (string.Equals(SynchronizedReadConversationKey(view, snapshot), marker.ConversationKey, StringComparison.Ordinal))
+                        view.ApplySynchronizedReadMarker(marker);
+                }
+            }
+            return;
+        }
+
+        if (stateEvent.Marker is not { } update) return;
+        if (entry.SynchronizedReadMarkers.TryGetValue(update.ConversationKey, out var current)
+            && !IsNewerSynchronizedReadMarker(update, current))
+            return;
+
+        entry.SynchronizedReadMarkers[update.ConversationKey] = update;
+        entry.SynchronizedReadSessionEpoch = Math.Max(entry.SynchronizedReadSessionEpoch, update.SessionEpoch);
+        foreach (var view in entry.Workspace.Channels.Cast<WorkspaceView>().Concat(entry.Workspace.Queries))
+        {
+            if (string.Equals(SynchronizedReadConversationKey(view, snapshot), update.ConversationKey, StringComparison.Ordinal))
+                view.ApplySynchronizedReadMarker(update);
+        }
+    }
+
+    private static bool IsNewerSynchronizedReadMarker(NexIrcReadMarker candidate, NexIrcReadMarker current)
+    {
+        if (candidate.Revision <= current.Revision || candidate.SessionEpoch < current.SessionEpoch
+            || candidate.SessionEpoch == current.SessionEpoch && candidate.Sequence < current.Sequence)
+            return false;
+        return candidate.SessionEpoch > current.SessionEpoch || candidate.Sequence > current.Sequence
+            || string.Equals(candidate.MessageId, current.MessageId, StringComparison.Ordinal);
+    }
+
+    private void TryAdvanceSynchronizedReadState(NetworkWorkspace workspace, WorkspaceView view)
+    {
+        if (view is not (ChannelView or QueryView) || !view.IsActive || view.IsViewingHistory || !view.IsFollowingLive
+            || !workspace.Session.SynchronizedReadStateAvailable)
+            return;
+
+        var snapshot = workspace.Session.Snapshot;
+        if (!snapshot.Endpoint.UseTls || snapshot.Authentication.State != SaslAuthenticationState.Succeeded
+            || SynchronizedReadConversationKey(view, snapshot) is not { } key)
+            return;
+
+        var latest = view.EntriesSnapshot
+            .Where(static item => item.ServerSequence > 0 && item.ServerSessionEpoch > 0
+                && item.ServerMessageId is { Length: > 0 })
+            .OrderBy(static item => item.ServerSessionEpoch)
+            .ThenBy(static item => item.ServerSequence)
+            .LastOrDefault();
+        if (latest is null) return;
+
+        if (!TryGetEntry(workspace.Id, out var sessionEntry)) return;
+        Task? task = null;
+        lock (_pendingGate)
+        {
+            sessionEntry.PendingSynchronizedReadAdvances[key] = (latest.ServerSequence, latest.ServerMessageId!);
+            if (sessionEntry.ScheduledSynchronizedReadAdvances.Add(key))
+            {
+                task = DrainSynchronizedReadAdvancesAsync(sessionEntry, workspace.Session, key);
+                _pendingDispatches.Add(task);
+            }
+        }
+        if (task is not null) _ = RemovePendingAsync(task);
+    }
+
+    private async Task DrainSynchronizedReadAdvancesAsync(SessionEntry entry, ServerSession session, string key)
+    {
+        while (true)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(100)).ConfigureAwait(false);
+            (long Sequence, string MessageId) advance;
+            lock (_pendingGate)
+            {
+                if (!entry.PendingSynchronizedReadAdvances.Remove(key, out advance))
+                {
+                    entry.ScheduledSynchronizedReadAdvances.Remove(key);
+                    return;
+                }
+            }
+
+            await AdvanceSynchronizedReadStateAsync(session, key, advance.Sequence, advance.MessageId).ConfigureAwait(false);
+            lock (_pendingGate)
+            {
+                if (!entry.PendingSynchronizedReadAdvances.ContainsKey(key))
+                {
+                    entry.ScheduledSynchronizedReadAdvances.Remove(key);
+                    return;
+                }
+            }
+        }
+    }
+
+    private static async Task AdvanceSynchronizedReadStateAsync(ServerSession session, string key, long sequence, string messageId)
+    {
+        try { _ = await session.TryAdvanceSynchronizedReadStateAsync(key, sequence, messageId).ConfigureAwait(false); }
+        catch (Exception exception) when (exception is InvalidOperationException or OperationCanceledException or IOException or ObjectDisposedException)
+        {
+        }
+    }
+
+    private static string? SynchronizedReadConversationKey(WorkspaceView view, ServerSessionSnapshot snapshot)
+    {
+        var key = view switch
+        {
+            ChannelView channel => $"channel:{IrcCaseMappingComparer.Fold(channel.Channel, snapshot.Features.CaseMapping)}",
+            QueryView query when !query.IdentityEvidence.HasConflictingAccounts && query.IdentityEvidence.Accounts.Count == 1
+                => $"query-account:{query.IdentityEvidence.Accounts.Single()}",
+            _ => null
+        };
+        return key is { Length: > 0 and <= NexIrcReadStateProtocol.MaximumConversationKeyLength }
+            && !key.Any(char.IsControl)
+            ? key
+            : null;
+    }
+
     private async ValueTask ProjectNativeEventAsync(
         SessionEntry entry,
         SessionSemanticEvent item,
@@ -4890,6 +5027,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
         var snapshot = session.Snapshot;
         entry.Workspace.ApplySnapshot(snapshot);
+        if (item.Event is IrcNexIrcReadStateEvent readState)
+        {
+            ApplySynchronizedReadState(entry, readState, snapshot);
+            return true;
+        }
         RouteSemanticEvent(entry.Workspace, item.Event, snapshot, item.ReceivedAt);
         SignalReconnectBoundary(entry, session, item.Event, snapshot, item.ReceivedAt);
         return true;
@@ -5353,6 +5495,25 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             return;
         }
 
+        var hasSessionEntry = TryGetEntry(workspace.Id, out var sessionEntry);
+        if (semanticEvent.Message.TagValues.TryGetValue("resume-seq", out var rawSequence)
+            && rawSequence is not null
+            && NexIrcReadStateProtocol.TryParseSequence(rawSequence, out var serverSequence))
+        {
+            var stateEpoch = semanticEvent.Message.TagValues.TryGetValue("nexirc-state-epoch", out var rawEpoch)
+                && int.TryParse(rawEpoch, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var parsedEpoch)
+                ? parsedEpoch
+                : hasSessionEntry ? sessionEntry.SynchronizedReadSessionEpoch : 0;
+            entry = entry with { ServerSequence = serverSequence, ServerSessionEpoch = stateEpoch };
+        }
+
+        if (hasSessionEntry
+            && SynchronizedReadConversationKey(view, snapshot) is { } synchronizedKey
+            && sessionEntry.SynchronizedReadMarkers.TryGetValue(synchronizedKey, out var knownMarker))
+        {
+            view.ApplySynchronizedReadMarker(knownMarker);
+        }
+
         var previousActivity = view.Activity;
         var isHistorical = semanticEvent.IsHistorical;
         var isResynchronization = IsResynchronizationEvent(view, semanticEvent, snapshot) || isHistorical;
@@ -5363,7 +5524,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             IrcCtcpEvent ctcp => IrcIdentity.Equals(ctcp.Message.Prefix?.Name ?? string.Empty, snapshot.Nickname, snapshot.Features.CaseMapping),
             _ => false
         };
-        var effectiveActivity = isResynchronization || isOwnMessage || isHistorical
+        var alreadyRead = view.IsCoveredBySynchronizedReadMarker(entry);
+        var effectiveActivity = isResynchronization || isOwnMessage || isHistorical || alreadyRead
             ? WorkspaceActivity.None
             : activity ?? HighlightPolicy.Classify(view, semanticEvent, snapshot);
         if (isResynchronization)
@@ -5406,7 +5568,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         view.RefreshReplyRelationships(CanRecoverReplyParent(workspace, view));
         if (entry.IsHighlight && !isResynchronization && !isHistorical)
         {
-            view.MarkHighlight();
+            view.MarkHighlight(entry);
         }
 
         if (!isResynchronization && !isHistorical && view is ChannelView channel && semanticEvent is IrcJoinEvent)
@@ -5446,9 +5608,13 @@ public sealed class NetworkSessionManager : IAsyncDisposable
                     view.IsFollowingLive),
                 notify: false);
         }
+        if (!isResynchronization && !isHistorical && view.IsActive && view.IsFollowingLive)
+        {
+            TryAdvanceSynchronizedReadState(workspace, view);
+        }
         if (!view.IsActive && effectiveActivity != WorkspaceActivity.None)
         {
-            view.MarkActivity(effectiveActivity);
+            view.MarkActivity(effectiveActivity, entry);
         }
 
         if (!view.IsActive && view.Activity > previousActivity)
@@ -5742,7 +5908,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     private static WorkspaceDispatchActionCategory DispatchCategory(IrcSemanticEvent semanticEvent) => semanticEvent switch
     {
-        IrcPrivmsgEvent or IrcQueryMessageEvent or IrcCtcpEvent or IrcReactionEvent => WorkspaceDispatchActionCategory.IncomingMessage,
+        IrcPrivmsgEvent or IrcQueryMessageEvent or IrcCtcpEvent or IrcReactionEvent or IrcNexIrcReadStateEvent => WorkspaceDispatchActionCategory.IncomingMessage,
         IrcJoinEvent or IrcPartEvent or IrcQuitEvent or IrcKickEvent or IrcAwayEvent or IrcAccountEvent or IrcNamesEvent or IrcNamesCompleteEvent or IrcWhoEvent or IrcWhoEndEvent => WorkspaceDispatchActionCategory.Membership,
         IrcModeEvent or IrcTopicEvent or IrcTopicUnsetEvent or IrcTopicMetadataEvent => WorkspaceDispatchActionCategory.ModeOrTopic,
         IrcNicknameChangedEvent or IrcChannelSynchronizationEvent or IrcWelcomeEvent or IrcRegistrationStateEvent or IrcCapabilityChangedEvent or IrcSaslStateChangedEvent or IrcBatchEvent or IrcMotdEvent => WorkspaceDispatchActionCategory.Lifecycle,
@@ -5873,6 +6039,14 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         public Dictionary<string, ReconnectHistoryBoundary> ReconnectBoundaries { get; } = new(StringComparer.Ordinal);
 
         public Dictionary<string, TaskCompletionSource<ReconnectHistoryBoundary>> ReconnectBoundarySignals { get; } = new(StringComparer.Ordinal);
+
+        public Dictionary<string, NexIrcReadMarker> SynchronizedReadMarkers { get; } = new(StringComparer.Ordinal);
+
+        public int SynchronizedReadSessionEpoch { get; set; }
+
+        public Dictionary<string, (long Sequence, string MessageId)> PendingSynchronizedReadAdvances { get; } = new(StringComparer.Ordinal);
+
+        public HashSet<string> ScheduledSynchronizedReadAdvances { get; } = new(StringComparer.Ordinal);
 
         public HistoryGapLedger GapLedger { get; } = new();
 

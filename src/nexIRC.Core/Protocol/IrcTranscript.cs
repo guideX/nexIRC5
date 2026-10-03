@@ -153,6 +153,13 @@ public static class IrcSensitiveData
         var tokens = commandText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var prefix = commandIndex >= 0 ? line[..(commandIndex + 1)] : string.Empty;
 
+        if (tokens.Length >= 2 && tokens[1].Equals("STATE", StringComparison.OrdinalIgnoreCase))
+        {
+            return tokens.Length >= 4 && tokens[2].Equals("ACK", StringComparison.OrdinalIgnoreCase)
+                ? prefix + $"NEXIRC STATE ACK {tokens[3]}"
+                : prefix + "NEXIRC STATE <redacted>";
+        }
+
         if (tokens.Length >= 4 && tokens[1].Equals("PAIR", StringComparison.OrdinalIgnoreCase))
         {
             if (tokens[2].Equals("CREATED", StringComparison.OrdinalIgnoreCase) && tokens.Length >= 5)
