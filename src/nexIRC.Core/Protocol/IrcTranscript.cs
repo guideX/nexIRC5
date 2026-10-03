@@ -190,6 +190,11 @@ public static class IrcSensitiveData
             if (tokens[2].Equals("ACCEPT", StringComparison.OrdinalIgnoreCase) && tokens.Length >= 7)
             {
                 tokens[4] = $"<redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[4])}>";
+                if (tokens.Length >= 8)
+                {
+                    tokens[7] = $"<redacted:{NexIrcResumeProtocol.FingerprintToken(tokens[7])}>";
+                }
+
                 return prefix + string.Join(' ', tokens);
             }
 
