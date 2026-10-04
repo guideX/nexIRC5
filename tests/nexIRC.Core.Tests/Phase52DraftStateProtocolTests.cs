@@ -26,6 +26,29 @@ public sealed class Phase52DraftStateProtocolTests
     }
 
     [Fact]
+    public void DraftPayloadEnforcesExactUtf8BoundaryWithoutTruncatingScalars()
+    {
+        var belowLimit = new string('x', NexIrcDraftStateProtocol.MaximumDraftUtf8Bytes - 1);
+        Assert.Equal(4095, Encoding.UTF8.GetByteCount(belowLimit));
+        Assert.True(NexIrcDraftStateProtocol.TryEncodePayload(belowLimit, out var belowPayload));
+        Assert.True(NexIrcDraftStateProtocol.TryDecodePayload(belowPayload, out var decoded));
+        Assert.Equal(belowLimit, decoded);
+
+        var exactLimit = new string('x', NexIrcDraftStateProtocol.MaximumDraftUtf8Bytes);
+        Assert.True(NexIrcDraftStateProtocol.TryEncodePayload(exactLimit, out var exactPayload));
+        Assert.True(NexIrcDraftStateProtocol.TryDecodePayload(exactPayload, out decoded));
+        Assert.Equal(exactLimit, decoded);
+
+        Assert.False(NexIrcDraftStateProtocol.TryEncodePayload(exactLimit + "x", out _));
+        Assert.False(NexIrcDraftStateProtocol.TryEncodePayload(new string('x', 4095) + "🌍", out _));
+
+        var oversizedBytes = Encoding.UTF8.GetBytes(exactLimit + "x");
+        var oversizedPayload = Convert.ToBase64String(oversizedBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        Assert.False(NexIrcDraftStateProtocol.TryDecodePayload(oversizedPayload, out _));
+        Assert.False(NexIrcDraftStateProtocol.TryDecodePayload(string.Empty, out _));
+    }
+
+    [Fact]
     public void DraftProtocolRejectsMalformedUtf8NoncanonicalBase64AndInvalidRevisions()
     {
         Assert.False(NexIrcDraftStateProtocol.TryDecodePayload("_w", out _));

@@ -1,6 +1,5 @@
 using System.Collections.ObjectModel;
 using System.IO;
-using System.Text;
 using System.Windows.Input;
 using nexIRC.Application;
 using nexIRC.Core.Networking;
@@ -200,7 +199,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         get => _inputText;
         set
         {
-            var normalized = LimitDraftUtf8(value ?? string.Empty);
+            var normalized = value ?? string.Empty;
             if (SetProperty(ref _inputText, normalized) && !_applyingDraftProjection)
                 CaptureActiveDraft(normalized);
         }
@@ -1107,6 +1106,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             if (!Sessions.TryGetView(pair.Key.ViewId, out _, out var view) || view is null) continue;
             var state = pair.Value;
             if (state.HasConflict || !state.HasSnapshot
+                || !NexIrcDraftStateProtocol.TryEncodePayload(state.Text, out _)
                 || !Sessions.TryGet(view.NetworkId, out var workspace) || workspace is null
                 || NetworkSessionManager.SynchronizedDraftConversationKey(view, workspace.Snapshot) is not { } key
                 || !string.Equals(key, state.ConversationKey, StringComparison.Ordinal))
@@ -1252,20 +1252,6 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             StatusText = "Local draft storage could not be updated; this draft remains available until the application closes.";
     }
 
-    private static string LimitDraftUtf8(string text)
-    {
-        if (NexIrcDraftStateProtocol.TryEncodePayload(text, out _)) return text;
-        var builder = new StringBuilder(Math.Min(text.Length, ConfigurationLimits.MaximumDraftLength));
-        var bytes = 0;
-        foreach (var rune in text.EnumerateRunes())
-        {
-            if (bytes + rune.Utf8SequenceLength > NexIrcDraftStateProtocol.MaximumDraftUtf8Bytes) break;
-            builder.Append(rune.ToString());
-            bytes += rune.Utf8SequenceLength;
-        }
-        return builder.ToString();
-    }
-
     private void SetProjectedInput(string text)
     {
         _applyingDraftProjection = true;
@@ -1276,6 +1262,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private void ScheduleDraftSynchronization(WorkspaceView view, ComposerDraftState state)
     {
         if (state.HasConflict || !state.HasSnapshot || state.PendingAwaitingResponse
+            || !NexIrcDraftStateProtocol.TryEncodePayload(state.Text, out _)
             || state.Text == state.ServerText && state.PendingMutationId is null
             || !Sessions.TryGet(view.NetworkId, out var workspace) || workspace is null
             || NetworkSessionManager.SynchronizedDraftConversationKey(view, workspace.Snapshot) is not { } key
@@ -1316,6 +1303,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private void StartDraftMutation(WorkspaceView view, ComposerDraftState state)
     {
         if (state.HasConflict || !state.HasSnapshot || state.PendingAwaitingResponse
+            || !NexIrcDraftStateProtocol.TryEncodePayload(state.Text, out _)
             || !Sessions.TryGet(view.NetworkId, out var workspace) || workspace is null
             || NetworkSessionManager.SynchronizedDraftConversationKey(view, workspace.Snapshot) is not { } key
             || !string.Equals(key, state.ConversationKey, StringComparison.Ordinal))
@@ -1400,7 +1388,6 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             state.HasSnapshot = true;
             state.ServerText = authority.Text;
             state.ServerRevision = authority.Revision;
-            state.BaseRevision = authority.Revision;
             state.HasConflict = true;
             state.HasLocalChanges = true;
             PersistDraftState(state);
@@ -1445,7 +1432,6 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             {
                 state.ServerText = authority.Text;
                 state.ServerRevision = authority.Revision;
-                state.BaseRevision = authority.Revision;
                 state.HasConflict = true;
                 state.HasLocalChanges = true;
                 state.ClearAfterSuccessfulSend = false;
@@ -1465,9 +1451,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             state.ClearAfterSuccessfulSend = false;
             state.ServerText = authority.Text;
             state.ServerRevision = authority.Revision;
-            state.BaseRevision = authority.Revision;
             state.HasConflict = !serverStillAtKnownBase && state.Text != authority.Text;
             state.HasLocalChanges = state.Text != authority.Text;
+            if (!state.HasConflict) state.BaseRevision = authority.Revision;
         }
         else if (state.HasConflict)
         {
@@ -1498,7 +1484,6 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             state.ServerText = authority.Text;
             state.ServerRevision = authority.Revision;
-            state.BaseRevision = authority.Revision;
             state.HasConflict = true;
             state.HasLocalChanges = true;
         }
@@ -1521,7 +1506,6 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             state.ServerText = stateEvent.AuthoritativeText ?? string.Empty;
             state.ServerRevision = revision;
-            state.BaseRevision = revision;
             state.HasConflict = true;
             state.HasLocalChanges = true;
             state.ClearAfterSuccessfulSend = false;

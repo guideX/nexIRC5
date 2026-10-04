@@ -45,6 +45,7 @@ public sealed class ProtectedJsonConversationDraftStore(string path, IResumeSecr
 {
     private const int MaximumFileBytes = 16 * 1024 * 1024;
     private const int MaximumDraftRecords = 4096;
+    private const int MaximumLocalDraftUtf8Bytes = 64 * 1024;
     private const string ProtectionContext = "nexirc-local-conversation-drafts-v1";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string _path = Path.GetFullPath(string.IsNullOrWhiteSpace(path)
@@ -135,12 +136,19 @@ public sealed class ProtectedJsonConversationDraftStore(string path, IResumeSecr
         return draft.ProfileId != Guid.Empty
             && !string.IsNullOrWhiteSpace(draft.ConversationKey)
             && draft.ConversationKey.Length <= 512 && !draft.ConversationKey.Any(char.IsControl)
-            && NexIrcDraftStateProtocol.TryEncodePayload(draft.Text, out _)
+            && IsValidLocalDraftText(draft.Text)
             && NexIrcDraftStateProtocol.TryEncodePayload(draft.ServerText, out _)
             && draft.BaseRevision >= 0 && draft.ServerRevision >= 0
             && (draft.PendingMutationId is null || NexIrcDraftStateProtocol.IsValidMutationId(draft.PendingMutationId))
             && (draft.PendingBaseRevision is null || draft.PendingBaseRevision.Value >= 0)
             && (draft.PendingBaseRevision is null || draft.PendingBaseRevision.Value < long.MaxValue)
             && (draft.PendingText is null || NexIrcDraftStateProtocol.TryEncodePayload(draft.PendingText, out _));
+    }
+
+    private static bool IsValidLocalDraftText(string? text)
+    {
+        if (text is null || text.Contains('\0')) return false;
+        try { return new UTF8Encoding(false, true).GetByteCount(text) <= MaximumLocalDraftUtf8Bytes; }
+        catch (EncoderFallbackException) { return false; }
     }
 }

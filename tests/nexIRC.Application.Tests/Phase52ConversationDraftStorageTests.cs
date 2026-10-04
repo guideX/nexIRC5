@@ -35,6 +35,23 @@ public sealed class Phase52ConversationDraftStorageTests
     }
 
     [Fact]
+    public void ProtectedDraftSnapshotRetainsLocallyAvailableTextAboveSyncByteLimit()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "conversation-drafts.json");
+        var text = new string('x', 4097);
+        var expected = new LocalConversationDraft(Guid.NewGuid(), "channel:#large-local", text, 0,
+            string.Empty, 0, false, HasLocalChanges: true);
+        var firstProcessStore = new ProtectedJsonConversationDraftStore(path, new TestProtector());
+
+        Assert.False(nexIRC.Core.Protocol.NexIrcDraftStateProtocol.TryEncodePayload(text, out _));
+        Assert.True(firstProcessStore.Save([expected]));
+
+        var restartedStore = new ProtectedJsonConversationDraftStore(path, new TestProtector());
+        Assert.Equal(expected, Assert.Single(restartedStore.Load()));
+    }
+
+    [Fact]
     public void CorruptOrOversizedDraftSnapshotDoesNotFabricateText()
     {
         using var directory = new TemporaryDirectory();
@@ -44,7 +61,7 @@ public sealed class Phase52ConversationDraftStorageTests
         var store = new ProtectedJsonConversationDraftStore(path, new TestProtector());
         Assert.Empty(store.Load());
         Assert.False(store.Save([new LocalConversationDraft(
-            Guid.NewGuid(), "channel:#alpha", new string('界', 1366), 0, string.Empty, 0, false)]));
+            Guid.NewGuid(), "channel:#alpha", new string('界', 21_846), 0, string.Empty, 0, false)]));
     }
 
     [Fact]

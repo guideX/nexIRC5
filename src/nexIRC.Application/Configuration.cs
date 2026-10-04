@@ -55,7 +55,6 @@ public static class ConfigurationLimits
     public const int MaximumHistorySearchIndexBlocks = 4096;
     public const int HistorySearchIndexBloomBytes = 128;
     public const int MaximumConversationNavigationHistory = 64;
-    public const int MaximumDraftLength = 4096;
     public const int MaximumLogRecordBytes = 32_768;
     public const int MaximumNotificationCoalescingEntries = 256;
     public const int MaximumIgnoreRules = 256;

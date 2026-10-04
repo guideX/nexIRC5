@@ -1704,28 +1704,46 @@ internal static class UiSmokeHarness
         viewModel.InputText = "draft from B";
         viewModel.OnSynchronizedDraftStateReceived(alpha, new IrcNexIrcDraftStateEvent(stateMessage,
             Snapshot: new NexIrcDraftStateSnapshot([new NexIrcDraft(conversationKey, "draft from A", 6)])));
+        viewModel.OnSynchronizedDraftStateReceived(alpha, new IrcNexIrcDraftStateEvent(stateMessage,
+            Draft: new NexIrcDraft(conversationKey, "draft from A2", 7, "abcdef0123456789abcdef0123456789")));
+        var preservedConflict = window.ConversationDraftStore.Load().Single(draft => draft.ProfileId == alpha.ProfileId
+            && draft.ConversationKey == conversationKey);
         Require(viewModel.IsDraftConflictVisible && viewModel.InputText == "draft from B"
-            && viewModel.DraftConflictText.Contains("revision 6", StringComparison.Ordinal),
-            "a newer remote edit silently replaced the active local draft instead of presenting a conflict");
+            && viewModel.DraftConflictText.Contains("revision 7", StringComparison.Ordinal)
+            && preservedConflict.HasConflict && preservedConflict.Text == "draft from B"
+            && preservedConflict.BaseRevision == 5 && preservedConflict.ServerText == "draft from A2"
+            && preservedConflict.ServerRevision == 7,
+            $"a newer remote edit silently replaced local text or failed to retain both conflict revisions and texts (visible={viewModel.IsDraftConflictVisible}, local={preservedConflict.Text}, base={preservedConflict.BaseRevision}, server={preservedConflict.ServerText}, serverRevision={preservedConflict.ServerRevision}, conflict={preservedConflict.HasConflict})");
 
         viewModel.ReplaceServerDraftCommand.Execute(null);
         var replacePending = window.ConversationDraftStore.Load().Single(draft => draft.ProfileId == alpha.ProfileId
             && draft.ConversationKey == conversationKey);
-        Require(!replacePending.HasConflict && replacePending.PendingBaseRevision == 6
+        Require(!replacePending.HasConflict && replacePending.PendingBaseRevision == 7
+            && replacePending.BaseRevision == 7 && replacePending.ServerRevision == 7
+            && replacePending.ServerText == "draft from A2" && replacePending.Text == "draft from B"
             && replacePending.PendingText == "draft from B",
             "explicit local resolution did not stage its text against the current server revision");
         viewModel.OnSynchronizedDraftStateReceived(alpha, new IrcNexIrcDraftStateEvent(stateMessage,
-            Draft: new NexIrcDraft(conversationKey, "draft from B", 7, replacePending.PendingMutationId)));
+            Draft: new NexIrcDraft(conversationKey, "draft from B", 8, replacePending.PendingMutationId)));
         Require(!viewModel.IsDraftConflictVisible && viewModel.InputText == "draft from B",
             "an acknowledged explicit overwrite did not resolve the composer conflict");
 
         viewModel.InputText = "second local draft";
         viewModel.OnSynchronizedDraftStateReceived(alpha, new IrcNexIrcDraftStateEvent(stateMessage,
-            Draft: new NexIrcDraft(conversationKey, "server's next version", 8, "fedcba9876543210fedcba9876543210")));
+            Draft: new NexIrcDraft(conversationKey, "server's next version", 9, "fedcba9876543210fedcba9876543210")));
         Require(viewModel.IsDraftConflictVisible && viewModel.InputText == "second local draft",
             "a second authoritative update did not preserve the local conflict copy");
+        var localBeforeKeep = window.ConversationDraftStore.Load().Single(draft => draft.ProfileId == alpha.ProfileId
+            && draft.ConversationKey == conversationKey);
+        Require(localBeforeKeep.Text == "second local draft" && localBeforeKeep.ServerText == "server's next version"
+            && localBeforeKeep.HasConflict,
+            "the local conflict copy was discarded before the explicit Keep-server action");
         viewModel.KeepServerDraftCommand.Execute(null);
-        Require(!viewModel.IsDraftConflictVisible && viewModel.InputText == "server's next version",
+        var keptServer = window.ConversationDraftStore.Load().Single(draft => draft.ProfileId == alpha.ProfileId
+            && draft.ConversationKey == conversationKey);
+        Require(!viewModel.IsDraftConflictVisible && viewModel.InputText == "server's next version"
+            && keptServer.Text == "server's next version" && keptServer.BaseRevision == 9
+            && keptServer.ServerText == "server's next version" && !keptServer.HasConflict,
             "explicit keep-server resolution did not populate the authoritative text");
 
         viewModel.InputText = alphaDraft;
@@ -1788,6 +1806,13 @@ internal static class UiSmokeHarness
             && draft.ConversationKey == "channel:#late-state");
         Require(lateSnapshot.HasConflict && lateSnapshot.Text.Length == 0 && lateSnapshot.ServerText == "newer server text",
             "a pre-snapshot successful send overwrote a newer server draft when the initial snapshot arrived");
+
+        var overSyncLimit = new string('x', 4097);
+        viewModel.InputText = overSyncLimit;
+        var locallyAvailable = window.ConversationDraftStore.Load().Single(draft => draft.ProfileId == alpha.ProfileId
+            && draft.ConversationKey == "channel:#late-state");
+        Require(viewModel.InputText == overSyncLimit && locallyAvailable.Text == overSyncLimit,
+            "text above the synchronized UTF-8 limit was truncated instead of remaining available locally");
     }
 
     private static async Task ReconnectAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
