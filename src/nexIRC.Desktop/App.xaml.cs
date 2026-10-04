@@ -33,7 +33,7 @@ public partial class App : System.Windows.Application
 
         if (smokeScenario is not null && !UiSmokeHarness.IsKnownScenario(smokeScenario))
         {
-            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": unknown scenario. Expected the existing smoke scenarios, message-reaction, history-search, stale-search, index-recovery, ircv3-metadata, contextual-actions, sustained-interactivity, or close-idle/close-sustained/close-backlog/close-reconnect/close-partial/close-registered/close-persistence/close-interacted.");
+            Console.Error.WriteLine("FAIL_UI_SMOKE " + smokeScenario + ": unknown scenario. Expected the existing smoke scenarios, drafts, message-reaction, history-search, stale-search, index-recovery, ircv3-metadata, contextual-actions, sustained-interactivity, or close-idle/close-sustained/close-backlog/close-reconnect/close-partial/close-registered/close-persistence/close-interacted.");
             Environment.ExitCode = 2;
             Shutdown(2);
             return;
@@ -82,7 +82,8 @@ public partial class App : System.Windows.Application
                 "logs"));
         }
 
-        var window = new MainWindow(transportFactory, configuration, credentials, logStore);
+        var smokeDraftStore = smokeScenario is null ? null : new MemoryConversationDraftStore();
+        var window = new MainWindow(transportFactory, configuration, credentials, logStore, smokeDraftStore);
         MainWindow = window;
         window.Show();
         _ = CleanupLogsAsync(logStore, configuration);

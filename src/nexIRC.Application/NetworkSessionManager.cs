@@ -183,6 +183,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     public event EventHandler? NavigationChanged;
 
+    public event Action<NetworkWorkspace, IrcNexIrcDraftStateEvent>? SynchronizedDraftStateReceived;
+
     public IReadOnlyList<ConversationIdentity> NavigationHistory => _navigationHistory.Entries;
 
     public IReadOnlyList<ConversationNavigationItem> GetConversationNavigator(ConversationOrderingMode ordering = ConversationOrderingMode.Workspace)
@@ -253,6 +255,44 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         workspace = null;
         view = null;
         return false;
+    }
+
+    public async ValueTask<bool> TryUpdateSynchronizedDraftAsync(WorkspaceView view, long baseRevision,
+        string mutationId, string text, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(view);
+        if (view is not (ChannelView or QueryView)
+            || !TryGet(view.NetworkId, out var workspace) || workspace is null
+            || SynchronizedDraftConversationKey(view, workspace.Snapshot) is not { } key)
+            return false;
+        return await workspace.Session.TryUpdateSynchronizedDraftAsync(key, baseRevision, mutationId, text, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    public bool TryGetSynchronizedDraftState(WorkspaceView view, out NexIrcDraft? draft)
+    {
+        draft = null;
+        if (view is not (ChannelView or QueryView)
+            || !TryGet(view.NetworkId, out var workspace) || workspace is null
+            || SynchronizedDraftConversationKey(view, workspace.Snapshot) is not { } key
+            || !TryGetEntry(workspace.Id, out var entry) || !entry.SynchronizedDraftSnapshotReceived)
+            return false;
+        entry.SynchronizedDrafts.TryGetValue(key, out draft);
+        return true;
+    }
+
+    public static string? SynchronizedDraftConversationKey(WorkspaceView view, ServerSessionSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(view);
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var key = view switch
+        {
+            ChannelView channel => $"channel:{IrcCaseMappingComparer.Fold(channel.Channel, snapshot.Features.CaseMapping)}",
+            QueryView query when !query.IdentityEvidence.HasConflictingAccounts && query.IdentityEvidence.Accounts.Count == 1
+                => $"query-account:{query.IdentityEvidence.Accounts.Single()}",
+            _ => null
+        };
+        return NexIrcDraftStateProtocol.IsValidConversationKey(key) ? key : null;
     }
 
     public ChannelView EnsureChannel(Guid networkId, string channel)
@@ -4899,6 +4939,45 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         }
     }
 
+    private void ApplySynchronizedDraftState(SessionEntry entry, IrcNexIrcDraftStateEvent stateEvent)
+    {
+        if (stateEvent.Snapshot is { } snapshot)
+        {
+            entry.SynchronizedDraftSnapshotReceived = true;
+            entry.SynchronizedDrafts.Clear();
+            foreach (var draft in snapshot.Drafts)
+            {
+                if (NexIrcDraftStateProtocol.IsValidConversationKey(draft.ConversationKey)
+                    && NexIrcDraftStateProtocol.TryEncodePayload(draft.Text, out _)
+                    && draft.Revision > 0)
+                    entry.SynchronizedDrafts[draft.ConversationKey] = draft;
+            }
+        }
+        else if (stateEvent.Draft is { } update
+            && NexIrcDraftStateProtocol.IsValidConversationKey(update.ConversationKey)
+            && entry.SynchronizedDrafts.TryGetValue(update.ConversationKey, out var current)
+            && update.Revision > current.Revision)
+        {
+            entry.SynchronizedDrafts[update.ConversationKey] = update;
+        }
+        else if (stateEvent.Draft is { } firstUpdate
+            && NexIrcDraftStateProtocol.IsValidConversationKey(firstUpdate.ConversationKey)
+            && firstUpdate.Revision > 0)
+        {
+            entry.SynchronizedDrafts[firstUpdate.ConversationKey] = firstUpdate;
+        }
+        else if (string.Equals(stateEvent.Status, "CONFLICT", StringComparison.OrdinalIgnoreCase)
+            && stateEvent.ConversationKey is { } conflictKey && stateEvent.AuthoritativeRevision is { } conflictRevision)
+        {
+            if (conflictRevision == 0)
+                entry.SynchronizedDrafts.Remove(conflictKey);
+            else if (stateEvent.AuthoritativeText is { } conflictText)
+                entry.SynchronizedDrafts[conflictKey] = new NexIrcDraft(conflictKey, conflictText, conflictRevision);
+        }
+
+        SynchronizedDraftStateReceived?.Invoke(entry.Workspace, stateEvent);
+    }
+
     private static bool IsNewerSynchronizedReadMarker(NexIrcReadMarker candidate, NexIrcReadMarker current)
     {
         if (candidate.Revision <= current.Revision || candidate.SessionEpoch < current.SessionEpoch
@@ -5030,6 +5109,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         if (item.Event is IrcNexIrcReadStateEvent readState)
         {
             ApplySynchronizedReadState(entry, readState, snapshot);
+            return true;
+        }
+        if (item.Event is IrcNexIrcDraftStateEvent draftState)
+        {
+            ApplySynchronizedDraftState(entry, draftState);
             return true;
         }
         RouteSemanticEvent(entry.Workspace, item.Event, snapshot, item.ReceivedAt);
@@ -5908,7 +5992,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     private static WorkspaceDispatchActionCategory DispatchCategory(IrcSemanticEvent semanticEvent) => semanticEvent switch
     {
-        IrcPrivmsgEvent or IrcQueryMessageEvent or IrcCtcpEvent or IrcReactionEvent or IrcNexIrcReadStateEvent => WorkspaceDispatchActionCategory.IncomingMessage,
+        IrcPrivmsgEvent or IrcQueryMessageEvent or IrcCtcpEvent or IrcReactionEvent or IrcNexIrcReadStateEvent or IrcNexIrcDraftStateEvent => WorkspaceDispatchActionCategory.IncomingMessage,
         IrcJoinEvent or IrcPartEvent or IrcQuitEvent or IrcKickEvent or IrcAwayEvent or IrcAccountEvent or IrcNamesEvent or IrcNamesCompleteEvent or IrcWhoEvent or IrcWhoEndEvent => WorkspaceDispatchActionCategory.Membership,
         IrcModeEvent or IrcTopicEvent or IrcTopicUnsetEvent or IrcTopicMetadataEvent => WorkspaceDispatchActionCategory.ModeOrTopic,
         IrcNicknameChangedEvent or IrcChannelSynchronizationEvent or IrcWelcomeEvent or IrcRegistrationStateEvent or IrcCapabilityChangedEvent or IrcSaslStateChangedEvent or IrcBatchEvent or IrcMotdEvent => WorkspaceDispatchActionCategory.Lifecycle,
@@ -6041,6 +6125,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         public Dictionary<string, TaskCompletionSource<ReconnectHistoryBoundary>> ReconnectBoundarySignals { get; } = new(StringComparer.Ordinal);
 
         public Dictionary<string, NexIrcReadMarker> SynchronizedReadMarkers { get; } = new(StringComparer.Ordinal);
+
+        public Dictionary<string, NexIrcDraft> SynchronizedDrafts { get; } = new(StringComparer.Ordinal);
+
+        public bool SynchronizedDraftSnapshotReceived { get; set; }
 
         public int SynchronizedReadSessionEpoch { get; set; }
 

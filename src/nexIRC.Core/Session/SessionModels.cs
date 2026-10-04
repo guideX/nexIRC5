@@ -244,6 +244,16 @@ public sealed record IrcNexIrcReadStateEvent(
     NexIrcReadMarker? Marker = null,
     string? Status = null) : IrcSemanticEvent(Message);
 
+public sealed record IrcNexIrcDraftStateEvent(
+    IrcMessage Message,
+    NexIrcDraftStateSnapshot? Snapshot = null,
+    NexIrcDraft? Draft = null,
+    string? Status = null,
+    string? MutationId = null,
+    string? ConversationKey = null,
+    long? AuthoritativeRevision = null,
+    string? AuthoritativeText = null) : IrcSemanticEvent(Message);
+
 public sealed record IrcChannelSynchronizationEvent(
     IrcMessage Message,
     string Channel,

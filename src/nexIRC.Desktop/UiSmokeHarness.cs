@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using nexIRC.Application;
 using nexIRC.Core.Networking;
+using nexIRC.Core.Protocol;
 using nexIRC.Core.Session;
 using nexIRC.Networking.Testing;
 
@@ -24,6 +25,7 @@ internal static class UiSmokeHarness
         "multi-network",
         "lifecycle",
         "read-state",
+        "drafts",
         "reconnect",
         "burst",
         "burst-fairness",
@@ -101,6 +103,9 @@ internal static class UiSmokeHarness
                 break;
             case "read-state":
                 await ReadStateAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                break;
+            case "drafts":
+                await DraftsAsync(window, demo, state.Alpha, state.Beta).ConfigureAwait(true);
                 break;
             case "reconnect":
                 await ReconnectAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -1679,6 +1684,110 @@ internal static class UiSmokeHarness
         await viewModel.Sessions.FlushStateDispatchAsync().ConfigureAwait(true);
         Require(channel.Activity == WorkspaceActivity.None && channel.UnreadCount == 0 && channel.HighlightCount == 0, "ignored content changed read state");
         Require(!channel.EntriesSnapshot.Any(entry => entry.Text.Contains("ignored read-state", StringComparison.Ordinal)), "ignored content was presented");
+    }
+
+    private static async Task DraftsAsync(MainWindow window, DemoScenario demo, NetworkWorkspace alpha, NetworkWorkspace beta)
+    {
+        var viewModel = window.ViewModel;
+        var alphaChannel = RequiredChannel(alpha);
+        var betaChannel = RequiredChannel(beta);
+        const string alphaDraft = "phase52 local draft\nUnicode 🌍";
+        const string betaDraft = "phase52 beta draft";
+        const string conversationKey = "channel:#general";
+
+        viewModel.SelectView(alphaChannel);
+        viewModel.InputText = string.Empty;
+        var stateMessage = IrcMessageParser.Parse(":smoke.server NEXIRC STATE DRAFT END").Message
+            ?? throw new InvalidOperationException("The draft smoke state event could not be constructed.");
+        viewModel.OnSynchronizedDraftStateReceived(alpha, new IrcNexIrcDraftStateEvent(stateMessage,
+            Snapshot: new NexIrcDraftStateSnapshot([new NexIrcDraft(conversationKey, "base", 5)])));
+        viewModel.InputText = "draft from B";
+        viewModel.OnSynchronizedDraftStateReceived(alpha, new IrcNexIrcDraftStateEvent(stateMessage,
+            Snapshot: new NexIrcDraftStateSnapshot([new NexIrcDraft(conversationKey, "draft from A", 6)])));
+        Require(viewModel.IsDraftConflictVisible && viewModel.InputText == "draft from B"
+            && viewModel.DraftConflictText.Contains("revision 6", StringComparison.Ordinal),
+            "a newer remote edit silently replaced the active local draft instead of presenting a conflict");
+
+        viewModel.ReplaceServerDraftCommand.Execute(null);
+        var replacePending = window.ConversationDraftStore.Load().Single(draft => draft.ProfileId == alpha.ProfileId
+            && draft.ConversationKey == conversationKey);
+        Require(!replacePending.HasConflict && replacePending.PendingBaseRevision == 6
+            && replacePending.PendingText == "draft from B",
+            "explicit local resolution did not stage its text against the current server revision");
+        viewModel.OnSynchronizedDraftStateReceived(alpha, new IrcNexIrcDraftStateEvent(stateMessage,
+            Draft: new NexIrcDraft(conversationKey, "draft from B", 7, replacePending.PendingMutationId)));
+        Require(!viewModel.IsDraftConflictVisible && viewModel.InputText == "draft from B",
+            "an acknowledged explicit overwrite did not resolve the composer conflict");
+
+        viewModel.InputText = "second local draft";
+        viewModel.OnSynchronizedDraftStateReceived(alpha, new IrcNexIrcDraftStateEvent(stateMessage,
+            Draft: new NexIrcDraft(conversationKey, "server's next version", 8, "fedcba9876543210fedcba9876543210")));
+        Require(viewModel.IsDraftConflictVisible && viewModel.InputText == "second local draft",
+            "a second authoritative update did not preserve the local conflict copy");
+        viewModel.KeepServerDraftCommand.Execute(null);
+        Require(!viewModel.IsDraftConflictVisible && viewModel.InputText == "server's next version",
+            "explicit keep-server resolution did not populate the authoritative text");
+
+        viewModel.InputText = alphaDraft;
+        viewModel.SelectView(betaChannel);
+        viewModel.InputText = betaDraft;
+        viewModel.SelectView(alphaChannel);
+        Require(viewModel.InputText == alphaDraft, "switching workspaces lost the inactive channel draft");
+
+        var stored = window.ConversationDraftStore.Load();
+        Require(stored.Any(draft => draft.ProfileId == alpha.ProfileId
+            && draft.ConversationKey == "channel:#general" && draft.Text == alphaDraft),
+            "composer edits were not persisted locally before synchronization");
+
+        // Rebuild the actual composer view-model over new fake transports while
+        // reusing only its local draft store, representing a client restart.
+        var restartedFactory = DemoScenario.CreateFactory(out var restartedDemo);
+        var restartedViewModel = new MainWindowViewModel(
+            restartedFactory,
+            window.Dispatcher,
+            credentials: new ProfileCredentialService(new InMemoryProfileCredentialStore()),
+            conversationDraftStore: window.ConversationDraftStore);
+        try
+        {
+            var restarted = await restartedDemo.SeedSmokeAsync(restartedViewModel).ConfigureAwait(true);
+            restartedViewModel.SelectView(RequiredChannel(restarted.Alpha));
+            Require(restartedViewModel.InputText == alphaDraft,
+                "a local unsynchronized draft was not restored by a fresh composer view-model");
+        }
+        finally
+        {
+            await restartedViewModel.ShutdownAsync().ConfigureAwait(true);
+        }
+
+        viewModel.SelectView(alphaChannel);
+        viewModel.InputText = "phase52 accepted send";
+        await viewModel.SubmitInputAsync().ConfigureAwait(true);
+        await WaitForPollingAsync(
+            () => demo.AlphaTransport.OutboundLines.Any(line => line.Contains("PRIVMSG #general :phase52 accepted send", StringComparison.Ordinal)),
+            "draft smoke did not send the accepted IRC message").ConfigureAwait(true);
+        Require(viewModel.InputText.Length == 0, "an accepted IRC send did not clear the local composer draft");
+
+        viewModel.SelectView(betaChannel);
+        viewModel.InputText = "phase52 failed send stays";
+        await viewModel.Sessions.DisconnectAsync(beta.Id).ConfigureAwait(true);
+        await viewModel.SubmitInputAsync().ConfigureAwait(true);
+        Require(viewModel.InputText == "phase52 failed send stays",
+            "a failed IRC send cleared the unsent local draft");
+
+        var lateSnapshotChannel = viewModel.Sessions.EnsureChannel(alpha.Id, "#late-state");
+        viewModel.SelectView(lateSnapshotChannel);
+        viewModel.InputText = "phase52 sent before draft snapshot";
+        await viewModel.SubmitInputAsync().ConfigureAwait(true);
+        await WaitForPollingAsync(
+            () => demo.AlphaTransport.OutboundLines.Any(line => line.Contains("PRIVMSG #late-state :phase52 sent before draft snapshot", StringComparison.Ordinal)),
+            "draft smoke did not send before the initial draft snapshot").ConfigureAwait(true);
+        Require(viewModel.InputText.Length == 0, "the accepted pre-snapshot send did not clear the local composer");
+        viewModel.OnSynchronizedDraftStateReceived(alpha, new IrcNexIrcDraftStateEvent(stateMessage,
+            Snapshot: new NexIrcDraftStateSnapshot([new NexIrcDraft("channel:#late-state", "newer server text", 1)])));
+        var lateSnapshot = window.ConversationDraftStore.Load().Single(draft => draft.ProfileId == alpha.ProfileId
+            && draft.ConversationKey == "channel:#late-state");
+        Require(lateSnapshot.HasConflict && lateSnapshot.Text.Length == 0 && lateSnapshot.ServerText == "newer server text",
+            "a pre-snapshot successful send overwrote a newer server draft when the initial snapshot arrived");
     }
 
     private static async Task ReconnectAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)

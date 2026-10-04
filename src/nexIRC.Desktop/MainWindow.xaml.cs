@@ -20,6 +20,7 @@ public partial class MainWindow : Window
 {
     private bool _closing;
     private bool _shutdownComplete;
+    private readonly IConversationDraftStore? _conversationDraftStore;
     private bool _renderingSubscribed;
     private bool _viewportRestoreQueued;
     private readonly PresentationTimingProbe _presentationTiming = new();
@@ -32,15 +33,18 @@ public partial class MainWindow : Window
         IIrcTransportFactory transportFactory,
         ConfigurationService? configuration = null,
         ProfileCredentialService? credentials = null,
-        IConversationLogStore? logStore = null)
+        IConversationLogStore? logStore = null,
+        IConversationDraftStore? conversationDraftStore = null)
     {
         InitializeComponent();
+        _conversationDraftStore = conversationDraftStore;
         ViewModel = new MainWindowViewModel(
             transportFactory,
             Dispatcher,
             configuration ?? new ConfigurationService(new InMemoryConfigurationStore()),
             credentials,
-            logStore);
+            logStore,
+            conversationDraftStore: conversationDraftStore);
         DataContext = ViewModel;
         ViewModel.NewConnectionRequested += ShowNewConnectionAsync;
         ViewModel.ExitRequested += Close;
@@ -56,6 +60,8 @@ public partial class MainWindow : Window
     }
 
     public MainWindowViewModel ViewModel { get; }
+
+    internal IConversationDraftStore ConversationDraftStore => _conversationDraftStore ?? throw new InvalidOperationException("No smoke draft store was injected.");
 
     internal PresentationTimingProbe PresentationTiming => _presentationTiming;
 

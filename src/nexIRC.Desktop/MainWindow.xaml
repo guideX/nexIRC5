@@ -488,6 +488,15 @@
                 </Grid>
                 <Border Grid.Row="1" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="0,1,0,0" Padding="10,8">
                     <DockPanel>
+                        <Border DockPanel.Dock="Top" Background="#FEF3C7" BorderBrush="#F59E0B" BorderThickness="1" Padding="8,5" Margin="0,0,0,6" Visibility="{Binding IsDraftConflictVisible, Converter={StaticResource BooleanToVisibility}}">
+                            <DockPanel>
+                                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                                    <Button Content="Keep server" Command="{Binding KeepServerDraftCommand}" Padding="8,2" Margin="6,0,0,0" AutomationProperties.AutomationId="DraftConflict.KeepServer" />
+                                    <Button Content="Replace with mine" Command="{Binding ReplaceServerDraftCommand}" Padding="8,2" Margin="6,0,0,0" AutomationProperties.AutomationId="DraftConflict.ReplaceWithLocal" />
+                                </StackPanel>
+                                <TextBlock Text="{Binding DraftConflictText}" VerticalAlignment="Center" Foreground="#92400E" AutomationProperties.AutomationId="DraftConflict.Banner" />
+                            </DockPanel>
+                        </Border>
                         <Border DockPanel.Dock="Top" Background="#EFF6FF" BorderBrush="#BFDBFE" BorderThickness="1" Padding="8,5" Margin="0,0,0,6" Visibility="{Binding IsReplying, Converter={StaticResource BooleanToVisibility}}">
                             <DockPanel>
                                 <Button DockPanel.Dock="Right" Content="Cancel reply" Command="{Binding CancelReplyCommand}" Padding="8,2" AutomationProperties.AutomationId="Reply.Cancel" />

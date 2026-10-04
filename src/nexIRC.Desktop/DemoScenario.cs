@@ -49,6 +49,7 @@ public sealed class DemoScenario
         var sessions = viewModel.Sessions;
         var alpha = sessions.Add(Options("AlphaNet", _alpha.Endpoint, "nexAlpha", "#general") with
         {
+            ProfileId = Guid.Parse("a52d0000-0000-4000-8000-000000000001"),
             RequestedCapabilities = IrcCapabilityCatalog.PreferredPhase1Y,
             Reconnect = new ReconnectPolicy(
                 Enabled: true,
@@ -58,6 +59,7 @@ public sealed class DemoScenario
         });
         var beta = sessions.Add(Options("BetaNet", _beta.Endpoint, "nexBeta", "#general") with
         {
+            ProfileId = Guid.Parse("a52d0000-0000-4000-8000-000000000002"),
             RequestedCapabilities = Array.Empty<string>()
         });
 

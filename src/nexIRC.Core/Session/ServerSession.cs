@@ -1,5 +1,6 @@
 using System.Threading.Channels;
 using System.Runtime.CompilerServices;
+using System.Text;
 using nexIRC.Core.Networking;
 using nexIRC.Core.Protocol;
 using nexIRC.Core.State;
@@ -87,8 +88,12 @@ public sealed class ServerSession : IAsyncDisposable
     private NativeResumeAttempt? _nativeResumeAttempt;
     private ReadStateSnapshotBuilder? _readStateSnapshotBuilder;
     private readonly Dictionary<string, NexIrcReadMarker> _pendingReadStateUpdates = new(StringComparer.Ordinal);
+    private DraftStateSnapshotBuilder? _draftStateSnapshotBuilder;
+    private readonly Dictionary<string, NexIrcDraft> _pendingDraftStateUpdates = new(StringComparer.Ordinal);
     private bool _readStateSnapshotSeen;
     private bool _readStateSnapshotRequested;
+    private bool _draftStateSnapshotSeen;
+    private bool _draftStateSnapshotRequested;
     private TaskCompletionSource<NexIrcPairingAuthorization>? _pairingAuthorizationAttempt;
     private TaskCompletionSource<bool>? _pairingRevocationAttempt;
     private string? _nativeLivePendingSequence;
@@ -274,6 +279,11 @@ public sealed class ServerSession : IAsyncDisposable
         get { lock (_gate) return NexIrcReadStateProtocol.IsSupported(_capabilities.Snapshot); }
     }
 
+    public bool SynchronizedDraftStateAvailable
+    {
+        get { lock (_gate) return NexIrcDraftStateProtocol.IsSupported(_capabilities.Snapshot); }
+    }
+
     public async ValueTask<bool> TryRequestSynchronizedReadStateAsync(CancellationToken cancellationToken = default)
     {
         lock (_gate)
@@ -327,6 +337,67 @@ public sealed class ServerSession : IAsyncDisposable
         }
         catch (InvalidOperationException) { return false; }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return false; }
+    }
+
+    public async ValueTask<bool> TryRequestSynchronizedDraftStateAsync(CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+        {
+            if (!NexIrcDraftStateProtocol.IsSupported(_capabilities.Snapshot)
+                || !_options.Endpoint.UseTls
+                || _authenticationState != SaslAuthenticationState.Succeeded
+                || _registration != RegistrationState.Registered
+                || _draftStateSnapshotRequested)
+                return false;
+            _draftStateSnapshotRequested = true;
+        }
+
+        try
+        {
+            await SendCommandAsync("NEXIRC", ["STATE", "GET", "DRAFT"], cancellationToken: cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or OperationCanceledException or IOException)
+        {
+            lock (_gate) _draftStateSnapshotRequested = false;
+            return false;
+        }
+    }
+
+    public async ValueTask<bool> TryUpdateSynchronizedDraftAsync(
+        string conversationKey,
+        long baseRevision,
+        string mutationId,
+        string text,
+        CancellationToken cancellationToken = default)
+    {
+        if (!NexIrcDraftStateProtocol.IsValidConversationKey(conversationKey)
+            || baseRevision < 0 || !NexIrcDraftStateProtocol.IsValidMutationId(mutationId)
+            || !NexIrcDraftStateProtocol.TryEncodePayload(text, out var payload))
+            return false;
+
+        lock (_gate)
+        {
+            if (!NexIrcDraftStateProtocol.IsSupported(_capabilities.Snapshot)
+                || !_options.Endpoint.UseTls
+                || _authenticationState != SaslAuthenticationState.Succeeded
+                || _registration != RegistrationState.Registered)
+                return false;
+        }
+
+        try
+        {
+            var command = new IrcCommandBuilder(Math.Max(_options.MaximumOutboundLineBytes, NexIrcDraftStateProtocol.MaximumWireLineBytes))
+                .Build("NEXIRC", ["STATE", "SET", "DRAFT", NexIrcReadStateProtocol.EncodeField(conversationKey),
+                    baseRevision.ToString(System.Globalization.CultureInfo.InvariantCulture), mutationId,
+                    payload]);
+            await QueueOutboundAsync(command, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or OperationCanceledException or IOException or ArgumentOutOfRangeException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -2950,6 +3021,10 @@ public sealed class ServerSession : IAsyncDisposable
             _pendingReadStateUpdates.Clear();
             _readStateSnapshotSeen = false;
             _readStateSnapshotRequested = false;
+            _draftStateSnapshotBuilder = null;
+            _pendingDraftStateUpdates.Clear();
+            _draftStateSnapshotSeen = false;
+            _draftStateSnapshotRequested = false;
             _capabilities.Reset();
             _isupport.Reset();
             _identityDetector.Reset();
@@ -3177,6 +3252,7 @@ public sealed class ServerSession : IAsyncDisposable
         if (!NexIrcReadStateProtocol.IsSupported(capabilities)) return;
 
         var parameters = message.Parameters;
+        if (await HandleNexIrcDraftStateMessageAsync(message, epoch, parameters).ConfigureAwait(false)) return;
         var subcommand = parameters.Count > 1 ? parameters[1].ToUpperInvariant() : string.Empty;
         if (subcommand == "BEGIN")
         {
@@ -3223,11 +3299,12 @@ public sealed class ServerSession : IAsyncDisposable
             var builder = _readStateSnapshotBuilder;
             _readStateSnapshotBuilder = null;
             _readStateSnapshotRequested = false;
-            if (parameters.Count == 3
+            var validSnapshot = parameters.Count == 3
                 && builder is not null
                 && int.TryParse(parameters[2], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var endEpoch)
                 && endEpoch == builder.SessionEpoch
-                && builder.Markers.Count == builder.ExpectedCount)
+                && builder.Markers.Count == builder.ExpectedCount;
+            if (validSnapshot && builder is not null)
             {
                 var snapshot = new NexIrcReadStateSnapshot(builder.SessionEpoch,
                     builder.Markers.Values.OrderBy(static item => item.ConversationKey, StringComparer.Ordinal).ToArray());
@@ -3235,6 +3312,8 @@ public sealed class ServerSession : IAsyncDisposable
             }
             _readStateSnapshotSeen = true;
             await FlushPendingReadStateUpdatesAsync(message, epoch).ConfigureAwait(false);
+            if (validSnapshot)
+                _ = await TryRequestSynchronizedDraftStateAsync().ConfigureAwait(false);
             return;
         }
 
@@ -3257,15 +3336,182 @@ public sealed class ServerSession : IAsyncDisposable
 
         if (subcommand == "ACK" && parameters.Count == 3)
         {
+            if (_draftStateSnapshotRequested)
+            {
+                _draftStateSnapshotRequested = false;
+                _draftStateSnapshotSeen = true;
+                await PublishSemanticAsync(new IrcNexIrcDraftStateEvent(message, Status: parameters[2]), epoch).ConfigureAwait(false);
+            }
             if (string.Equals(parameters[2], "UNAVAILABLE", StringComparison.OrdinalIgnoreCase)
                 && (_readStateSnapshotRequested || !_readStateSnapshotSeen))
             {
                 _readStateSnapshotRequested = false;
                 _readStateSnapshotSeen = true;
                 await FlushPendingReadStateUpdatesAsync(message, epoch).ConfigureAwait(false);
+                if (_draftStateSnapshotRequested)
+                {
+                    _draftStateSnapshotRequested = false;
+                    _draftStateSnapshotSeen = true;
+                    await PublishSemanticAsync(new IrcNexIrcDraftStateEvent(message, Status: parameters[2]), epoch).ConfigureAwait(false);
+                }
             }
             await PublishSemanticAsync(new IrcNexIrcReadStateEvent(message, Status: parameters[2]), epoch).ConfigureAwait(false);
         }
+    }
+
+    private async Task<bool> HandleNexIrcDraftStateMessageAsync(IrcMessage message, ConnectionEpoch epoch,
+        IReadOnlyList<string> parameters)
+    {
+        var subcommand = parameters.Count > 1 ? parameters[1].ToUpperInvariant() : string.Empty;
+        if (subcommand == "DRAFT")
+        {
+            var section = parameters.Count > 2 ? parameters[2].ToUpperInvariant() : string.Empty;
+            if (section == "BEGIN")
+            {
+                var beginBytes = Encoding.UTF8.GetByteCount(message.RawLine) + 2;
+                if (parameters.Count == 4
+                    && int.TryParse(parameters[3], System.Globalization.NumberStyles.None,
+                        System.Globalization.CultureInfo.InvariantCulture, out var count)
+                    && count is >= 0 and <= NexIrcDraftStateProtocol.MaximumEntries
+                    && beginBytes <= NexIrcDraftStateProtocol.MaximumSnapshotBytes)
+                {
+                    _draftStateSnapshotBuilder = new DraftStateSnapshotBuilder(count, beginBytes);
+                }
+                else
+                {
+                    _draftStateSnapshotBuilder = null;
+                    _draftStateSnapshotRequested = false;
+                    _draftStateSnapshotSeen = true;
+                    await FlushPendingDraftStateUpdatesAsync(message, epoch).ConfigureAwait(false);
+                }
+                return true;
+            }
+
+            if (section == "ENTRY")
+            {
+                var builder = _draftStateSnapshotBuilder;
+                var lineBytes = Encoding.UTF8.GetByteCount(message.RawLine) + 2;
+                if (parameters.Count == 6
+                    && NexIrcDraftStateProtocol.TryCreateDraft(parameters, 3, out var draft)
+                    && draft is not null
+                    && builder is not null
+                    && builder.EncodedBytes + lineBytes <= NexIrcDraftStateProtocol.MaximumSnapshotBytes
+                    && builder.Drafts.Count < builder.ExpectedCount
+                    && builder.Drafts.TryAdd(draft.ConversationKey, draft))
+                {
+                    builder.EncodedBytes += lineBytes;
+                    return true;
+                }
+
+                _draftStateSnapshotBuilder = null;
+                _draftStateSnapshotRequested = false;
+                _draftStateSnapshotSeen = true;
+                await FlushPendingDraftStateUpdatesAsync(message, epoch).ConfigureAwait(false);
+                return true;
+            }
+
+            if (section == "END")
+            {
+                var builder = _draftStateSnapshotBuilder;
+                _draftStateSnapshotBuilder = null;
+                _draftStateSnapshotRequested = false;
+                var endBytes = Encoding.UTF8.GetByteCount(message.RawLine) + 2;
+                if (parameters.Count == 3 && builder is not null
+                    && builder.EncodedBytes + endBytes <= NexIrcDraftStateProtocol.MaximumSnapshotBytes
+                    && builder.Drafts.Count == builder.ExpectedCount)
+                {
+                    var snapshot = new NexIrcDraftStateSnapshot(builder.Drafts.Values
+                        .OrderBy(static draft => draft.ConversationKey, StringComparer.Ordinal).ToArray());
+                    await PublishSemanticAsync(new IrcNexIrcDraftStateEvent(message, Snapshot: snapshot), epoch).ConfigureAwait(false);
+                }
+                else
+                {
+                    await PublishSemanticAsync(new IrcNexIrcDraftStateEvent(message, Status: "INVALID"), epoch).ConfigureAwait(false);
+                }
+                _draftStateSnapshotSeen = true;
+                await FlushPendingDraftStateUpdatesAsync(message, epoch).ConfigureAwait(false);
+                return true;
+            }
+            return true;
+        }
+
+        if (subcommand == "UPDATE" && parameters.Count > 2
+            && string.Equals(parameters[2], "DRAFT", StringComparison.OrdinalIgnoreCase))
+        {
+            if (parameters.Count == 7
+                && NexIrcDraftStateProtocol.TryDecodeConversationKey(parameters[3], out var key)
+                && NexIrcDraftStateProtocol.TryParseRevision(parameters[4], allowZero: false, out var revision)
+                && NexIrcDraftStateProtocol.IsValidMutationId(parameters[5])
+                && NexIrcDraftStateProtocol.TryDecodePayload(parameters[6], out var text))
+            {
+                var draft = new NexIrcDraft(key, text, revision, parameters[5]);
+                if (_draftStateSnapshotBuilder is not null || !_draftStateSnapshotSeen || _draftStateSnapshotRequested)
+                    BufferDraftStateUpdate(draft);
+                else
+                    await PublishSemanticAsync(new IrcNexIrcDraftStateEvent(message, Draft: draft), epoch).ConfigureAwait(false);
+            }
+            return true;
+        }
+
+        if (subcommand == "ACK" && parameters.Count > 2
+            && string.Equals(parameters[2], "DRAFT", StringComparison.OrdinalIgnoreCase))
+        {
+            if (parameters.Count >= 4)
+            {
+                var status = parameters[3].ToUpperInvariant();
+                // Snapshot failures have no mutation id/key. Release the
+                // one-shot request gate so a later authenticated snapshot
+                // request can recover instead of leaving drafts disabled for
+                // the lifetime of this connection.
+                if (parameters.Count == 4 && _draftStateSnapshotRequested)
+                {
+                    _draftStateSnapshotRequested = false;
+                    _draftStateSnapshotSeen = true;
+                }
+                string? mutationId = null;
+                string? conversationKey = null;
+                long? revision = null;
+                string? authoritativeText = null;
+                if (parameters.Count >= 7
+                    && NexIrcDraftStateProtocol.IsValidMutationId(parameters[4])
+                    && NexIrcDraftStateProtocol.TryDecodeConversationKey(parameters[5], out var key))
+                {
+                    mutationId = parameters[4];
+                    conversationKey = key;
+                    if (NexIrcDraftStateProtocol.TryParseRevision(parameters[6], allowZero: true, out var parsedRevision))
+                        revision = parsedRevision;
+                    if (parameters.Count == 8 && revision is not null
+                        && NexIrcDraftStateProtocol.TryDecodePayload(parameters[7], out var decodedText))
+                        authoritativeText = decodedText;
+                }
+                await PublishSemanticAsync(new IrcNexIrcDraftStateEvent(message, Status: status, MutationId: mutationId,
+                    ConversationKey: conversationKey, AuthoritativeRevision: revision, AuthoritativeText: authoritativeText), epoch).ConfigureAwait(false);
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    private void BufferDraftStateUpdate(NexIrcDraft draft)
+    {
+        if (_pendingDraftStateUpdates.TryGetValue(draft.ConversationKey, out var current))
+        {
+            if (draft.Revision > current.Revision)
+                _pendingDraftStateUpdates[draft.ConversationKey] = draft;
+            return;
+        }
+
+        if (_pendingDraftStateUpdates.Count < NexIrcDraftStateProtocol.MaximumEntries)
+            _pendingDraftStateUpdates.Add(draft.ConversationKey, draft);
+    }
+
+    private async Task FlushPendingDraftStateUpdatesAsync(IrcMessage source, ConnectionEpoch epoch)
+    {
+        var updates = _pendingDraftStateUpdates.Values.OrderBy(static draft => draft.ConversationKey, StringComparer.Ordinal).ToArray();
+        _pendingDraftStateUpdates.Clear();
+        foreach (var draft in updates)
+            await PublishSemanticAsync(new IrcNexIrcDraftStateEvent(source, Draft: draft), epoch).ConfigureAwait(false);
     }
 
     private void BufferReadStateUpdate(NexIrcReadMarker marker)
@@ -5005,6 +5251,15 @@ public sealed class ServerSession : IAsyncDisposable
         public int ExpectedCount { get; } = expectedCount;
 
         public Dictionary<string, NexIrcReadMarker> Markers { get; } = new(StringComparer.Ordinal);
+    }
+
+    private sealed class DraftStateSnapshotBuilder(int expectedCount, int encodedBytes)
+    {
+        public int ExpectedCount { get; } = expectedCount;
+
+        public long EncodedBytes { get; set; } = encodedBytes;
+
+        public Dictionary<string, NexIrcDraft> Drafts { get; } = new(StringComparer.Ordinal);
     }
 
     private sealed class PendingChathistoryRequest(long requestId, ChathistoryRequest request, int connectionGeneration)

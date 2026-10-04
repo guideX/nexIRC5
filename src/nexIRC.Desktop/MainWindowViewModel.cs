@@ -1,7 +1,10 @@
 using System.Collections.ObjectModel;
+using System.IO;
+using System.Text;
 using System.Windows.Input;
 using nexIRC.Application;
 using nexIRC.Core.Networking;
+using nexIRC.Core.Protocol;
 using nexIRC.Core.Session;
 
 namespace nexIRC.Desktop;
@@ -26,9 +29,13 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private readonly System.Windows.Threading.Dispatcher _uiDispatcher;
     private readonly IResumeStateStore? _resumeStateStore;
     private readonly IResumeSecretProtector? _resumeSecretProtector;
+    private readonly IConversationDraftStore _conversationDraftStore;
     private readonly Dictionary<Guid, MemorySaslCredentialProvider> _sessionCredentials = [];
     private readonly Dictionary<Guid, MemoryServerPasswordProvider> _sessionServerPasswords = [];
-    private readonly Dictionary<(Guid NetworkId, Guid ViewId), string> _drafts = [];
+    private readonly Dictionary<(Guid NetworkId, Guid ViewId), ComposerDraftState> _drafts = [];
+    private readonly Dictionary<(Guid ProfileId, string ConversationKey), LocalConversationDraft> _persistedDrafts = [];
+    private readonly Dictionary<(Guid NetworkId, Guid ViewId), CancellationTokenSource> _draftDebounces = [];
+    private bool _applyingDraftProjection;
     private ReplyComposerState? _replyComposer;
 
     public MainWindowViewModel(
@@ -36,7 +43,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         System.Windows.Threading.Dispatcher dispatcher,
         ConfigurationService? configuration = null,
         ProfileCredentialService? credentials = null,
-        IConversationLogStore? logStore = null)
+        IConversationLogStore? logStore = null,
+        IConversationDraftStore? conversationDraftStore = null)
     {
         _uiDispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         Configuration = configuration;
@@ -58,6 +66,18 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 _resumeStateStore = null;
                 _resumeSecretProtector = null;
             }
+        }
+
+        _conversationDraftStore = conversationDraftStore ?? CreateConversationDraftStore(_resumeSecretProtector);
+        try
+        {
+            foreach (var draft in _conversationDraftStore.Load())
+                _persistedDrafts[(draft.ProfileId, draft.ConversationKey)] = draft;
+        }
+        catch
+        {
+            // Local draft recovery is best effort; the protected store itself
+            // rejects corrupt snapshots without reconstructing draft text.
         }
 
         Sessions = new NetworkSessionManager(
@@ -103,6 +123,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         BackConversationCommand = new RelayCommand(() => { Sessions.NavigateBack(); }, () => Sessions.Networks.Count > 0);
         ForwardConversationCommand = new RelayCommand(() => { Sessions.NavigateForward(); }, () => Sessions.Networks.Count > 0);
         CancelReplyCommand = new RelayCommand(() => CancelReply(), () => IsReplying);
+        KeepServerDraftCommand = new RelayCommand(KeepServerDraft, HasActiveDraftConflict);
+        ReplaceServerDraftCommand = new RelayCommand(ReplaceServerDraftWithLocal, HasActiveDraftConflict);
         ExitCommand = new RelayCommand(() => ExitRequested?.Invoke());
 
         HighlightPolicy.PropertyChanged += (_, _) => SavePreferencesInBackground();
@@ -130,6 +152,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             RefreshConversationNavigator();
         };
         Sessions.NavigationChanged += OnNavigationChanged;
+        Sessions.SynchronizedDraftStateReceived += OnSynchronizedDraftStateReceived;
         RefreshConversationNavigator();
     }
 
@@ -175,8 +198,21 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public string InputText
     {
         get => _inputText;
-        set => SetProperty(ref _inputText, (value ?? string.Empty)[..Math.Min(value?.Length ?? 0, ConfigurationLimits.MaximumDraftLength)]);
+        set
+        {
+            var normalized = LimitDraftUtf8(value ?? string.Empty);
+            if (SetProperty(ref _inputText, normalized) && !_applyingDraftProjection)
+                CaptureActiveDraft(normalized);
+        }
     }
+
+    public bool IsDraftConflictVisible => ActiveView is not null
+        && _drafts.TryGetValue((ActiveView.NetworkId, ActiveView.Id), out var state) && state.HasConflict;
+
+    public string DraftConflictText => ActiveView is not null
+        && _drafts.TryGetValue((ActiveView.NetworkId, ActiveView.Id), out var state) && state.HasConflict
+            ? $"This draft conflicts with server revision {state.ServerRevision}. Your local text is preserved."
+            : string.Empty;
 
     public string StatusText
     {
@@ -263,6 +299,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public ICommand ForwardConversationCommand { get; }
 
     public ICommand CancelReplyCommand { get; }
+
+    public ICommand KeepServerDraftCommand { get; }
+
+    public ICommand ReplaceServerDraftCommand { get; }
 
     public ICommand ExitCommand { get; }
 
@@ -427,6 +467,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             return;
         }
+
+        foreach (var key in _persistedDrafts.Keys.Where(key => key.ProfileId == profileId).ToArray())
+            _persistedDrafts.Remove(key);
+        foreach (var key in _drafts.Where(pair => pair.Value.ProfileId == profileId).Select(static pair => pair.Key).ToArray())
+            _drafts.Remove(key);
+        _ = _conversationDraftStore.Save(_persistedDrafts.Values.ToArray());
 
         var workspace = Sessions.Networks.FirstOrDefault(network => network.ProfileId == profileId);
         if (workspace is not null)
@@ -755,7 +801,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             return;
         }
         ActiveView = view;
-        InputText = _drafts.TryGetValue((view.NetworkId, view.Id), out var draft) ? draft : string.Empty;
+        SetProjectedInput(GetOrCreateDraftState(view).Text);
+        RefreshDraftConflictState();
         StatusText = $"{view.Title} · {view.Kind}";
         if (Configuration is not null && Sessions.ActiveNetwork?.ProfileId is Guid profileId)
         {
@@ -777,8 +824,6 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         var reply = _replyComposer;
         if (reply is not null && input[0] != '/')
         {
-            InputText = string.Empty;
-            InputHistory.Submit(input);
             if (ActiveView is null || !Sessions.TryGet(reply.NetworkId, out var replyNetwork) || replyNetwork is null)
             {
                 StatusText = "The reply conversation is no longer available.";
@@ -789,6 +834,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             StatusText = replyResult.Message;
             if (replyResult.Succeeded)
             {
+                ClearComposerAfterAcceptedSend();
+                InputHistory.Submit(input);
                 ClearReplyComposer(updateStatus: false);
             }
             if (replyResult.View is not null)
@@ -798,10 +845,13 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        InputText = string.Empty;
-        InputHistory.Submit(input);
         var result = await _commands.DispatchAsync(Sessions.ActiveNetwork, ActiveView, input).ConfigureAwait(true);
         StatusText = result.Message;
+        if (result.Succeeded)
+        {
+            ClearComposerAfterAcceptedSend();
+            InputHistory.Submit(input);
+        }
         if (result.View is not null)
         {
             SelectView(result.View);
@@ -928,7 +978,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         if (closed)
         {
             ActiveView = Sessions.ActiveView;
-            InputText = ActiveView is not null && _drafts.TryGetValue((ActiveView.NetworkId, ActiveView.Id), out var draft) ? draft : string.Empty;
+        SetProjectedInput(ActiveView is null ? string.Empty : GetOrCreateDraftState(ActiveView).Text);
             StatusText = $"Closed {closing.Title}; the conversation remains available to reopen.";
             RefreshCommandStates();
         }
@@ -948,7 +998,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         if (closed)
         {
             ActiveView = Sessions.ActiveView;
-            InputText = ActiveView is not null && _drafts.TryGetValue((ActiveView.NetworkId, ActiveView.Id), out var draft) ? draft : string.Empty;
+            SetProjectedInput(ActiveView is null ? string.Empty : GetOrCreateDraftState(ActiveView).Text);
             StatusText = $"Parted and closed {channel.Channel}.";
             RefreshCommandStates();
         }
@@ -975,9 +1025,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         var removed = Sessions.RemoveHistoricalConversation(view.Id);
         if (removed)
         {
-            _drafts.Remove((view.NetworkId, view.Id));
             ActiveView = Sessions.ActiveView;
-            InputText = ActiveView is not null && _drafts.TryGetValue((ActiveView.NetworkId, ActiveView.Id), out var draft) ? draft : string.Empty;
+            SetProjectedInput(ActiveView is null ? string.Empty : GetOrCreateDraftState(ActiveView).Text);
             StatusText = $"Removed {view.Title} from the workspace; stored history was kept.";
             RefreshCommandStates();
         }
@@ -1018,6 +1067,15 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private async Task ShutdownCoreAsync()
     {
         StatusText = "Closing sessions…";
+        SaveDraft();
+        Sessions.SynchronizedDraftStateReceived -= OnSynchronizedDraftStateReceived;
+        foreach (var cancellation in _draftDebounces.Values)
+        {
+            cancellation.Cancel();
+            cancellation.Dispose();
+        }
+        _draftDebounces.Clear();
+        await FlushDraftMutationsAsync().ConfigureAwait(true);
         await Sessions.DisposeAsync().ConfigureAwait(true);
         _notificationAdapter?.Dispose();
         if (Configuration is not null)
@@ -1040,6 +1098,36 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
+    private async Task FlushDraftMutationsAsync()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        var writes = new List<Task<bool>>();
+        foreach (var pair in _drafts.ToArray())
+        {
+            if (!Sessions.TryGetView(pair.Key.ViewId, out _, out var view) || view is null) continue;
+            var state = pair.Value;
+            if (state.HasConflict || !state.HasSnapshot
+                || !Sessions.TryGet(view.NetworkId, out var workspace) || workspace is null
+                || NetworkSessionManager.SynchronizedDraftConversationKey(view, workspace.Snapshot) is not { } key
+                || !string.Equals(key, state.ConversationKey, StringComparison.Ordinal))
+                continue;
+            if (state.PendingMutationId is null)
+            {
+                if (state.Text == state.ServerText) continue;
+                state.PendingMutationId = Guid.NewGuid().ToString("N");
+                state.PendingBaseRevision = state.BaseRevision;
+                state.PendingText = state.Text;
+                PersistDraftState(state);
+            }
+            if (state.PendingBaseRevision is { } revision && state.PendingText is { } text
+                && state.PendingMutationId is { } mutationId)
+                writes.Add(Sessions.TryUpdateSynchronizedDraftAsync(view, revision, mutationId, text, timeout.Token).AsTask());
+        }
+        if (writes.Count == 0) return;
+        try { await Task.WhenAll(writes).WaitAsync(timeout.Token).ConfigureAwait(true); }
+        catch (Exception exception) when (exception is OperationCanceledException or IOException or InvalidOperationException or ObjectDisposedException) { }
+    }
+
     private void SavePreferencesInBackground()
     {
         if (Configuration is null)
@@ -1053,13 +1141,482 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private void SaveDraft()
     {
-        if (ActiveView is null || string.IsNullOrEmpty(InputText))
+        if (ActiveView is null) return;
+        var state = GetOrCreateDraftState(ActiveView);
+        state.Text = InputText;
+        PersistDraftState(state);
+    }
+
+#pragma warning disable CA1859 // The method intentionally selects either protected disk storage or an in-memory fallback.
+    private static IConversationDraftStore CreateConversationDraftStore(IResumeSecretProtector? protector)
+    {
+        if (!OperatingSystem.IsWindows() || protector is null) return new MemoryConversationDraftStore();
+        try
         {
-            if (ActiveView is not null) _drafts.Remove((ActiveView.NetworkId, ActiveView.Id));
+            return new ProtectedJsonConversationDraftStore(Path.Combine(ResumeStatePaths.GetDefaultRoot(), "conversation-drafts.json"), protector);
+        }
+        catch
+        {
+            return new MemoryConversationDraftStore();
+        }
+    }
+#pragma warning restore CA1859
+
+    private void CaptureActiveDraft(string text)
+    {
+        if (ActiveView is not (ChannelView or QueryView)) return;
+        var state = GetOrCreateDraftState(ActiveView);
+        state.Text = text;
+        state.HasLocalChanges = true;
+        PersistDraftState(state);
+        ScheduleDraftSynchronization(ActiveView, state);
+    }
+
+    private void ClearComposerAfterAcceptedSend()
+    {
+        if (ActiveView is (ChannelView or QueryView))
+        {
+            var state = GetOrCreateDraftState(ActiveView);
+            state.ClearAfterSuccessfulSend = !state.HasSnapshot;
+        }
+        InputText = string.Empty;
+    }
+
+    private ComposerDraftState GetOrCreateDraftState(WorkspaceView view)
+    {
+        var identity = (view.NetworkId, view.Id);
+        if (_drafts.TryGetValue(identity, out var existing)) return existing;
+
+        if (!Sessions.TryGet(view.NetworkId, out var workspace) || workspace is null)
+            return _drafts[identity] = new ComposerDraftState(view.NetworkId, Guid.Empty, "", "");
+
+        var profileId = workspace.ProfileId ?? workspace.Id;
+        var conversationKey = GetLocalConversationKey(view, workspace);
+        _persistedDrafts.TryGetValue((profileId, conversationKey), out var persisted);
+        var state = persisted is null
+            ? new ComposerDraftState(view.NetworkId, profileId, conversationKey, "")
+            : new ComposerDraftState(view.NetworkId, profileId, conversationKey, persisted.Text)
+            {
+                BaseRevision = persisted.BaseRevision,
+                ServerText = persisted.ServerText,
+                ServerRevision = persisted.ServerRevision,
+                HasConflict = persisted.HasConflict,
+                PendingMutationId = persisted.PendingMutationId,
+                PendingBaseRevision = persisted.PendingBaseRevision,
+                PendingText = persisted.PendingText,
+                HasLocalChanges = persisted.HasLocalChanges,
+                ClearAfterSuccessfulSend = persisted.ClearAfterSuccessfulSend
+            };
+        _drafts[identity] = state;
+
+        if (Sessions.TryGetSynchronizedDraftState(view, out var remoteDraft))
+        {
+            state.HasSnapshot = true;
+            ApplyDraftAuthority(view, state, remoteDraft ?? new NexIrcDraft(
+                NetworkSessionManager.SynchronizedDraftConversationKey(view, workspace.Snapshot) ?? conversationKey,
+                string.Empty, 0), isSnapshot: true);
+        }
+        return state;
+    }
+
+    private static string GetLocalConversationKey(WorkspaceView view, NetworkWorkspace workspace)
+    {
+        if (NetworkSessionManager.SynchronizedDraftConversationKey(view, workspace.Snapshot) is { } key) return key;
+        return view switch
+        {
+            ChannelView channel => $"local-channel:{nexIRC.Core.State.IrcCaseMappingComparer.Fold(channel.Channel, workspace.Snapshot.Features.CaseMapping)}",
+            QueryView query => $"local-query:{nexIRC.Core.State.IrcCaseMappingComparer.Fold(query.Nickname, workspace.Snapshot.Features.CaseMapping)}",
+            _ => $"local-view:{view.Id:N}"
+        };
+    }
+
+    private void PersistDraftState(ComposerDraftState state)
+    {
+        if (state.ProfileId == Guid.Empty || string.IsNullOrWhiteSpace(state.ConversationKey)) return;
+        var key = (state.ProfileId, state.ConversationKey);
+        if (state.Text.Length == 0 && state.ServerText.Length == 0 && state.BaseRevision == 0
+            && state.ServerRevision == 0 && !state.HasConflict && state.PendingMutationId is null
+            && !state.HasLocalChanges && !state.ClearAfterSuccessfulSend)
+        {
+            _persistedDrafts.Remove(key);
+        }
+        else
+        {
+            _persistedDrafts[key] = new LocalConversationDraft(state.ProfileId, state.ConversationKey, state.Text,
+                state.BaseRevision, state.ServerText, state.ServerRevision, state.HasConflict,
+                state.PendingMutationId, state.PendingBaseRevision, state.PendingText,
+                state.HasLocalChanges, state.ClearAfterSuccessfulSend);
+        }
+
+        if (!_conversationDraftStore.Save(_persistedDrafts.Values.ToArray()))
+            StatusText = "Local draft storage could not be updated; this draft remains available until the application closes.";
+    }
+
+    private static string LimitDraftUtf8(string text)
+    {
+        if (NexIrcDraftStateProtocol.TryEncodePayload(text, out _)) return text;
+        var builder = new StringBuilder(Math.Min(text.Length, ConfigurationLimits.MaximumDraftLength));
+        var bytes = 0;
+        foreach (var rune in text.EnumerateRunes())
+        {
+            if (bytes + rune.Utf8SequenceLength > NexIrcDraftStateProtocol.MaximumDraftUtf8Bytes) break;
+            builder.Append(rune.ToString());
+            bytes += rune.Utf8SequenceLength;
+        }
+        return builder.ToString();
+    }
+
+    private void SetProjectedInput(string text)
+    {
+        _applyingDraftProjection = true;
+        try { InputText = text; }
+        finally { _applyingDraftProjection = false; }
+    }
+
+    private void ScheduleDraftSynchronization(WorkspaceView view, ComposerDraftState state)
+    {
+        if (state.HasConflict || !state.HasSnapshot || state.PendingAwaitingResponse
+            || state.Text == state.ServerText && state.PendingMutationId is null
+            || !Sessions.TryGet(view.NetworkId, out var workspace) || workspace is null
+            || NetworkSessionManager.SynchronizedDraftConversationKey(view, workspace.Snapshot) is not { } key
+            || !string.Equals(key, state.ConversationKey, StringComparison.Ordinal)
+            || !workspace.Session.SynchronizedDraftStateAvailable)
+            return;
+
+        var identity = (view.NetworkId, view.Id);
+        if (_draftDebounces.Remove(identity, out var oldCancellation))
+        {
+            oldCancellation.Cancel();
+            oldCancellation.Dispose();
+        }
+        var cancellation = new CancellationTokenSource();
+        _draftDebounces[identity] = cancellation;
+        _ = DebounceDraftSynchronizationAsync(view, state, identity, cancellation);
+    }
+
+    private async Task DebounceDraftSynchronizationAsync(WorkspaceView view, ComposerDraftState state,
+        (Guid NetworkId, Guid ViewId) identity, CancellationTokenSource cancellation)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(350), cancellation.Token).ConfigureAwait(false);
+            _ = _uiDispatcher.BeginInvoke(new Action(() =>
+            {
+                if (_draftDebounces.TryGetValue(identity, out var current) && ReferenceEquals(current, cancellation))
+                {
+                    _draftDebounces.Remove(identity);
+                    cancellation.Dispose();
+                    StartDraftMutation(view, state);
+                }
+            }));
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+    }
+
+    private void StartDraftMutation(WorkspaceView view, ComposerDraftState state)
+    {
+        if (state.HasConflict || !state.HasSnapshot || state.PendingAwaitingResponse
+            || !Sessions.TryGet(view.NetworkId, out var workspace) || workspace is null
+            || NetworkSessionManager.SynchronizedDraftConversationKey(view, workspace.Snapshot) is not { } key
+            || !string.Equals(key, state.ConversationKey, StringComparison.Ordinal))
+            return;
+
+        if (state.PendingMutationId is null)
+        {
+            if (state.Text == state.ServerText) return;
+            state.PendingMutationId = Guid.NewGuid().ToString("N");
+            state.PendingBaseRevision = state.BaseRevision;
+            state.PendingText = state.Text;
+        }
+        if (state.PendingBaseRevision is not { } baseRevision || state.PendingText is not { } pendingText) return;
+        var mutationId = state.PendingMutationId;
+        state.PendingAwaitingResponse = true;
+        PersistDraftState(state);
+        _ = SendDraftMutationAsync(view, state, mutationId, baseRevision, pendingText);
+    }
+
+    private async Task SendDraftMutationAsync(WorkspaceView view, ComposerDraftState state, string mutationId,
+        long baseRevision, string text)
+    {
+        var sent = false;
+        try
+        {
+            sent = await Sessions.TryUpdateSynchronizedDraftAsync(view, baseRevision, mutationId, text).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is IOException or InvalidOperationException or ObjectDisposedException)
+        {
+        }
+        _ = _uiDispatcher.BeginInvoke(new Action(() =>
+        {
+            if (string.Equals(state.PendingMutationId, mutationId, StringComparison.Ordinal))
+            {
+                state.PendingAwaitingResponse = sent;
+                PersistDraftState(state);
+            }
+        }));
+    }
+
+    internal void OnSynchronizedDraftStateReceived(NetworkWorkspace workspace, IrcNexIrcDraftStateEvent stateEvent)
+    {
+        if (!_uiDispatcher.CheckAccess())
+        {
+            _uiDispatcher.BeginInvoke(new Action(() => OnSynchronizedDraftStateReceived(workspace, stateEvent)));
             return;
         }
 
-        _drafts[(ActiveView.NetworkId, ActiveView.Id)] = InputText[..Math.Min(InputText.Length, ConfigurationLimits.MaximumDraftLength)];
+        var views = workspace.Channels.Cast<WorkspaceView>().Concat(workspace.Queries).ToArray();
+        if (stateEvent.Snapshot is { } snapshot)
+        {
+            var remote = snapshot.Drafts.ToDictionary(static draft => draft.ConversationKey, StringComparer.Ordinal);
+            foreach (var view in views)
+            {
+                if (NetworkSessionManager.SynchronizedDraftConversationKey(view, workspace.Snapshot) is not { } key) continue;
+                var authority = remote.TryGetValue(key, out var draft) ? draft : new NexIrcDraft(key, string.Empty, 0);
+                ApplyDraftAuthority(view, GetOrCreateDraftState(view), authority, isSnapshot: true);
+            }
+        }
+        else if (stateEvent.Draft is { } update)
+        {
+            foreach (var view in views.Where(view => string.Equals(
+                NetworkSessionManager.SynchronizedDraftConversationKey(view, workspace.Snapshot), update.ConversationKey, StringComparison.Ordinal)))
+                ApplyDraftAuthority(view, GetOrCreateDraftState(view), update, isSnapshot: false);
+        }
+        else if (stateEvent.ConversationKey is { } key && stateEvent.AuthoritativeRevision is { } revision)
+        {
+            var targetView = views.FirstOrDefault(view => string.Equals(
+                NetworkSessionManager.SynchronizedDraftConversationKey(view, workspace.Snapshot), key, StringComparison.Ordinal));
+            if (targetView is not null)
+                ApplyDraftAcknowledgement(targetView, GetOrCreateDraftState(targetView), stateEvent, key, revision);
+        }
+        RefreshDraftConflictState();
+    }
+
+    private void ApplyDraftAuthority(WorkspaceView view, ComposerDraftState state, NexIrcDraft authority, bool isSnapshot)
+    {
+        if (state.ConversationKey != authority.ConversationKey
+            && state.ConversationKey.StartsWith("local-query:", StringComparison.Ordinal)
+            && state.Text.Length > 0)
+        {
+            state.HasSnapshot = true;
+            state.ServerText = authority.Text;
+            state.ServerRevision = authority.Revision;
+            state.BaseRevision = authority.Revision;
+            state.HasConflict = true;
+            state.HasLocalChanges = true;
+            PersistDraftState(state);
+            RefreshDraftConflictState();
+            return;
+        }
+
+        if (state.ConversationKey != authority.ConversationKey)
+        {
+            _persistedDrafts.Remove((state.ProfileId, state.ConversationKey));
+            state.ConversationKey = authority.ConversationKey;
+        }
+
+        state.HasSnapshot = true;
+        if (isSnapshot) state.PendingAwaitingResponse = false;
+
+        if (state.PendingMutationId is { } pendingId
+            && state.PendingBaseRevision is { } pendingBase
+            && state.PendingText is { } pendingText)
+        {
+            if (authority.Revision > pendingBase && string.Equals(authority.Text, pendingText, StringComparison.Ordinal))
+            {
+                state.ServerText = authority.Text;
+                state.ServerRevision = authority.Revision;
+                state.BaseRevision = authority.Revision;
+                state.HasLocalChanges = state.Text != pendingText;
+                state.ClearAfterSuccessfulSend = false;
+                ClearPendingMutation(state);
+                state.HasConflict = false;
+            }
+            else if (authority.Revision == pendingBase && string.Equals(authority.Text, state.ServerText, StringComparison.Ordinal))
+            {
+                state.ServerText = authority.Text;
+                state.ServerRevision = authority.Revision;
+                state.BaseRevision = authority.Revision;
+                state.PendingAwaitingResponse = false;
+                PersistDraftState(state);
+                ScheduleDraftSynchronization(view, state);
+                return;
+            }
+            else if (authority.Revision != pendingBase || !string.Equals(authority.Text, state.ServerText, StringComparison.Ordinal))
+            {
+                state.ServerText = authority.Text;
+                state.ServerRevision = authority.Revision;
+                state.BaseRevision = authority.Revision;
+                state.HasConflict = true;
+                state.HasLocalChanges = true;
+                state.ClearAfterSuccessfulSend = false;
+                ClearPendingMutation(state);
+            }
+            else
+            {
+                state.PendingAwaitingResponse = false;
+                ScheduleDraftSynchronization(view, state);
+                return;
+            }
+        }
+        else if (state.ClearAfterSuccessfulSend)
+        {
+            var serverStillAtKnownBase = authority.Revision == state.BaseRevision
+                && string.Equals(authority.Text, state.ServerText, StringComparison.Ordinal);
+            state.ClearAfterSuccessfulSend = false;
+            state.ServerText = authority.Text;
+            state.ServerRevision = authority.Revision;
+            state.BaseRevision = authority.Revision;
+            state.HasConflict = !serverStillAtKnownBase && state.Text != authority.Text;
+            state.HasLocalChanges = state.Text != authority.Text;
+        }
+        else if (state.HasConflict)
+        {
+            state.ServerText = authority.Text;
+            state.ServerRevision = authority.Revision;
+        }
+        else if (!state.HasLocalChanges)
+        {
+            state.Text = authority.Text;
+            state.ServerText = authority.Text;
+            state.ServerRevision = authority.Revision;
+            state.BaseRevision = authority.Revision;
+        }
+        else if (state.Text == authority.Text)
+        {
+            state.ServerText = authority.Text;
+            state.ServerRevision = authority.Revision;
+            state.BaseRevision = authority.Revision;
+            state.HasLocalChanges = false;
+        }
+        else if (state.BaseRevision == authority.Revision
+            && string.Equals(state.ServerText, authority.Text, StringComparison.Ordinal))
+        {
+            state.ServerText = authority.Text;
+            state.ServerRevision = authority.Revision;
+        }
+        else
+        {
+            state.ServerText = authority.Text;
+            state.ServerRevision = authority.Revision;
+            state.BaseRevision = authority.Revision;
+            state.HasConflict = true;
+            state.HasLocalChanges = true;
+        }
+
+        if (ReferenceEquals(ActiveView, view) && !state.HasConflict)
+            SetProjectedInput(state.Text);
+        PersistDraftState(state);
+        if (!state.HasConflict && state.Text != state.ServerText)
+            ScheduleDraftSynchronization(view, state);
+    }
+
+    private void ApplyDraftAcknowledgement(WorkspaceView view, ComposerDraftState state,
+        IrcNexIrcDraftStateEvent stateEvent, string conversationKey, long revision)
+    {
+        if (!string.Equals(stateEvent.Status, "CONFLICT", StringComparison.OrdinalIgnoreCase)
+            && (state.PendingMutationId is null || !string.Equals(state.PendingMutationId, stateEvent.MutationId, StringComparison.Ordinal)))
+            return;
+
+        if (string.Equals(stateEvent.Status, "CONFLICT", StringComparison.OrdinalIgnoreCase))
+        {
+            state.ServerText = stateEvent.AuthoritativeText ?? string.Empty;
+            state.ServerRevision = revision;
+            state.BaseRevision = revision;
+            state.HasConflict = true;
+            state.HasLocalChanges = true;
+            state.ClearAfterSuccessfulSend = false;
+            ClearPendingMutation(state);
+        }
+        else if (string.Equals(stateEvent.Status, "APPLIED", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(stateEvent.Status, "DUPLICATE", StringComparison.OrdinalIgnoreCase))
+        {
+            state.ServerText = state.PendingText ?? state.Text;
+            state.ServerRevision = revision;
+            state.BaseRevision = revision;
+            state.HasConflict = false;
+            state.HasLocalChanges = state.Text != state.ServerText;
+            state.ClearAfterSuccessfulSend = false;
+            ClearPendingMutation(state);
+        }
+        else
+        {
+            state.PendingAwaitingResponse = false;
+            PersistDraftState(state);
+            return;
+        }
+
+        if (ReferenceEquals(ActiveView, view) && !state.HasConflict)
+            SetProjectedInput(state.Text);
+        PersistDraftState(state);
+        RefreshDraftConflictState();
+        if (!state.HasConflict && state.Text != state.ServerText)
+            ScheduleDraftSynchronization(view, state);
+        _ = conversationKey;
+    }
+
+    private static void ClearPendingMutation(ComposerDraftState state)
+    {
+        state.PendingMutationId = null;
+        state.PendingBaseRevision = null;
+        state.PendingText = null;
+        state.PendingAwaitingResponse = false;
+    }
+
+    private bool HasActiveDraftConflict() => ActiveView is not null
+        && _drafts.TryGetValue((ActiveView.NetworkId, ActiveView.Id), out var state) && state.HasConflict;
+
+    private void KeepServerDraft()
+    {
+        if (ActiveView is not { } view || !HasActiveDraftConflict() || !_drafts.TryGetValue((view.NetworkId, view.Id), out var state)) return;
+        if (Sessions.TryGet(view.NetworkId, out var workspace) && workspace is not null
+            && NetworkSessionManager.SynchronizedDraftConversationKey(view, workspace.Snapshot) is { } key
+            && state.ConversationKey != key)
+        {
+            _persistedDrafts.Remove((state.ProfileId, state.ConversationKey));
+            state.ConversationKey = key;
+        }
+        state.Text = state.ServerText;
+        state.BaseRevision = state.ServerRevision;
+        state.HasConflict = false;
+        state.HasLocalChanges = false;
+        state.ClearAfterSuccessfulSend = false;
+        ClearPendingMutation(state);
+        SetProjectedInput(state.Text);
+        PersistDraftState(state);
+        RefreshDraftConflictState();
+    }
+
+    private void ReplaceServerDraftWithLocal()
+    {
+        if (ActiveView is not { } view || !HasActiveDraftConflict() || !_drafts.TryGetValue((view.NetworkId, view.Id), out var state)
+            || !Sessions.TryGet(view.NetworkId, out var workspace) || workspace is null
+            || NetworkSessionManager.SynchronizedDraftConversationKey(view, workspace.Snapshot) is not { } key)
+            return;
+
+        _persistedDrafts.Remove((state.ProfileId, state.ConversationKey));
+        state.ConversationKey = key;
+        state.BaseRevision = state.ServerRevision;
+        state.HasConflict = false;
+        state.HasLocalChanges = true;
+        state.ClearAfterSuccessfulSend = false;
+        ClearPendingMutation(state);
+        if (state.Text != state.ServerText)
+        {
+            state.PendingMutationId = Guid.NewGuid().ToString("N");
+            state.PendingBaseRevision = state.BaseRevision;
+            state.PendingText = state.Text;
+        }
+        PersistDraftState(state);
+        RefreshDraftConflictState();
+        StartDraftMutation(view, state);
+    }
+
+    private void RefreshDraftConflictState()
+    {
+        OnPropertyChanged(nameof(IsDraftConflictVisible));
+        OnPropertyChanged(nameof(DraftConflictText));
+        (KeepServerDraftCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
+        (ReplaceServerDraftCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
     }
 
     private void ClearReplyComposer(bool updateStatus)
@@ -1085,6 +1642,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         foreach (var key in _drafts.Keys.Where(key => key.NetworkId == networkId).ToArray())
         {
             _drafts.Remove(key);
+            if (_draftDebounces.Remove(key, out var cancellation))
+            {
+                cancellation.Cancel();
+                cancellation.Dispose();
+            }
         }
     }
 
@@ -1229,6 +1791,41 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         (BackConversationCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
         (ForwardConversationCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
         (CancelReplyCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
+        (KeepServerDraftCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
+        (ReplaceServerDraftCommand as RelayCommandBase)?.RaiseCanExecuteChanged();
+    }
+
+    private sealed class ComposerDraftState(Guid networkId, Guid profileId, string conversationKey, string text)
+    {
+        public Guid NetworkId { get; } = networkId;
+
+        public Guid ProfileId { get; } = profileId;
+
+        public string ConversationKey { get; set; } = conversationKey;
+
+        public string Text { get; set; } = text;
+
+        public long BaseRevision { get; set; }
+
+        public string ServerText { get; set; } = string.Empty;
+
+        public long ServerRevision { get; set; }
+
+        public bool HasConflict { get; set; }
+
+        public bool HasLocalChanges { get; set; }
+
+        public bool ClearAfterSuccessfulSend { get; set; }
+
+        public bool HasSnapshot { get; set; }
+
+        public bool PendingAwaitingResponse { get; set; }
+
+        public string? PendingMutationId { get; set; }
+
+        public long? PendingBaseRevision { get; set; }
+
+        public string? PendingText { get; set; }
     }
 
     private abstract class RelayCommandBase : ICommand
