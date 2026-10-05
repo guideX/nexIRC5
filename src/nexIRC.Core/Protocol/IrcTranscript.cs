@@ -225,6 +225,11 @@ public static class IrcSensitiveData
         if (tokens.Length >= 4
             && tokens[1].Equals("SESSION", StringComparison.OrdinalIgnoreCase))
         {
+            if (tokens[2].Equals("ACK", StringComparison.OrdinalIgnoreCase))
+            {
+                return prefix + string.Join(' ', tokens);
+            }
+
             if (tokens.Length >= 6
                 && tokens[2].Equals(NexIrcResumeProtocol.SessionRotateSubcommand, StringComparison.OrdinalIgnoreCase))
             {

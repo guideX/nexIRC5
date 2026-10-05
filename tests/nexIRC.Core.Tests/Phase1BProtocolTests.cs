@@ -191,6 +191,13 @@ public sealed class Phase1BProtocolTests
     }
 
     [Fact]
+    public void ResumeRotationAcknowledgementsRemainDiagnosableWithoutExposingCredentials()
+    {
+        Assert.Equal("NEXIRC SESSION ACK 3", IrcSensitiveData.RedactLine("NEXIRC SESSION ACK 3"));
+        Assert.Equal(":server NEXIRC SESSION ACK OK 3", IrcSensitiveData.RedactLine(":server NEXIRC SESSION ACK OK 3"));
+    }
+
+    [Fact]
     public void PairingMaterialIsNetworkBoundAndRedactedAtEveryWireBoundary()
     {
         const string network = "phase42-network";
