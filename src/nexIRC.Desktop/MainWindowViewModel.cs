@@ -43,7 +43,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         ConfigurationService? configuration = null,
         ProfileCredentialService? credentials = null,
         IConversationLogStore? logStore = null,
-        IConversationDraftStore? conversationDraftStore = null)
+        IConversationDraftStore? conversationDraftStore = null,
+        IResumeStateStore? resumeStateStore = null,
+        IResumeSecretProtector? resumeSecretProtector = null)
     {
         _uiDispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         Configuration = configuration;
@@ -51,12 +53,15 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             OperatingSystem.IsWindows()
                 ? new WindowsCredentialStore()
                 : new InMemoryProfileCredentialStore());
-        if (OperatingSystem.IsWindows() && configuration?.Store is JsonConfigurationStore)
+        _resumeStateStore = resumeStateStore;
+        _resumeSecretProtector = resumeSecretProtector;
+        if (OperatingSystem.IsWindows() && configuration?.Store is JsonConfigurationStore
+            && (_resumeStateStore is null || _resumeSecretProtector is null))
         {
             try
             {
-                _resumeStateStore = new JsonResumeStateStore(ResumeStatePaths.GetDefaultRoot());
-                _resumeSecretProtector = new WindowsDpapiResumeSecretProtector();
+                _resumeStateStore ??= new JsonResumeStateStore(ResumeStatePaths.GetDefaultRoot());
+                _resumeSecretProtector ??= new WindowsDpapiResumeSecretProtector();
             }
             catch
             {

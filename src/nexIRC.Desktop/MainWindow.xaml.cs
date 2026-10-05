@@ -34,7 +34,9 @@ public partial class MainWindow : Window
         ConfigurationService? configuration = null,
         ProfileCredentialService? credentials = null,
         IConversationLogStore? logStore = null,
-        IConversationDraftStore? conversationDraftStore = null)
+        IConversationDraftStore? conversationDraftStore = null,
+        nexIRC.Core.Session.IResumeStateStore? resumeStateStore = null,
+        nexIRC.Core.Session.IResumeSecretProtector? resumeSecretProtector = null)
     {
         InitializeComponent();
         _conversationDraftStore = conversationDraftStore;
@@ -44,7 +46,9 @@ public partial class MainWindow : Window
             configuration ?? new ConfigurationService(new InMemoryConfigurationStore()),
             credentials,
             logStore,
-            conversationDraftStore: conversationDraftStore);
+            conversationDraftStore: conversationDraftStore,
+            resumeStateStore: resumeStateStore,
+            resumeSecretProtector: resumeSecretProtector);
         DataContext = ViewModel;
         ViewModel.NewConnectionRequested += ShowNewConnectionAsync;
         ViewModel.ExitRequested += Close;

@@ -252,6 +252,9 @@ public sealed record NetworkConnectionOptions
     /// </summary>
     public IResumeStateStore? ResumeStateStore { get; init; }
 
+    /// <summary>Optional host-owned binding for native-resume storage in controlled process fixtures.</summary>
+    public string? ResumeNetworkIdentity { get; init; }
+
     public ServerSessionOptions ToSessionOptions(
         Guid? networkId = null,
         bool continuityRecoveryRequired = false,
@@ -260,7 +263,9 @@ public sealed record NetworkConnectionOptions
         IResumeSecretProtector? resumeSecretProtector = null) => new()
     {
         NetworkId = networkId,
-        ResumeNetworkIdentity = ResumeStateIdentity.For(Endpoint, networkId),
+        ResumeNetworkIdentity = string.IsNullOrWhiteSpace(ResumeNetworkIdentity)
+            ? ResumeStateIdentity.For(Endpoint, networkId)
+            : ResumeNetworkIdentity,
         ResumeStateStore = resumeStateStore ?? ResumeStateStore,
         ResumeSecretProtector = resumeSecretProtector,
         ContinuityRecoveryRequired = continuityRecoveryRequired,

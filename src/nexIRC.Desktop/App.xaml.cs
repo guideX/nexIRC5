@@ -20,6 +20,25 @@ public partial class App : System.Windows.Application
     {
         base.OnStartup(e);
 
+        if (Phase53DesktopProcessHarness.IsRequested(e.Args))
+        {
+            try
+            {
+                var exitCode = await Phase53DesktopProcessHarness.RunAsync(e.Args).ConfigureAwait(true);
+                Environment.ExitCode = exitCode;
+                Shutdown(exitCode);
+            }
+            catch (Exception exception)
+            {
+                var safeMessage = exception.Message.Replace('\r', ' ').Replace('\n', ' ');
+                Console.Error.WriteLine($"PHASE53_DESKTOP_ERROR type={exception.GetType().Name} message={safeMessage}");
+                Environment.ExitCode = 2;
+                Shutdown(2);
+            }
+
+            return;
+        }
+
         var demo = e.Args.Any(argument => string.Equals(argument, "--demo", StringComparison.OrdinalIgnoreCase));
         var liveSmoke = e.Args.Any(argument => string.Equals(argument, "--live-smoke", StringComparison.OrdinalIgnoreCase));
         var smokeScenario = ReadSmokeScenario(e.Args);
