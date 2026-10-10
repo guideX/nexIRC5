@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using nexIRC.Application;
@@ -257,7 +258,12 @@ internal static class Phase53DesktopProcessHarness
         var persisted = window.ConversationDraftStore.Load().FirstOrDefault(draft => draft.ProfileId == workspace.ProfileId
             && string.Equals(draft.ConversationKey, conversationKey, StringComparison.Ordinal));
         var hasAuthority = window.ViewModel.Sessions.TryGetSynchronizedDraftState(view, out var authority);
-        Emit($"DESKTOP_COMPOSER_STATE request={requestId} input64={Encode(window.ViewModel.InputText)} local64={Encode(persisted?.Text ?? string.Empty)} baseRevision={persisted?.BaseRevision.ToString(CultureInfo.InvariantCulture) ?? "none"} conflict={persisted?.HasConflict.ToString().ToLowerInvariant() ?? "false"} localServerRevision={persisted?.ServerRevision.ToString(CultureInfo.InvariantCulture) ?? "none"} localServer64={Encode(persisted?.ServerText ?? string.Empty)} pendingMutationId={persisted?.PendingMutationId ?? "none"} pendingBaseRevision={persisted?.PendingBaseRevision?.ToString(CultureInfo.InvariantCulture) ?? "none"} pendingText64={Encode(persisted?.PendingText ?? string.Empty)} authorityRevision={(hasAuthority ? authority?.Revision.ToString(CultureInfo.InvariantCulture) : "none")} authority64={Encode(hasAuthority ? authority?.Text ?? string.Empty : string.Empty)}");
+        var input = window.ViewModel.InputText;
+        var local = persisted?.Text ?? string.Empty;
+        var localServer = persisted?.ServerText ?? string.Empty;
+        var pendingText = persisted?.PendingText ?? string.Empty;
+        var authorityText = hasAuthority ? authority?.Text ?? string.Empty : string.Empty;
+        Emit($"DESKTOP_COMPOSER_STATE request={requestId} inputBytes={Encoding.UTF8.GetByteCount(input).ToString(CultureInfo.InvariantCulture)} inputSha256={Fingerprint(input)} localBytes={Encoding.UTF8.GetByteCount(local).ToString(CultureInfo.InvariantCulture)} localSha256={Fingerprint(local)} baseRevision={persisted?.BaseRevision.ToString(CultureInfo.InvariantCulture) ?? "none"} conflict={persisted?.HasConflict.ToString().ToLowerInvariant() ?? "false"} localServerRevision={persisted?.ServerRevision.ToString(CultureInfo.InvariantCulture) ?? "none"} localServerBytes={Encoding.UTF8.GetByteCount(localServer).ToString(CultureInfo.InvariantCulture)} localServerSha256={Fingerprint(localServer)} pendingMutationId={persisted?.PendingMutationId ?? "none"} pendingBaseRevision={persisted?.PendingBaseRevision?.ToString(CultureInfo.InvariantCulture) ?? "none"} pendingTextBytes={Encoding.UTF8.GetByteCount(pendingText).ToString(CultureInfo.InvariantCulture)} pendingTextSha256={Fingerprint(pendingText)} authorityRevision={(hasAuthority ? authority?.Revision.ToString(CultureInfo.InvariantCulture) : "none")} authorityBytes={Encoding.UTF8.GetByteCount(authorityText).ToString(CultureInfo.InvariantCulture)} authoritySha256={Fingerprint(authorityText)}");
     }
 
     private static string CommandRequestId(string command) =>
@@ -282,8 +288,8 @@ internal static class Phase53DesktopProcessHarness
         return Encoding.UTF8.GetString(Convert.FromBase64String(normalized));
     }
 
-    private static string Encode(string value) => Convert.ToBase64String(Encoding.UTF8.GetBytes(value))
-        .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+    private static string Fingerprint(string value) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
 
     private static void Emit(string message)
     {

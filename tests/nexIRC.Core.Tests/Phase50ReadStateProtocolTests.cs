@@ -1,3 +1,4 @@
+using System.Text;
 using nexIRC.Core.Protocol;
 using nexIRC.Core.State;
 
@@ -42,6 +43,24 @@ public sealed class Phase50ReadStateProtocolTests
         Assert.DoesNotContain("cXVlcnktYWNjb3VudDphY2NvdW50OmFsaWNl", redacted, StringComparison.Ordinal);
         Assert.DoesNotContain("bXNnLTE3", redacted, StringComparison.Ordinal);
         Assert.Contains("NEXIRC STATE <redacted>", redacted, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DraftStateDiagnosticsRedactCompletePayloads()
+    {
+        const string draftBody = "private synchronized draft body — keep out of diagnostics";
+        var payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(draftBody));
+        var line = $":alice!user@host NEXIRC STATE SET DRAFT cXVlcnktYWNjb3VudDphY2NvdW50OmJvYg 8 0123456789abcdef {payload}";
+        var redacted = IrcSensitiveData.RedactLine(line);
+
+        Assert.Contains("NEXIRC STATE <redacted>", redacted, StringComparison.Ordinal);
+        Assert.DoesNotContain(draftBody, redacted, StringComparison.Ordinal);
+        Assert.DoesNotContain(payload, redacted, StringComparison.Ordinal);
+
+        var parsed = IrcMessageParser.Parse(line).Message!;
+        var redactedParsed = IrcSensitiveData.RedactParsedMessage(parsed);
+        Assert.DoesNotContain(draftBody, redactedParsed.RawLine, StringComparison.Ordinal);
+        Assert.DoesNotContain(payload, redactedParsed.RawLine, StringComparison.Ordinal);
     }
 
     [Fact]

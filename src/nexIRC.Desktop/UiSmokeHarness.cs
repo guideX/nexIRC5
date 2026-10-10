@@ -117,7 +117,7 @@ internal static class UiSmokeHarness
                 await BurstAsync(window, demo, state.Alpha, 5_000).ConfigureAwait(true);
                 break;
             case "query-nick":
-                await QueryNickAsync(window, demo, state.Alpha).ConfigureAwait(true);
+                await QueryNickAsync(window, demo, state.Alpha, state.Beta).ConfigureAwait(true);
                 break;
             case "ircv3-metadata":
                 await Ircv3MetadataAsync(window, demo, state.Alpha).ConfigureAwait(true);
@@ -2369,15 +2369,21 @@ internal static class UiSmokeHarness
             $"the close probe did not create the required accepted-work pressure (max={sessions.Diagnostics.MaximumQueueDepth})");
     }
 
-    private static async Task QueryNickAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)
+    private static async Task QueryNickAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network, NetworkWorkspace otherNetwork)
     {
         var viewModel = window.ViewModel;
         var channel = RequiredChannel(network);
         var query = viewModel.Sessions.EnsureQuery(network.Id, "Alex");
+        Require(NetworkSessionManager.SynchronizedDraftConversationKey(query, network.Snapshot) is null,
+            "nick-only query unexpectedly acquired an account-scoped synchronized identity");
         var historyKey = query.HistoryConversationKey;
         viewModel.SelectView(query);
         const string draft = "draft survives the query nickname transition";
         viewModel.PrepareInput(draft);
+        viewModel.SelectView(otherNetwork.StatusView);
+        Require(ReferenceEquals(viewModel.ActiveView, otherNetwork.StatusView), "query fallback probe did not switch workspaces");
+        viewModel.SelectView(query);
+        Require(viewModel.InputText == draft, "nick-only local draft was lost while switching workspaces");
         viewModel.SelectView(network.StatusView);
 
         demo.AlphaTransport.EnqueueInboundLine(":Alex!demo@alpha NICK Alex2");
@@ -2386,14 +2392,27 @@ internal static class UiSmokeHarness
         Require(query.HistoryConversationKey == historyKey, "query nickname transition changed the stable history identity");
         Require(query.EntriesSnapshot.Any(entry => entry.Kind == TranscriptEntryKind.Nick && entry.Text.Contains("Alex2", StringComparison.Ordinal)), "query nickname transition was not rendered in the query transcript");
 
+        var reusedNickname = viewModel.Sessions.EnsureQuery(network.Id, "Alex");
+        Require(!ReferenceEquals(query, reusedNickname), "a reused nickname was merged into the renamed query view");
+        viewModel.SelectView(reusedNickname);
+        Require(viewModel.InputText.Length == 0, "the prior nick-only query draft leaked into the new nick owner");
+        const string reusedNickDraft = "draft for the new holder of Alex";
+        viewModel.PrepareInput(reusedNickDraft);
         viewModel.SelectView(query);
+        Require(viewModel.InputText == draft, "nick reuse replaced the original query's local draft");
+        viewModel.SelectView(reusedNickname);
+        Require(viewModel.InputText == reusedNickDraft, "nick reuse did not keep the new query's local draft separate");
+        viewModel.SelectView(query);
+
         Require(viewModel.InputText == draft, "query draft was not restored after the nickname transition");
         Require(viewModel.CloseActiveView(), "renamed query did not close through the UI view-model path");
         var renamedMember = RequiredMember(channel, "Alex2");
         viewModel.OpenParticipantQuery(viewModel.CreateParticipantContext(network, channel, renamedMember));
         Require(ReferenceEquals(viewModel.ActiveView, query), "participant reopen created a duplicate query after nickname transition");
         Require(viewModel.InputText == draft, "query draft was not restored after close and participant reopen");
-        Console.WriteLine($"QUERY_NICK_UI_METRICS same_view=true history_key_stable=true draft_restored=true query_count={network.Queries.Count}");
+        Require(!demo.AlphaTransport.OutboundLines.Any(static line => line.StartsWith("NEXIRC STATE SET DRAFT ", StringComparison.Ordinal)),
+            "ambiguous nick-only composer emitted an account-scoped synchronized draft mutation");
+        Console.WriteLine($"QUERY_NICK_UI_METRICS same_view=true history_key_stable=true draft_restored=true nick_reuse_isolated=true synchronized_mutations=0 query_count={network.Queries.Count}");
     }
 
     private static void Register(FakeIrcTransport transport, string nickname)

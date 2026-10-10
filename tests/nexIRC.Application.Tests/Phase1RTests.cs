@@ -1,6 +1,7 @@
 using nexIRC.Core.Networking;
 using nexIRC.Core.Session;
 using nexIRC.Networking.Testing;
+using System.Diagnostics;
 
 namespace nexIRC.Application.Tests;
 
@@ -99,7 +100,7 @@ public sealed class Phase1RTests
                     plan.Initial,
                     generation: 0,
                     initialTrafficPerNetwork);
-                await WaitForPlanConvergenceAsync(plan, "initial workload did not converge");
+                await WaitForPlanConvergenceAsync(manager, plan, "initial");
                 await manager.FlushStateDispatchAsync();
             }
 
@@ -120,6 +121,7 @@ public sealed class Phase1RTests
                     var oldTransport = cycle == 0 ? plan.Initial : plan.Replacements[cycle - 1];
                     var replacement = plan.Replacements[cycle];
                     await manager.ReconnectAsync(plan.Network.Id);
+                    plan.CurrentTransport = replacement;
                     totalReconnectCycles++;
                     await WaitForAsync(() => replacement.ConnectCount == 1, "replacement transport did not connect");
                     await WaitForAsync(() => oldTransport.CallbackSubscriptionCount == 0 && oldTransport.ActiveReadCount == 0, "old transport remained active after reconnect");
@@ -130,7 +132,7 @@ public sealed class Phase1RTests
                         replacement,
                         generation: cycle + 1,
                         reconnectTrafficPerNetwork);
-                    await WaitForPlanConvergenceAsync(plan, $"reconnect workload {cycle + 1} did not converge");
+                    await WaitForPlanConvergenceAsync(manager, plan, $"reconnect-{cycle + 1}");
                     await manager.FlushStateDispatchAsync();
                 }
             }
@@ -240,7 +242,7 @@ public sealed class Phase1RTests
             totalInboundLines += EnqueueRegistration(readdedTransport, readdedPlan.Network.Snapshot.Nickname, "srv-readded");
             await WaitForAsync(() => readdedPlan.Network.State == NetworkDisplayState.Registered, "re-added network did not register");
             totalInboundLines += EnqueueConnectionWorkload(readdedPlan, readdedTransport, 0, 120);
-            await WaitForPlanConvergenceAsync(readdedPlan, "re-added network did not converge");
+            await WaitForPlanConvergenceAsync(manager, readdedPlan, "re-added-network");
             await manager.FlushStateDispatchAsync();
             await manager.RemoveAsync(readdedPlan.Network.Id);
 
@@ -396,12 +398,38 @@ public sealed class Phase1RTests
         return count;
     }
 
-    private static async Task WaitForPlanConvergenceAsync(SessionPlan plan, string failure)
+    private static async Task WaitForPlanConvergenceAsync(NetworkSessionManager manager, SessionPlan plan, string stage)
     {
-        await WaitForAsync(
-            () => plan.Network.Channels.All(channel => channel.Synchronization == ChannelSynchronizationState.Synchronized)
-                && plan.ExpectedChannelMessages.All(pair => pair.Value.Count == 0 || plan.Network.Channels.Single(channel => channel.Channel == pair.Key).EntriesSnapshot.Any(entry => entry.Text == pair.Value[^1])),
-            failure);
+        var convergenceWatch = Stopwatch.StartNew();
+        bool IsConverged() => plan.Network.Channels.All(channel => channel.Synchronization == ChannelSynchronizationState.Synchronized)
+            && plan.ExpectedChannelMessages.All(pair => pair.Value.Count == 0 || plan.Network.Channels.Single(channel => channel.Channel == pair.Key).EntriesSnapshot.Any(entry => entry.Text == pair.Value[^1]));
+
+        try
+        {
+            await WaitForAsync(IsConverged, $"{stage} workload did not converge");
+        }
+        catch (TimeoutException exception)
+        {
+            convergenceWatch.Stop();
+            throw new TimeoutException(
+                $"{exception.Message}; stage={stage}; elapsed_ms={convergenceWatch.ElapsedMilliseconds}; " +
+                $"network_state={plan.Network.State}; synchronized_channels={plan.Network.Channels.Count(channel => channel.Synchronization == ChannelSynchronizationState.Synchronized)}/{plan.Network.Channels.Count}; " +
+                $"channels=[{string.Join(';', plan.Network.Channels.Select(channel =>
+                {
+                    var expected = plan.ExpectedChannelMessages[channel.Channel];
+                    var entries = channel.EntriesSnapshot;
+                    return $"{channel.Channel}:sync={channel.Synchronization},members={channel.MembersSnapshot.Count},entries={entries.Count},expected_tail={(expected.Count == 0 || entries.Any(entry => entry.Text == expected[^1]))}";
+                }))}]; " +
+                $"transport_connected={plan.CurrentTransport.IsConnected}; transport_pending_inbound={plan.CurrentTransport.PendingInboundItemCount}; " +
+                FormatDispatcherDiagnostics(manager.Diagnostics),
+                exception);
+        }
+
+        convergenceWatch.Stop();
+        Console.WriteLine(
+            $"PHASE1R_CONVERGENCE stage={stage}; elapsed_ms={convergenceWatch.ElapsedMilliseconds}; " +
+            $"synchronized_channels={plan.Network.Channels.Count(channel => channel.Synchronization == ChannelSynchronizationState.Synchronized)}/{plan.Network.Channels.Count}; " +
+            FormatDispatcherDiagnostics(manager.Diagnostics));
 
         foreach (var pair in plan.ExpectedChannelMessages)
         {
@@ -415,6 +443,20 @@ public sealed class Phase1RTests
         }
 
         Assert.All(plan.Network.Channels, channel => Assert.Equal(49, channel.MembersSnapshot.Count));
+    }
+
+    private static string FormatDispatcherDiagnostics(NetworkSessionDiagnostics diagnostics)
+    {
+        var state = diagnostics.StateDispatch;
+        var boundary = state.BoundaryDiagnostics;
+        var recentCategories = state.RecentSamples is null
+            ? "unavailable"
+            : string.Join(',', state.RecentSamples.TakeLast(8).Select(sample => sample.Category));
+        return $"dispatcher_queued={state.QueuedActions},dispatcher_processed={state.ProcessedActions},dispatcher_backlog={state.CurrentQueueDepth}," +
+            $"dispatcher_oldest_age_ms={state.CurrentOldestQueuedWorkAgeMilliseconds:F1},dispatcher_max_backlog={state.MaximumQueueDepth}," +
+            $"boundary_posted={boundary?.WorkItemsPosted ?? 0},boundary_executed={boundary?.WorkItemsExecuted ?? 0}," +
+            $"boundary_pending={boundary?.CurrentPendingWorkItems ?? 0},boundary_max_pending={boundary?.MaximumPendingWorkItems ?? 0}," +
+            $"recent_completed_categories={recentCategories}";
     }
 
     private static async Task WaitForAsync(Func<bool> condition, string failure, int timeoutMilliseconds = 15_000)
@@ -446,6 +488,8 @@ public sealed class Phase1RTests
         public IReadOnlyList<string> Channels { get; } = channels;
 
         public NetworkWorkspace Network { get; set; } = null!;
+
+        public FakeIrcTransport CurrentTransport { get; set; } = initial;
 
         public Dictionary<string, List<string>> ExpectedChannelMessages { get; } = channels.ToDictionary(channel => channel, _ => new List<string>(), StringComparer.Ordinal);
 

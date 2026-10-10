@@ -1230,7 +1230,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         return view switch
         {
             ChannelView channel => $"local-channel:{nexIRC.Core.State.IrcCaseMappingComparer.Fold(channel.Channel, workspace.Snapshot.Features.CaseMapping)}",
-            QueryView query => $"local-query:{nexIRC.Core.State.IrcCaseMappingComparer.Fold(query.Nickname, workspace.Snapshot.Features.CaseMapping)}",
+            QueryView query => $"local-query:{query.Id:N}",
             _ => $"local-view:{view.Id:N}"
         };
     }
