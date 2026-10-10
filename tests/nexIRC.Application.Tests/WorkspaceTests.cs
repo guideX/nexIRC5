@@ -78,7 +78,8 @@ public sealed class WorkspaceTests
         first.EnqueueInboundLine(":srv 366 alice #room :End");
         first.EnqueueInboundLine(":srv 332 alice #room :Adaptive topic");
 
-        await WaitForAsync(() => network.Channels.Single().Synchronization == ChannelSynchronizationState.Synchronized);
+        await WaitForAsync(() => network.Channels.Single().Synchronization == ChannelSynchronizationState.Synchronized
+            && network.Channels.Single().Topic == "Adaptive topic");
         var channel = network.Channels.Single();
         Assert.Equal("Adaptive topic", channel.Topic);
         Assert.Equal("~", channel.MembersSnapshot.Single(member => member.Nickname == "alice").PrefixText);
