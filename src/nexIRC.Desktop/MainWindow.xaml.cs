@@ -598,6 +598,20 @@ public partial class MainWindow : Window
             return;
         }
 
+        var pinnedItem = FindAncestor<ListBoxItem>(source);
+        if (pinnedItem?.DataContext is PinnedConversationNavigationItem pinnedConversation)
+        {
+            var pinActions = new List<(string, Func<Task>)>
+            {
+                ("Unpin conversation", () => ViewModel.SetConversationPinnedAsync(pinnedConversation.View, false))
+            };
+            if (pinnedConversation.CanMoveToTop)
+                pinActions.Insert(0, ("Move to top", () => ViewModel.MovePinnedConversationToTopAsync(pinnedConversation)));
+            OpenContextMenu(pinnedItem, pinActions, "PinnedConversationContextMenu");
+            e.Handled = true;
+            return;
+        }
+
         var treeItem = FindAncestor<TreeViewItem>(source);
         if (treeItem?.DataContext is NetworkWorkspace network)
         {
@@ -629,6 +643,11 @@ public partial class MainWindow : Window
             {
                 ("Activate", () => { ViewModel.SelectView(view); return Task.CompletedTask; })
             };
+            var isPinned = ViewModel.Sessions.IsConversationPinned(viewNetwork, view);
+            actions.Insert(0, (isPinned ? "Unpin conversation" : "Pin conversation",
+                () => ViewModel.SetConversationPinnedAsync(view, !isPinned)));
+            if (isPinned && ViewModel.Sessions.IsSynchronizedConversationPin(viewNetwork, view, out _))
+                actions.Insert(0, ("Move to top", () => ViewModel.MovePinnedConversationToTopAsync(view)));
             if (view is ChannelView channel)
             {
                 if (channel.IsJoined)

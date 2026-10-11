@@ -333,6 +333,7 @@ public abstract class WorkspaceView : ObservableObject
     private readonly List<SynchronizedUnreadActivity> _synchronizedUnreadActivities = [];
     private bool _isActive;
     private bool _isViewOpen = true;
+    private bool _isPinned;
     private bool _isLoadingOlderHistory;
     private bool _isLoadingNewerHistory;
     private bool _isViewingHistory;
@@ -439,6 +440,14 @@ public abstract class WorkspaceView : ObservableObject
         get => _isViewOpen;
         private set => SetProperty(ref _isViewOpen, value);
     }
+
+    public bool IsPinned
+    {
+        get => _isPinned;
+        private set => SetProperty(ref _isPinned, value);
+    }
+
+    internal void SetPinned(bool value) => IsPinned = value;
 
     public bool IsLoadingOlderHistory
     {
@@ -2002,6 +2011,7 @@ public sealed class NetworkWorkspace : ObservableObject
         _session = session;
         StatusView = new ServerStatusView(id, Guid.NewGuid(), options.DisplayName, options.Endpoint);
         Views.Add(StatusView);
+        SidebarViews.Add(StatusView);
         _snapshot = session.Snapshot;
         ApplySnapshot(_snapshot);
 
@@ -2113,6 +2123,9 @@ public sealed class NetworkWorkspace : ObservableObject
     public ServerStatusView StatusView { get; }
 
     public ThreadSafeObservableCollection<WorkspaceView> Views { get; } = [];
+
+    /// <summary>Sidebar tree projection that omits conversations in the pinned area.</summary>
+    public ThreadSafeObservableCollection<WorkspaceView> SidebarViews { get; } = [];
 
     public ThreadSafeObservableCollection<ChannelView> Channels { get; } = [];
 
@@ -2468,6 +2481,7 @@ public sealed class NetworkWorkspace : ObservableObject
     {
         view.CloseView();
         Views.Remove(view);
+        SidebarViews.Remove(view);
     }
 
     internal void ReopenView(WorkspaceView view)
@@ -2486,6 +2500,7 @@ public sealed class NetworkWorkspace : ObservableObject
     {
         view.CloseView();
         Views.Remove(view);
+        SidebarViews.Remove(view);
         if (view is ChannelView channel)
         {
             Channels.Remove(channel);
@@ -2508,5 +2523,24 @@ public sealed class NetworkWorkspace : ObservableObject
             var channelIndex = Views.TakeWhile(item => item.Kind is WorkspaceViewKind.ServerStatus or WorkspaceViewKind.Channel).Count();
             Views.Insert(Math.Max(1, channelIndex), view);
         }
+        InsertSidebarView(view);
+    }
+
+    internal void SetPinned(WorkspaceView view, bool isPinned)
+    {
+        view.SetPinned(isPinned);
+        if (isPinned)
+            SidebarViews.Remove(view);
+        else if (Views.Contains(view))
+            InsertSidebarView(view);
+    }
+
+    private void InsertSidebarView(WorkspaceView view)
+    {
+        if (view.IsPinned || SidebarViews.Contains(view)) return;
+        var sourceIndex = Views.IndexOf(view);
+        if (sourceIndex < 0) return;
+        var sidebarIndex = Views.Take(sourceIndex).Count(static item => !item.IsPinned);
+        SidebarViews.Insert(Math.Clamp(sidebarIndex, 0, SidebarViews.Count), view);
     }
 }

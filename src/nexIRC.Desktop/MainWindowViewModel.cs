@@ -21,6 +21,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private readonly object _shutdownGate = new();
     private Task? _shutdownTask;
     private int _navigationRefreshPending;
+    private int _pinnedRefreshPending;
     private long _navigationRefreshRequests;
     private long _navigationRefreshExecutions;
     private long _navigationRefreshCoalescedRequests;
@@ -117,7 +118,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         ListCommand = new RelayCommand(() => InputText = "/list ");
         NextViewCommand = new RelayCommand(() => ActivateRelativeView(1), () => Sessions.Networks.Count > 0);
         PreviousViewCommand = new RelayCommand(() => ActivateRelativeView(-1), () => Sessions.Networks.Count > 0);
-        ActivateConversationCommand = new ParameterizedRelayCommand(ActivateConversation, parameter => parameter is ConversationNavigationItem);
+        ActivateConversationCommand = new ParameterizedRelayCommand(ActivateConversation,
+            parameter => parameter is ConversationNavigationItem or PinnedConversationNavigationItem);
         NextConversationCommand = new RelayCommand(() => { Sessions.NavigateNextConversation(); }, () => Sessions.Networks.Count > 0);
         PreviousConversationCommand = new RelayCommand(() => { Sessions.NavigatePreviousConversation(); }, () => Sessions.Networks.Count > 0);
         NextUnreadCommand = new RelayCommand(() => { Sessions.NavigateNextUnread(); }, () => Sessions.Networks.Count > 0);
@@ -154,10 +156,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
             RefreshCommandStates();
             RefreshConversationNavigator();
+            RefreshPinnedConversations();
         };
         Sessions.NavigationChanged += OnNavigationChanged;
         Sessions.SynchronizedDraftStateReceived += OnSynchronizedDraftStateReceived;
+        Sessions.PinnedConversationsChanged += OnPinnedConversationsChanged;
+        Sessions.SynchronizedPinStateReceived += OnSynchronizedPinStateReceived;
         RefreshConversationNavigator();
+        RefreshPinnedConversations();
     }
 
     public event Func<Task>? NewConnectionRequested;
@@ -181,6 +187,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public ObservableCollection<NetworkWorkspace> Networks => Sessions.Networks;
 
     public ObservableCollection<ConversationNavigationItem> ConversationNavigator { get; } = [];
+
+    public ObservableCollection<PinnedConversationNavigationItem> PinnedConversations { get; } = [];
 
     public MainWindowPresentationDiagnostics PresentationDiagnostics => new(
         Interlocked.Read(ref _navigationRefreshRequests),
@@ -1023,6 +1031,35 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         return reopened;
     }
 
+    public async Task<bool> SetConversationPinnedAsync(WorkspaceView view, bool isPinned)
+    {
+        ArgumentNullException.ThrowIfNull(view);
+        if (!Sessions.TryGet(view.NetworkId, out var network) || network is null) return false;
+        var updated = await Sessions.SetConversationPinnedAsync(network, view, isPinned).ConfigureAwait(true);
+        StatusText = updated
+            ? isPinned ? $"Pin request sent for {view.Title}." : $"Unpin request sent for {view.Title}."
+            : network.Session.SynchronizedPinsAvailable
+                ? "Account pins are still loading or could not accept that change."
+                : "The local pin could not be saved.";
+        RefreshPinnedConversations();
+        return updated;
+    }
+
+    public async Task<bool> MovePinnedConversationToTopAsync(PinnedConversationNavigationItem item)
+    {
+        ArgumentNullException.ThrowIfNull(item);
+        var moved = await Sessions.MoveConversationPinToTopAsync(item).ConfigureAwait(true);
+        StatusText = moved ? $"Moved {item.View.Title} to the top of Pinned." : "The pinned order could not be changed.";
+        RefreshPinnedConversations();
+        return moved;
+    }
+
+    public Task<bool> MovePinnedConversationToTopAsync(WorkspaceView view)
+    {
+        var item = Sessions.GetPinnedConversationItems().FirstOrDefault(candidate => candidate.View.Id == view.Id);
+        return item is null ? Task.FromResult(false) : MovePinnedConversationToTopAsync(item);
+    }
+
     public bool RemoveHistoricalConversation(WorkspaceView view)
     {
         ArgumentNullException.ThrowIfNull(view);
@@ -1641,6 +1678,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private void ActivateConversation(object? parameter)
     {
+        if (parameter is PinnedConversationNavigationItem pinned)
+        {
+            if (!pinned.View.IsViewOpen)
+                ReopenConversation(pinned.View);
+            else
+                SelectView(pinned.View);
+            return;
+        }
         if (parameter is ConversationNavigationItem item
             && Sessions.TryGetView(item.ViewId, out _, out var view)
             && view is not null)
@@ -1680,6 +1725,70 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             ConversationNavigator.Add(item);
         }
+    }
+
+    private void OnPinnedConversationsChanged(object? sender, EventArgs e)
+    {
+        if (_uiDispatcher.CheckAccess())
+        {
+            RefreshPinnedConversations();
+            return;
+        }
+        if (Interlocked.Exchange(ref _pinnedRefreshPending, 1) != 0) return;
+        _uiDispatcher.BeginInvoke(new Action(() =>
+        {
+            Interlocked.Exchange(ref _pinnedRefreshPending, 0);
+            RefreshPinnedConversations();
+        }), System.Windows.Threading.DispatcherPriority.ContextIdle);
+    }
+
+    private void OnSynchronizedPinStateReceived(NetworkWorkspace workspace, IrcNexIrcPinStateEvent stateEvent)
+    {
+        if (stateEvent.Status is not { } status) return;
+        StatusText = status.ToUpperInvariant() switch
+        {
+            "APPLIED" or "DUPLICATE" => "Pinned conversations synchronized.",
+            "CONFLICT" => "Pinned conversations changed on another device; the list was refreshed.",
+            "CAPACITY" => "This account already has the maximum number of pinned conversations.",
+            "UNAUTHORIZED" => "The server rejected this pin change because the session is no longer authorized.",
+            "PERSISTENCE" => "The pin change could not be saved on the server.",
+            "UNAVAILABLE" => "Synchronized pins are unavailable; local pins remain available.",
+            _ => "The server rejected an invalid pin change."
+        };
+    }
+
+    private void RefreshPinnedConversations()
+    {
+        var items = Sessions.GetPinnedConversationItems();
+        for (var index = PinnedConversations.Count - 1; index >= 0; index--)
+        {
+            if (!items.Any(item => item.ViewId == PinnedConversations[index].ViewId))
+                PinnedConversations.RemoveAt(index);
+        }
+        for (var targetIndex = 0; targetIndex < items.Count; targetIndex++)
+        {
+            var desired = items[targetIndex];
+            var existingIndex = -1;
+            for (var index = targetIndex; index < PinnedConversations.Count; index++)
+            {
+                if (PinnedConversations[index].ViewId == desired.ViewId)
+                {
+                    existingIndex = index;
+                    break;
+                }
+            }
+            if (existingIndex < 0)
+            {
+                PinnedConversations.Insert(targetIndex, desired);
+                continue;
+            }
+            if (existingIndex != targetIndex)
+                PinnedConversations.Move(existingIndex, targetIndex);
+            if (!Equals(PinnedConversations[targetIndex], desired))
+                PinnedConversations[targetIndex] = desired;
+        }
+        while (PinnedConversations.Count > items.Count)
+            PinnedConversations.RemoveAt(PinnedConversations.Count - 1);
     }
 
     private static bool IsSameHistoryRecord(ConversationLogRecord left, ConversationLogRecord right) =>

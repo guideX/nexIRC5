@@ -82,6 +82,24 @@ public sealed record ConversationNavigationItem(
     public string AccessibleText => $"{DisplayText}; {LifecycleText}; {ActivityText}";
 }
 
+public sealed record PinnedConversationNavigationItem(
+    NetworkWorkspace Network,
+    WorkspaceView View,
+    ConversationNavigationItem Navigation,
+    bool IsSynchronized,
+    bool CanMoveToTop)
+{
+    public Guid ViewId => View.Id;
+
+    public string DisplayText => Navigation.DisplayText;
+
+    public string StateMarker => Navigation.StateMarker;
+
+    public string ActivityText => Navigation.ActivityText;
+
+    public string AccessibleText => $"Pinned; {Navigation.AccessibleText}; {(IsSynchronized ? "account synchronized" : "local only")}";
+}
+
 /// <summary>
 /// A bounded back/forward history of logical conversations. It does not own
 /// views, so closed conversations and disconnected networks do not cause

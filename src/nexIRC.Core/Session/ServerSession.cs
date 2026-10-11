@@ -90,10 +90,14 @@ public sealed class ServerSession : IAsyncDisposable
     private readonly Dictionary<string, NexIrcReadMarker> _pendingReadStateUpdates = new(StringComparer.Ordinal);
     private DraftStateSnapshotBuilder? _draftStateSnapshotBuilder;
     private readonly Dictionary<string, NexIrcDraft> _pendingDraftStateUpdates = new(StringComparer.Ordinal);
+    private PinStateSnapshotBuilder? _pinStateSnapshotBuilder;
+    private readonly Dictionary<string, (NexIrcConversationPin Pin, long Generation, long Revision, string? MutationId)> _pendingPinStateUpdates = new(StringComparer.Ordinal);
     private bool _readStateSnapshotSeen;
     private bool _readStateSnapshotRequested;
     private bool _draftStateSnapshotSeen;
     private bool _draftStateSnapshotRequested;
+    private bool _pinStateSnapshotSeen;
+    private bool _pinStateSnapshotRequested;
     private TaskCompletionSource<NexIrcPairingAuthorization>? _pairingAuthorizationAttempt;
     private TaskCompletionSource<bool>? _pairingRevocationAttempt;
     private string? _nativeLivePendingSequence;
@@ -282,6 +286,67 @@ public sealed class ServerSession : IAsyncDisposable
     public bool SynchronizedDraftStateAvailable
     {
         get { lock (_gate) return NexIrcDraftStateProtocol.IsSupported(_capabilities.Snapshot); }
+    }
+
+    public bool SynchronizedPinsAvailable
+    {
+        get { lock (_gate) return NexIrcPinStateProtocol.IsSupported(_capabilities.Snapshot)
+            && _options.Endpoint.UseTls && _authenticationState == SaslAuthenticationState.Succeeded
+            && _registration == RegistrationState.Registered; }
+    }
+
+    public async ValueTask<bool> TryRequestSynchronizedPinsAsync(CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+        {
+            if (!NexIrcPinStateProtocol.IsSupported(_capabilities.Snapshot)
+                || !_options.Endpoint.UseTls || _authenticationState != SaslAuthenticationState.Succeeded
+                || _registration != RegistrationState.Registered || _pinStateSnapshotRequested)
+                return false;
+            _pinStateSnapshotRequested = true;
+        }
+        try
+        {
+            await SendCommandAsync("NEXIRC", ["PINS", "GET"], cancellationToken: cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or OperationCanceledException or IOException)
+        {
+            lock (_gate) _pinStateSnapshotRequested = false;
+            return false;
+        }
+    }
+
+    public async ValueTask<bool> TryMutateSynchronizedPinAsync(string operation, long generation,
+        string conversationKey, long expectedItemRevision, string mutationId, string displayName,
+        CancellationToken cancellationToken = default)
+    {
+        operation = operation?.ToUpperInvariant() ?? string.Empty;
+        if (operation is not ("PIN" or "UNPIN" or "MOVE_TOP")
+            || !NexIrcPinStateProtocol.IsValidConversationKey(conversationKey)
+            || generation < 1 || expectedItemRevision < 0
+            || !NexIrcPinStateProtocol.IsValidMutationId(mutationId)
+            || !NexIrcPinStateProtocol.IsValidDisplayName(displayName))
+            return false;
+        lock (_gate)
+        {
+            if (!NexIrcPinStateProtocol.IsSupported(_capabilities.Snapshot)
+                || !_options.Endpoint.UseTls || _authenticationState != SaslAuthenticationState.Succeeded
+                || _registration != RegistrationState.Registered)
+                return false;
+        }
+        try
+        {
+            await SendCommandAsync("NEXIRC", ["PINS", "SET", operation,
+                generation.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                NexIrcPinStateProtocol.EncodeField(conversationKey),
+                expectedItemRevision.ToString(System.Globalization.CultureInfo.InvariantCulture), mutationId,
+                NexIrcPinStateProtocol.EncodeField(displayName)], cancellationToken: cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (InvalidOperationException) { return false; }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return false; }
+        catch (IOException) { return false; }
     }
 
     public async ValueTask<bool> TryRequestSynchronizedReadStateAsync(CancellationToken cancellationToken = default)
@@ -2350,6 +2415,8 @@ public sealed class ServerSession : IAsyncDisposable
         {
             if (message.Parameters.Count > 0 && string.Equals(message.Parameters[0], "STATE", StringComparison.OrdinalIgnoreCase))
                 await HandleNexIrcReadStateMessageAsync(message, epoch).ConfigureAwait(false);
+            else if (message.Parameters.Count > 0 && string.Equals(message.Parameters[0], "PINS", StringComparison.OrdinalIgnoreCase))
+                await HandleNexIrcPinStateMessageAsync(message, epoch).ConfigureAwait(false);
             else
                 await HandleNativeResumeMessageAsync(message, epoch, connectionCts).ConfigureAwait(false);
             return;
@@ -3025,6 +3092,10 @@ public sealed class ServerSession : IAsyncDisposable
             _pendingDraftStateUpdates.Clear();
             _draftStateSnapshotSeen = false;
             _draftStateSnapshotRequested = false;
+            _pinStateSnapshotBuilder = null;
+            _pendingPinStateUpdates.Clear();
+            _pinStateSnapshotSeen = false;
+            _pinStateSnapshotRequested = false;
             _capabilities.Reset();
             _isupport.Reset();
             _identityDetector.Reset();
@@ -3491,6 +3562,161 @@ public sealed class ServerSession : IAsyncDisposable
         }
 
         return false;
+    }
+
+    private async Task HandleNexIrcPinStateMessageAsync(IrcMessage message, ConnectionEpoch epoch)
+    {
+        CapabilitySnapshot capabilities;
+        lock (_gate) capabilities = _capabilities.Snapshot;
+        if (!NexIrcPinStateProtocol.IsSupported(capabilities)
+            || !_options.Endpoint.UseTls || _authenticationState != SaslAuthenticationState.Succeeded)
+            return;
+
+        var parameters = message.Parameters;
+        if (parameters.Count < 2 || !string.Equals(parameters[0], "PINS", StringComparison.OrdinalIgnoreCase)) return;
+        var subcommand = parameters[1].ToUpperInvariant();
+        var lineBytes = Encoding.UTF8.GetByteCount(message.RawLine) + 2;
+
+        if (subcommand == "BEGIN")
+        {
+            if (parameters.Count == 5
+                && NexIrcPinStateProtocol.TryParseRevision(parameters[2], allowZero: false, out var generation)
+                && NexIrcPinStateProtocol.TryParseRevision(parameters[3], allowZero: true, out var revision)
+                && int.TryParse(parameters[4], System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out var count)
+                && count is >= 0 and <= NexIrcPinStateProtocol.MaximumTrackedEntries
+                && lineBytes <= NexIrcPinStateProtocol.MaximumSnapshotBytes)
+            {
+                _pinStateSnapshotBuilder = new PinStateSnapshotBuilder(generation, revision, count, lineBytes);
+            }
+            else
+            {
+                _pinStateSnapshotBuilder = null;
+                _pinStateSnapshotRequested = false;
+                _pinStateSnapshotSeen = true;
+                await FlushPendingPinStateUpdatesAsync(message, epoch).ConfigureAwait(false);
+                await PublishSemanticAsync(new IrcNexIrcPinStateEvent(message, Status: "INVALID"), epoch).ConfigureAwait(false);
+            }
+            return;
+        }
+
+        if (subcommand == "ENTRY")
+        {
+            var builder = _pinStateSnapshotBuilder;
+            if (parameters.Count == 7 && lineBytes <= NexIrcPinStateProtocol.MaximumWireLineBytes
+                && NexIrcPinStateProtocol.TryCreatePin(parameters, 2, out var pin) && pin is not null
+                && pin.OrderSequence <= (builder?.CatalogRevision ?? -1)
+                && builder is not null && builder.EncodedBytes + lineBytes <= NexIrcPinStateProtocol.MaximumSnapshotBytes
+                && builder.Entries.Count < builder.ExpectedCount && builder.Entries.TryAdd(pin.ConversationKey, pin))
+            {
+                builder.EncodedBytes += lineBytes;
+                return;
+            }
+
+            _pinStateSnapshotBuilder = null;
+            _pinStateSnapshotRequested = false;
+            _pinStateSnapshotSeen = true;
+            await FlushPendingPinStateUpdatesAsync(message, epoch).ConfigureAwait(false);
+            await PublishSemanticAsync(new IrcNexIrcPinStateEvent(message, Status: "INVALID"), epoch).ConfigureAwait(false);
+            return;
+        }
+
+        if (subcommand == "END")
+        {
+            var builder = _pinStateSnapshotBuilder;
+            _pinStateSnapshotBuilder = null;
+            _pinStateSnapshotRequested = false;
+            var valid = parameters.Count == 4 && builder is not null
+                && NexIrcPinStateProtocol.TryParseRevision(parameters[2], allowZero: false, out var endGeneration)
+                && endGeneration == builder.Generation
+                && NexIrcPinStateProtocol.TryParseRevision(parameters[3], allowZero: true, out var endRevision)
+                && endRevision == builder.CatalogRevision
+                && builder.Entries.Count == builder.ExpectedCount
+                && builder.Entries.Values.Count(static item => item.IsPinned) <= NexIrcPinStateProtocol.MaximumPinnedConversations
+                && lineBytes <= NexIrcPinStateProtocol.MaximumSnapshotBytes
+                && builder.EncodedBytes + lineBytes <= NexIrcPinStateProtocol.MaximumSnapshotBytes;
+            if (valid && builder is not null)
+            {
+                var snapshot = new NexIrcPinStateSnapshot(builder.Generation, builder.CatalogRevision,
+                    builder.Entries.Values.OrderBy(static item => item.ConversationKey, StringComparer.Ordinal).ToArray());
+                await PublishSemanticAsync(new IrcNexIrcPinStateEvent(message, Snapshot: snapshot), epoch).ConfigureAwait(false);
+            }
+            else
+            {
+                await PublishSemanticAsync(new IrcNexIrcPinStateEvent(message, Status: "INVALID"), epoch).ConfigureAwait(false);
+            }
+            _pinStateSnapshotSeen = true;
+            await FlushPendingPinStateUpdatesAsync(message, epoch).ConfigureAwait(false);
+            return;
+        }
+
+        if (subcommand == "UPDATE")
+        {
+            if (parameters.Count == 10 && lineBytes <= NexIrcPinStateProtocol.MaximumWireLineBytes
+                && NexIrcPinStateProtocol.TryParseRevision(parameters[2], allowZero: false, out var generation)
+                && NexIrcPinStateProtocol.TryParseRevision(parameters[3], allowZero: false, out var revision)
+                && NexIrcPinStateProtocol.TryCreatePin(parameters, 4, out var pin) && pin is not null
+                && pin.OrderSequence <= revision && NexIrcPinStateProtocol.IsValidMutationId(parameters[9]))
+            {
+                var update = (pin, generation, revision, (string?)parameters[9]);
+                if (_pinStateSnapshotBuilder is not null || !_pinStateSnapshotSeen || _pinStateSnapshotRequested)
+                    BufferPinStateUpdate(update);
+                else
+                    await PublishSemanticAsync(new IrcNexIrcPinStateEvent(message, Pin: pin, Generation: generation,
+                        CatalogRevision: revision, MutationId: parameters[9]), epoch).ConfigureAwait(false);
+            }
+            return;
+        }
+
+        if (subcommand == "ACK" && parameters.Count >= 3)
+        {
+            var status = parameters[2].ToUpperInvariant();
+            if (_pinStateSnapshotRequested && parameters.Count == 3)
+            {
+                _pinStateSnapshotRequested = false;
+                _pinStateSnapshotSeen = true;
+            }
+            NexIrcConversationPin? authoritative = null;
+            long? generation = null;
+            long? revision = null;
+            var mutationId = parameters.Count >= 4 && NexIrcPinStateProtocol.IsValidMutationId(parameters[3])
+                ? parameters[3]
+                : null;
+            if (parameters.Count == 11 && mutationId is not null
+                && NexIrcPinStateProtocol.TryParseRevision(parameters[4], allowZero: false, out var parsedGeneration)
+                && NexIrcPinStateProtocol.TryParseRevision(parameters[5], allowZero: true, out var parsedRevision)
+                && NexIrcPinStateProtocol.TryCreatePin(parameters, 6, out var parsedPin)
+                && parsedPin is not null && parsedPin.OrderSequence <= parsedRevision)
+            {
+                generation = parsedGeneration;
+                revision = parsedRevision;
+                authoritative = parsedPin;
+            }
+            await PublishSemanticAsync(new IrcNexIrcPinStateEvent(message, Pin: authoritative, Generation: generation,
+                CatalogRevision: revision, Status: status, MutationId: mutationId), epoch).ConfigureAwait(false);
+        }
+    }
+
+    private void BufferPinStateUpdate((NexIrcConversationPin Pin, long Generation, long Revision, string? MutationId) update)
+    {
+        if (_pendingPinStateUpdates.TryGetValue(update.Pin.ConversationKey, out var current))
+        {
+            if (update.Generation > current.Generation || update.Generation == current.Generation && update.Revision > current.Revision)
+                _pendingPinStateUpdates[update.Pin.ConversationKey] = update;
+            return;
+        }
+        if (_pendingPinStateUpdates.Count < NexIrcPinStateProtocol.MaximumTrackedEntries)
+            _pendingPinStateUpdates.Add(update.Pin.ConversationKey, update);
+    }
+
+    private async Task FlushPendingPinStateUpdatesAsync(IrcMessage source, ConnectionEpoch epoch)
+    {
+        var updates = _pendingPinStateUpdates.Values.OrderBy(static item => item.Revision)
+            .ThenBy(static item => item.Pin.ConversationKey, StringComparer.Ordinal).ToArray();
+        _pendingPinStateUpdates.Clear();
+        foreach (var update in updates)
+            await PublishSemanticAsync(new IrcNexIrcPinStateEvent(source, Pin: update.Pin,
+                Generation: update.Generation, CatalogRevision: update.Revision, MutationId: update.MutationId), epoch).ConfigureAwait(false);
     }
 
     private void BufferDraftStateUpdate(NexIrcDraft draft)
@@ -5260,6 +5486,19 @@ public sealed class ServerSession : IAsyncDisposable
         public long EncodedBytes { get; set; } = encodedBytes;
 
         public Dictionary<string, NexIrcDraft> Drafts { get; } = new(StringComparer.Ordinal);
+    }
+
+    private sealed class PinStateSnapshotBuilder(long generation, long catalogRevision, int expectedCount, int encodedBytes)
+    {
+        public long Generation { get; } = generation;
+
+        public long CatalogRevision { get; } = catalogRevision;
+
+        public int ExpectedCount { get; } = expectedCount;
+
+        public long EncodedBytes { get; set; } = encodedBytes;
+
+        public Dictionary<string, NexIrcConversationPin> Entries { get; } = new(StringComparer.Ordinal);
     }
 
     private sealed class PendingChathistoryRequest(long requestId, ChathistoryRequest request, int connectionGeneration)

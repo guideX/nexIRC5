@@ -254,6 +254,15 @@ public sealed record IrcNexIrcDraftStateEvent(
     long? AuthoritativeRevision = null,
     string? AuthoritativeText = null) : IrcSemanticEvent(Message);
 
+public sealed record IrcNexIrcPinStateEvent(
+    IrcMessage Message,
+    NexIrcPinStateSnapshot? Snapshot = null,
+    NexIrcConversationPin? Pin = null,
+    long? Generation = null,
+    long? CatalogRevision = null,
+    string? Status = null,
+    string? MutationId = null) : IrcSemanticEvent(Message);
+
 public sealed record IrcChannelSynchronizationEvent(
     IrcMessage Message,
     string Channel,

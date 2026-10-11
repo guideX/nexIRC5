@@ -136,6 +136,9 @@ public static class IrcCapabilityCatalog
     /// <summary>Optional account-owned synchronized client read state v1.</summary>
     public const string NexIrcState = "nexirc/state";
 
+    /// <summary>Optional ordered account-owned conversation pins v1.</summary>
+    public const string NexIrcPins = "nexirc/pins";
+
     public static IReadOnlyList<string> PreferredPhase1V { get; } =
     [MessageTags, EchoMessage, ServerTime, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
 
@@ -148,10 +151,10 @@ public static class IrcCapabilityCatalog
     [MessageTags, EchoMessage, ServerTime, Batch, Chathistory, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
 
     public static IReadOnlyList<string> PreferredPhase1Y { get; } =
-    [MessageTags, EchoMessage, ServerTime, Batch, Chathistory, EventPlayback, NexIrcResume, NexIrcAttachments, NexIrcState, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
+        [MessageTags, EchoMessage, ServerTime, Batch, Chathistory, EventPlayback, NexIrcResume, NexIrcAttachments, NexIrcState, NexIrcPins, AwayNotify, ExtendedJoin, MultiPrefix, AccountNotify, LabeledResponse];
 
     public static IReadOnlySet<string> Known { get; } =
-        new HashSet<string>(PreferredPhase1Y.Concat([AccountTag, Sasl, NexIrcResume, NexIrcAttachments, NexIrcState]), StringComparer.Ordinal);
+        new HashSet<string>(PreferredPhase1Y.Concat([AccountTag, Sasl, NexIrcResume, NexIrcAttachments, NexIrcState, NexIrcPins]), StringComparer.Ordinal);
 }
 
 public enum CapNegotiationState
@@ -400,7 +403,14 @@ public sealed class IrcCapabilityNegotiator
             {
                 _enabled.Add(name);
                 _rejected.Remove(name);
-                AddAdvertised(token);
+                // An ACK normally names the capability without repeating its
+                // advertised value (for example, pins=1 in LS and pins in
+                // ACK). Preserve the server's advertised version in that
+                // case so version-gated extensions cannot be mistaken for v1.
+                if (token.Contains('=') || !_available.ContainsKey(name))
+                {
+                    AddAdvertised(token);
+                }
             }
         }
     }

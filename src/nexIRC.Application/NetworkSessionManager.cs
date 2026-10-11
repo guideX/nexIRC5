@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
+using System.Text;
 using nexIRC.Core.Session;
 using nexIRC.Core.Protocol;
 using nexIRC.Core.State;
@@ -29,8 +31,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
     private readonly object _disposeGate = new();
     private readonly object _replyNavigationGate = new();
     private readonly Dictionary<string, Task<HistoryNavigationResult>> _replyNavigationTasks = new(StringComparer.Ordinal);
+    private readonly Dictionary<(Guid NetworkId, Guid ViewId), long> _localConversationPins = [];
     private long _operationSequence;
     private long _activitySequence;
+    private long _localPinSequence;
     private long _staleGenerationEventsDiscarded;
     private long _duplicateSemanticEventsDiscarded;
     private long _resynchronizationEventsSuppressed;
@@ -185,6 +189,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     public event Action<NetworkWorkspace, IrcNexIrcDraftStateEvent>? SynchronizedDraftStateReceived;
 
+    public event Action<NetworkWorkspace, IrcNexIrcPinStateEvent>? SynchronizedPinStateReceived;
+
+    public event EventHandler? PinnedConversationsChanged;
+
     public IReadOnlyList<ConversationIdentity> NavigationHistory => _navigationHistory.Entries;
 
     public IReadOnlyList<ConversationNavigationItem> GetConversationNavigator(ConversationOrderingMode ordering = ConversationOrderingMode.Workspace)
@@ -293,6 +301,253 @@ public sealed class NetworkSessionManager : IAsyncDisposable
             _ => null
         };
         return NexIrcDraftStateProtocol.IsValidConversationKey(key) ? key : null;
+    }
+
+    public static string? SynchronizedPinConversationKey(WorkspaceView view, ServerSessionSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(view);
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var networkIdentity = BuildPinNetworkIdentity(snapshot);
+        var key = view switch
+        {
+            ChannelView channel => NexIrcPinStateProtocol.BuildChannelKey(networkIdentity, channel.Channel, snapshot.Features.CaseMapping),
+            QueryView query when !query.IdentityEvidence.HasConflictingAccounts && query.IdentityEvidence.Accounts.Count == 1
+                => NexIrcPinStateProtocol.BuildAccountQueryKey(networkIdentity, query.IdentityEvidence.Accounts.Single()),
+            _ => null
+        };
+        return NexIrcPinStateProtocol.IsValidConversationKey(key) ? key : null;
+    }
+
+    private static string BuildPinNetworkIdentity(ServerSessionSnapshot snapshot)
+    {
+        var host = snapshot.Endpoint.Host.Trim().TrimEnd('.').ToLowerInvariant();
+        var network = (snapshot.Features.NetworkName ?? snapshot.Identity.NetworkName ?? string.Empty).Trim().ToLowerInvariant();
+        var canonical = $"{host}:{snapshot.Endpoint.Port}|{network}";
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
+    }
+
+    public bool TryGetSynchronizedPinCatalog(NetworkWorkspace workspace, out NexIrcPinStateSnapshot? catalog)
+    {
+        ArgumentNullException.ThrowIfNull(workspace);
+        catalog = null;
+        if (!TryGetEntry(workspace.Id, out var entry) || entry is null || !entry.SynchronizedPinSnapshotReceived)
+            return false;
+        catalog = new NexIrcPinStateSnapshot(entry.SynchronizedPinGeneration, entry.SynchronizedPinCatalogRevision,
+            entry.SynchronizedPins.Values.OrderByDescending(static item => item.IsPinned)
+                .ThenByDescending(static item => item.OrderSequence)
+                .ThenBy(static item => item.ConversationKey, StringComparer.Ordinal).ToArray());
+        return true;
+    }
+
+    public bool TryGetSynchronizedPin(NetworkWorkspace workspace, WorkspaceView view, out NexIrcConversationPin? pin)
+    {
+        pin = null;
+        if (workspace.Id != view.NetworkId || !TryGetSynchronizedPinCatalog(workspace, out _)
+            || !TryGetEntry(workspace.Id, out var entry) || entry is null
+            || SynchronizedPinConversationKey(view, workspace.Snapshot) is not { } key)
+            return false;
+        return entry.SynchronizedPins.TryGetValue(key, out pin);
+    }
+
+    public ValueTask<bool> TryMutateSynchronizedPinAsync(NetworkWorkspace workspace, WorkspaceView view, string operation,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(workspace);
+        ArgumentNullException.ThrowIfNull(view);
+        if (workspace.Id != view.NetworkId || !workspace.Session.SynchronizedPinsAvailable
+            || !TryGetEntry(workspace.Id, out var entry) || entry is null || !entry.SynchronizedPinSnapshotReceived
+            || SynchronizedPinConversationKey(view, workspace.Snapshot) is not { } key)
+            return ValueTask.FromResult(false);
+        entry.SynchronizedPins.TryGetValue(key, out var current);
+        var expectedRevision = current?.Revision ?? 0;
+        var displayName = view switch
+        {
+            QueryView query => query.Nickname,
+            ChannelView channel => channel.Channel,
+            _ => string.Empty
+        };
+        if (operation.Equals("MOVE_TOP", StringComparison.OrdinalIgnoreCase) && current?.IsPinned != true)
+            return ValueTask.FromResult(false);
+        return workspace.Session.TryMutateSynchronizedPinAsync(operation, entry.SynchronizedPinGeneration, key,
+            expectedRevision, Guid.NewGuid().ToString("N"), displayName, cancellationToken);
+    }
+
+    public bool IsConversationPinned(NetworkWorkspace network, WorkspaceView view)
+    {
+        if (network.Id != view.NetworkId) return false;
+        if (network.Session.SynchronizedPinsAvailable
+            && SynchronizedPinConversationKey(view, network.Snapshot) is { } key
+            && TryGetSynchronizedPinCatalog(network, out _)
+            && TryGetEntry(network.Id, out var entry) && entry is not null)
+            return entry.SynchronizedPins.TryGetValue(key, out var synchronizedPin) && synchronizedPin.IsPinned;
+        if (view is ChannelView channel)
+            return Favorites(network.Id, DestinationKind.Channel).Any(item =>
+                IrcCaseMappingComparer.Equals(item.Name, channel.Channel, network.Snapshot.Features.CaseMapping));
+        return _localConversationPins.ContainsKey((network.Id, view.Id));
+    }
+
+    public bool IsSynchronizedConversationPin(NetworkWorkspace network, WorkspaceView view, out NexIrcConversationPin? pin)
+    {
+        pin = null;
+        return network.Id == view.NetworkId && network.Session.SynchronizedPinsAvailable
+            && TryGetSynchronizedPin(network, view, out pin) && pin?.IsPinned == true;
+    }
+
+    public async Task<bool> SetConversationPinnedAsync(NetworkWorkspace network, WorkspaceView view, bool isPinned,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        ArgumentNullException.ThrowIfNull(view);
+        if (network.Id != view.NetworkId) return false;
+        var pinKey = SynchronizedPinConversationKey(view, network.Snapshot);
+        if (pinKey is not null && network.Session.SynchronizedPinsAvailable)
+        {
+            if (!TryGetSynchronizedPinCatalog(network, out _))
+            {
+                _ = RequestPinSnapshotAsync(network.Session);
+                return false;
+            }
+            if (!TryGetEntry(network.Id, out var entry) || entry is null) return false;
+            entry.SynchronizedPins.TryGetValue(pinKey, out var current);
+            if (isPinned == (current?.IsPinned == true)) return true;
+            var displayName = view is ChannelView channel ? channel.Channel : ((QueryView)view).Nickname;
+            return await network.Session.TryMutateSynchronizedPinAsync(isPinned ? "PIN" : "UNPIN",
+                entry.SynchronizedPinGeneration, pinKey, current?.Revision ?? 0, Guid.NewGuid().ToString("N"),
+                displayName, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (view is ChannelView localChannel)
+        {
+            var favorite = Favorites(network.Id, DestinationKind.Channel).FirstOrDefault(item =>
+                IrcCaseMappingComparer.Equals(item.Name, localChannel.Channel, network.Snapshot.Features.CaseMapping));
+            if (isPinned && favorite is null)
+            {
+                if (!AddFavorite(network.Id, DestinationKind.Channel, localChannel.Channel, localChannel.Channel))
+                    return false;
+            }
+            else if (!isPinned && favorite is not null)
+            {
+                if (!RemoveFavorite(favorite.Id)) return false;
+            }
+            if (Configuration is null)
+            {
+                if (isPinned) _localConversationPins[(network.Id, view.Id)] = ++_localPinSequence;
+                else _localConversationPins.Remove((network.Id, view.Id));
+            }
+        }
+        else
+        {
+            if (isPinned) _localConversationPins[(network.Id, view.Id)] = ++_localPinSequence;
+            else _localConversationPins.Remove((network.Id, view.Id));
+        }
+        network.SetPinned(view, isPinned);
+        PinnedConversationsChanged?.Invoke(this, EventArgs.Empty);
+        return true;
+    }
+
+    public async Task<bool> MoveConversationPinToTopAsync(PinnedConversationNavigationItem item,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(item);
+        if (item.IsSynchronized)
+            return await TryMutateSynchronizedPinAsync(item.Network, item.View, "MOVE_TOP", cancellationToken).ConfigureAwait(false);
+        if (item.View is ChannelView channel && Configuration is not null)
+        {
+            var favorite = Favorites(item.Network.Id, DestinationKind.Channel).FirstOrDefault(candidate =>
+                IrcCaseMappingComparer.Equals(candidate.Name, channel.Channel, item.Network.Snapshot.Features.CaseMapping));
+            if (favorite is null) return false;
+            var sameGroup = Favorites(item.Network.Id, DestinationKind.Channel)
+                .Where(candidate => candidate.GroupId == favorite.GroupId).OrderBy(static candidate => candidate.SortOrder).ToArray();
+            var currentIndex = Array.FindIndex(sameGroup, candidate => candidate.Id == favorite.Id);
+            var moved = false;
+            while (currentIndex > 0)
+            {
+                if (!Configuration.ReorderFavorite(favorite.Id, -1)) break;
+                currentIndex--;
+                moved = true;
+            }
+            if (moved) SaveConfigurationInBackground();
+            if (moved) PinnedConversationsChanged?.Invoke(this, EventArgs.Empty);
+            return moved;
+        }
+        if (!_localConversationPins.ContainsKey((item.Network.Id, item.View.Id))) return false;
+        _localConversationPins[(item.Network.Id, item.View.Id)] = ++_localPinSequence;
+        PinnedConversationsChanged?.Invoke(this, EventArgs.Empty);
+        return true;
+    }
+
+    public IReadOnlyList<PinnedConversationNavigationItem> GetPinnedConversationItems()
+    {
+        var result = new List<PinnedConversationNavigationItem>();
+        var included = new HashSet<(Guid NetworkId, Guid ViewId)>();
+        foreach (var network in Networks)
+        {
+            NexIrcPinStateSnapshot? pinCatalog = null;
+            var synchronizedMode = network.Session.SynchronizedPinsAvailable
+                && TryGetSynchronizedPinCatalog(network, out pinCatalog);
+            if (synchronizedMode && pinCatalog is not null)
+            {
+                foreach (var pin in pinCatalog.Entries.Where(static item => item.IsPinned)
+                    .OrderByDescending(static item => item.OrderSequence))
+                {
+                    if (ResolveSynchronizedPinView(network, pin) is not { } view) continue;
+                    network.SetPinned(view, true);
+                    if (!included.Add((network.Id, view.Id))) continue;
+                    result.Add(new PinnedConversationNavigationItem(network, view,
+                        CreateNavigationItem(network, view), IsSynchronized: true,
+                        CanMoveToTop: pin.OrderSequence != pinCatalog.Entries.Where(static item => item.IsPinned)
+                            .Max(static item => item.OrderSequence)));
+                }
+            }
+            else
+            {
+                foreach (var favorite in Favorites(network.Id, DestinationKind.Channel)
+                    .OrderBy(static item => item.SortOrder))
+                {
+                    var view = network.Channels.FirstOrDefault(channel =>
+                        IrcCaseMappingComparer.Equals(channel.Channel, favorite.Name, network.Snapshot.Features.CaseMapping))
+                        ?? network.EnsureChannel(favorite.Name);
+                    network.SetPinned(view, true);
+                    if (!included.Add((network.Id, view.Id))) continue;
+                    var count = Favorites(network.Id, DestinationKind.Channel).Count(candidate => candidate.GroupId == favorite.GroupId);
+                    result.Add(new PinnedConversationNavigationItem(network, view, CreateNavigationItem(network, view),
+                        IsSynchronized: false, CanMoveToTop: favorite.SortOrder > 0 || count > 1));
+                }
+            }
+
+        foreach (var localPin in _localConversationPins.Where(item => item.Key.NetworkId == network.Id)
+            .OrderByDescending(static item => item.Value))
+        {
+                var view = network.Channels.Cast<WorkspaceView>().Concat(network.Queries)
+                    .FirstOrDefault(candidate => candidate.Id == localPin.Key.ViewId);
+                if (view is null) continue;
+                network.SetPinned(view, true);
+            if (!included.Add((network.Id, view.Id))) continue;
+            result.Add(new PinnedConversationNavigationItem(network, view, CreateNavigationItem(network, view),
+                IsSynchronized: false, CanMoveToTop: localPin.Value != _localConversationPins
+                    .Where(item => item.Key.NetworkId == network.Id).Select(static item => item.Value)
+                    .DefaultIfEmpty().Max()));
+            }
+
+            var pinnedViewIds = result.Where(item => item.Network.Id == network.Id).Select(static item => item.View.Id).ToHashSet();
+            foreach (var view in network.Channels.Cast<WorkspaceView>().Concat(network.Queries))
+                network.SetPinned(view, pinnedViewIds.Contains(view.Id));
+        }
+        return result;
+    }
+
+    private WorkspaceView? ResolveSynchronizedPinView(NetworkWorkspace network, NexIrcConversationPin pin)
+    {
+        var parts = pin.ConversationKey.Split(':');
+        if (parts.Length != 4 || parts[2] != NexIrcPinStateProtocol.EncodeField(BuildPinNetworkIdentity(network.Snapshot)))
+            return null;
+        if (parts[0] == "channel" && NexIrcPinStateProtocol.TryDecodeField(parts[3], 128, out _))
+            return network.Channels.FirstOrDefault(item => IrcCaseMappingComparer.Equals(item.Channel, pin.DisplayName,
+                network.Snapshot.Features.CaseMapping)) ?? network.EnsureChannel(pin.DisplayName);
+        if (parts[0] == "query-account" && NexIrcPinStateProtocol.TryDecodeField(parts[3], 128, out var account))
+            return network.Queries.FirstOrDefault(item => item.HasAccountEvidence(account))
+                ?? network.EnsureIncomingQuery(pin.DisplayName, account);
+        return null;
     }
 
     public ChannelView EnsureChannel(Guid networkId, string channel)
@@ -2311,6 +2566,8 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
         var wasActive = ReferenceEquals(ActiveView, view);
         workspace.RemoveConversation(view);
+        _localConversationPins.Remove((workspace.Id, view.Id));
+        PinnedConversationsChanged?.Invoke(this, EventArgs.Empty);
         if (wasActive)
         {
             ActiveView = null;
@@ -3594,6 +3851,10 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         var previousGeneration = entry.Workspace.Snapshot.ConnectionGeneration;
         entry.SynchronizedReadMarkers.Clear();
         entry.SynchronizedReadSessionEpoch = 0;
+        entry.SynchronizedPins.Clear();
+        entry.SynchronizedPinSnapshotReceived = false;
+        entry.SynchronizedPinGeneration = 0;
+        entry.SynchronizedPinCatalogRevision = 0;
         lock (_pendingGate)
         {
             entry.PendingSynchronizedReadAdvances.Clear();
@@ -3616,6 +3877,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         entry.ContinuityRecoveryRequired = false;
         entry.ContinuityPreviousGeneration = null;
         Attach(entry);
+        PinnedConversationsChanged?.Invoke(this, EventArgs.Empty);
     }
 
     private async Task StopEntryAsync(SessionEntry entry, string reason)
@@ -4978,6 +5240,80 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         SynchronizedDraftStateReceived?.Invoke(entry.Workspace, stateEvent);
     }
 
+    private void ApplySynchronizedPinState(SessionEntry entry, IrcNexIrcPinStateEvent stateEvent)
+    {
+        if (stateEvent.Snapshot is { } snapshot)
+        {
+            if (snapshot.Generation < entry.SynchronizedPinGeneration
+                || snapshot.Generation == entry.SynchronizedPinGeneration
+                    && snapshot.CatalogRevision < entry.SynchronizedPinCatalogRevision
+                || snapshot.Entries.Count > NexIrcPinStateProtocol.MaximumTrackedEntries
+                || snapshot.Entries.Count(static item => item.IsPinned) > NexIrcPinStateProtocol.MaximumPinnedConversations
+                || snapshot.Entries.Any(item => !NexIrcPinStateProtocol.IsValidConversationKey(item.ConversationKey)
+                    || !NexIrcPinStateProtocol.IsValidDisplayName(item.DisplayName) || item.Revision < 1
+                    || item.OrderSequence < 0 || item.IsPinned && (item.OrderSequence < 1 || item.OrderSequence > snapshot.CatalogRevision)
+                    || !item.IsPinned && item.OrderSequence != 0))
+                return;
+            entry.SynchronizedPins.Clear();
+            foreach (var pin in snapshot.Entries)
+                entry.SynchronizedPins[pin.ConversationKey] = pin;
+            entry.SynchronizedPinGeneration = snapshot.Generation;
+            entry.SynchronizedPinCatalogRevision = snapshot.CatalogRevision;
+            entry.SynchronizedPinSnapshotReceived = true;
+            SynchronizedPinStateReceived?.Invoke(entry.Workspace, stateEvent);
+            PinnedConversationsChanged?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        if (stateEvent.Status is { } status)
+        {
+            SynchronizedPinStateReceived?.Invoke(entry.Workspace, stateEvent);
+            if (string.Equals(status, "CONFLICT", StringComparison.OrdinalIgnoreCase))
+                _ = RequestPinSnapshotAsync(entry.Session);
+            return;
+        }
+
+        if (stateEvent.Pin is not { } update || stateEvent.Generation is not { } generation
+            || stateEvent.CatalogRevision is not { } catalogRevision
+            || !NexIrcPinStateProtocol.IsValidConversationKey(update.ConversationKey)
+            || !NexIrcPinStateProtocol.IsValidDisplayName(update.DisplayName))
+            return;
+        if (!entry.SynchronizedPinSnapshotReceived)
+        {
+            _ = RequestPinSnapshotAsync(entry.Session);
+            return;
+        }
+        if (generation != entry.SynchronizedPinGeneration)
+        {
+            _ = RequestPinSnapshotAsync(entry.Session);
+            return;
+        }
+        if (catalogRevision <= entry.SynchronizedPinCatalogRevision) return;
+        if (catalogRevision != entry.SynchronizedPinCatalogRevision + 1)
+        {
+            _ = RequestPinSnapshotAsync(entry.Session);
+            return;
+        }
+        if (entry.SynchronizedPins.TryGetValue(update.ConversationKey, out var current)
+            && update.Revision <= current.Revision)
+        {
+            _ = RequestPinSnapshotAsync(entry.Session);
+            return;
+        }
+        entry.SynchronizedPins[update.ConversationKey] = update;
+        entry.SynchronizedPinCatalogRevision = catalogRevision;
+        SynchronizedPinStateReceived?.Invoke(entry.Workspace, stateEvent);
+        PinnedConversationsChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private static async Task RequestPinSnapshotAsync(ServerSession session)
+    {
+        try { _ = await session.TryRequestSynchronizedPinsAsync().ConfigureAwait(false); }
+        catch (Exception exception) when (exception is InvalidOperationException or OperationCanceledException or IOException or ObjectDisposedException)
+        {
+        }
+    }
+
     private static bool IsNewerSynchronizedReadMarker(NexIrcReadMarker candidate, NexIrcReadMarker current)
     {
         if (candidate.Revision <= current.Revision || candidate.SessionEpoch < current.SessionEpoch
@@ -5114,6 +5450,11 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         if (item.Event is IrcNexIrcDraftStateEvent draftState)
         {
             ApplySynchronizedDraftState(entry, draftState);
+            return true;
+        }
+        if (item.Event is IrcNexIrcPinStateEvent pinState)
+        {
+            ApplySynchronizedPinState(entry, pinState);
             return true;
         }
         RouteSemanticEvent(entry.Workspace, item.Event, snapshot, item.ReceivedAt);
@@ -5992,7 +6333,7 @@ public sealed class NetworkSessionManager : IAsyncDisposable
 
     private static WorkspaceDispatchActionCategory DispatchCategory(IrcSemanticEvent semanticEvent) => semanticEvent switch
     {
-        IrcPrivmsgEvent or IrcQueryMessageEvent or IrcCtcpEvent or IrcReactionEvent or IrcNexIrcReadStateEvent or IrcNexIrcDraftStateEvent => WorkspaceDispatchActionCategory.IncomingMessage,
+        IrcPrivmsgEvent or IrcQueryMessageEvent or IrcCtcpEvent or IrcReactionEvent or IrcNexIrcReadStateEvent or IrcNexIrcDraftStateEvent or IrcNexIrcPinStateEvent => WorkspaceDispatchActionCategory.IncomingMessage,
         IrcJoinEvent or IrcPartEvent or IrcQuitEvent or IrcKickEvent or IrcAwayEvent or IrcAccountEvent or IrcNamesEvent or IrcNamesCompleteEvent or IrcWhoEvent or IrcWhoEndEvent => WorkspaceDispatchActionCategory.Membership,
         IrcModeEvent or IrcTopicEvent or IrcTopicUnsetEvent or IrcTopicMetadataEvent => WorkspaceDispatchActionCategory.ModeOrTopic,
         IrcNicknameChangedEvent or IrcChannelSynchronizationEvent or IrcWelcomeEvent or IrcRegistrationStateEvent or IrcCapabilityChangedEvent or IrcSaslStateChangedEvent or IrcBatchEvent or IrcMotdEvent => WorkspaceDispatchActionCategory.Lifecycle,
@@ -6127,6 +6468,14 @@ public sealed class NetworkSessionManager : IAsyncDisposable
         public Dictionary<string, NexIrcReadMarker> SynchronizedReadMarkers { get; } = new(StringComparer.Ordinal);
 
         public Dictionary<string, NexIrcDraft> SynchronizedDrafts { get; } = new(StringComparer.Ordinal);
+
+        public Dictionary<string, NexIrcConversationPin> SynchronizedPins { get; } = new(StringComparer.Ordinal);
+
+        public bool SynchronizedPinSnapshotReceived { get; set; }
+
+        public long SynchronizedPinGeneration { get; set; }
+
+        public long SynchronizedPinCatalogRevision { get; set; }
 
         public bool SynchronizedDraftSnapshotReceived { get; set; }
 

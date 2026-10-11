@@ -160,6 +160,13 @@ public static class IrcSensitiveData
                 : prefix + "NEXIRC STATE <redacted>";
         }
 
+        if (tokens.Length >= 2 && tokens[1].Equals("PINS", StringComparison.OrdinalIgnoreCase))
+        {
+            return tokens.Length >= 4 && tokens[2].Equals("ACK", StringComparison.OrdinalIgnoreCase)
+                ? prefix + $"NEXIRC PINS ACK {tokens[3]}"
+                : prefix + "NEXIRC PINS <redacted>";
+        }
+
         if (tokens.Length >= 4 && tokens[1].Equals("PAIR", StringComparison.OrdinalIgnoreCase))
         {
             if (tokens[2].Equals("CREATED", StringComparison.OrdinalIgnoreCase) && tokens.Length >= 5)

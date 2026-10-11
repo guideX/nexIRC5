@@ -140,7 +140,7 @@
                 <Run Text="{Binding DisplayLabel, Mode=OneWay}" />
             </TextBlock>
         </DataTemplate>
-        <HierarchicalDataTemplate DataType="{x:Type app:NetworkWorkspace}" ItemsSource="{Binding Views}">
+        <HierarchicalDataTemplate DataType="{x:Type app:NetworkWorkspace}" ItemsSource="{Binding SidebarViews}">
             <TextBlock Text="{Binding DisplayLabel}" Margin="4,2" FontWeight="SemiBold" />
         </HierarchicalDataTemplate>
         <DataTemplate DataType="{x:Type app:ServerStatusView}" x:Key="StatusContentTemplate">
@@ -473,6 +473,26 @@
                         </ListBox>
                     </Expander>
                     <TextBlock DockPanel.Dock="Top" Text="NETWORKS &amp; WINDOWS" Style="{StaticResource PaneHeader}" />
+                    <TextBlock DockPanel.Dock="Top" Text="Pinned" Margin="10,2,6,2" FontWeight="SemiBold" Foreground="#475569" />
+                    <ListBox DockPanel.Dock="Top" ItemsSource="{Binding PinnedConversations}" MaxHeight="150"
+                             AutomationProperties.AutomationId="PinnedConversations" AutomationProperties.Name="Pinned conversations"
+                             BorderThickness="0" Background="Transparent"
+                             KeyboardNavigation.TabNavigation="Local">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Button Command="{Binding DataContext.ActivateConversationCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                        CommandParameter="{Binding}" HorizontalContentAlignment="Stretch" Padding="4,3" BorderThickness="0" Background="Transparent"
+                                        ToolTip="{Binding AccessibleText}" AutomationProperties.Name="{Binding AccessibleText}">
+                                    <DockPanel>
+                                        <TextBlock DockPanel.Dock="Left" Text="{Binding StateMarker}" Width="20" />
+                                        <TextBlock Text="{Binding DisplayText}" TextTrimming="CharacterEllipsis" />
+                                        <TextBlock DockPanel.Dock="Right" Text="{Binding ActivityText}" Foreground="#64748B" Margin="8,0,0,0" />
+                                    </DockPanel>
+                                </Button>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                    <TextBlock DockPanel.Dock="Top" Text="Other conversations" Margin="10,4,6,2" FontWeight="SemiBold" Foreground="#475569" />
                     <TreeView x:Name="WorkspaceTree" ItemsSource="{Binding Networks}" SelectedItemChanged="OnTreeSelectionChanged" Margin="5,0,5,8" />
                 </DockPanel>
             </Border>
