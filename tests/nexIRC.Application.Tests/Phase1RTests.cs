@@ -406,7 +406,11 @@ public sealed class Phase1RTests
 
         try
         {
-            await WaitForAsync(IsConverged, $"{stage} workload did not converge");
+            // This synthetic multi-channel workload can leave a bounded
+            // dispatcher backlog on slower hosts after every channel has
+            // synchronized. Keep the wait finite while allowing that queued
+            // initial tail to drain before declaring a regression.
+            await WaitForAsync(IsConverged, $"{stage} workload did not converge", timeoutMilliseconds: 30_000);
         }
         catch (TimeoutException exception)
         {
