@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Windows;
+using System.Windows.Input;
 using System.Globalization;
 using System.IO;
 using nexIRC.Application;
@@ -40,6 +41,7 @@ internal static class UiSmokeHarness
         "index-recovery",
         "index-fingerprint",
         "accessibility",
+        "keyboard-context",
         "history-gap-repair",
         "history-integrity",
         "history-discovery",
@@ -149,6 +151,9 @@ internal static class UiSmokeHarness
             case "accessibility":
                 await AccessibilityAsync(window, state.Alpha).ConfigureAwait(true);
                 break;
+            case "keyboard-context":
+                await KeyboardContextMenuAsync(window, state.Alpha).ConfigureAwait(true);
+                break;
             case "history-gap-repair":
                 await HistoryGapRepairAsync(window, demo, state.Alpha).ConfigureAwait(true);
                 break;
@@ -191,6 +196,41 @@ internal static class UiSmokeHarness
         }
 
         Console.WriteLine($"PASS_UI_SMOKE {scenario.ToLowerInvariant()}");
+    }
+
+    private static async Task KeyboardContextMenuAsync(MainWindow owner, NetworkWorkspace network)
+    {
+        Require(MainWindow.IsKeyboardContextMenuGesture(Key.Apps, ModifierKeys.None),
+            "the application-menu key was not recognized as a context-menu gesture");
+        Require(MainWindow.IsKeyboardContextMenuGesture(Key.F10, ModifierKeys.Shift),
+            "Shift+F10 was not recognized as a context-menu gesture");
+        Require(!MainWindow.IsKeyboardContextMenuGesture(Key.F10, ModifierKeys.None),
+            "unmodified F10 was incorrectly captured as a context-menu gesture");
+        Require(!MainWindow.IsKeyboardContextMenuGesture(Key.Enter, ModifierKeys.None),
+            "Enter was incorrectly captured as a context-menu gesture");
+
+        var tree = (System.Windows.Controls.TreeView)owner.FindName("WorkspaceTree")!;
+        tree.UpdateLayout();
+        var networkItem = tree.ItemContainerGenerator.ContainerFromItem(network) as System.Windows.Controls.TreeViewItem;
+        Require(networkItem is not null, "the AlphaNet workspace row was not realized for keyboard context testing");
+        networkItem!.IsExpanded = true;
+        tree.UpdateLayout();
+        var channel = RequiredChannel(network);
+        var channelItem = networkItem.ItemContainerGenerator.ContainerFromItem(channel) as System.Windows.Controls.TreeViewItem;
+        Require(channelItem is not null, "the #general channel row was not realized for keyboard context testing");
+        Require(Keyboard.Focus(channelItem) is not null, "keyboard focus could not reach the channel TreeViewItem");
+
+        var source = System.Windows.PresentationSource.FromVisual(owner);
+        Require(source is not null, "the WPF main window had no presentation source");
+        var keyEvent = new System.Windows.Input.KeyEventArgs(Keyboard.PrimaryDevice, source, Environment.TickCount, Key.Apps)
+        {
+            RoutedEvent = Keyboard.PreviewKeyDownEvent
+        };
+        owner.RaiseEvent(keyEvent);
+        Require(keyEvent.Handled, "the application-menu key did not open the focused channel's pin context menu");
+        await owner.Dispatcher.InvokeAsync(static () => { }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+        Require(Keyboard.FocusedElement is System.Windows.Controls.MenuItem { Header: "Pin conversation" },
+            "the keyboard-opened channel menu did not focus its Pin conversation action");
     }
 
     private static async Task ParticipantAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)

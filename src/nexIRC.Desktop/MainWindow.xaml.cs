@@ -60,6 +60,7 @@ public partial class MainWindow : Window
         };
         ViewModel.Sessions.NavigationChanged += OnConversationNavigationChanged;
         AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(OnPreviewRightClick), true);
+        AddHandler(Keyboard.PreviewKeyDownEvent, new System.Windows.Input.KeyEventHandler(OnPreviewKeyboardContextMenu), true);
         Closed += OnClosed;
     }
 
@@ -724,6 +725,77 @@ public partial class MainWindow : Window
         }
     }
 
+    private void OnPreviewKeyboardContextMenu(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (!IsKeyboardContextMenuGesture(e.Key, Keyboard.Modifiers)
+            || Keyboard.FocusedElement is not DependencyObject source)
+        {
+            return;
+        }
+
+        if (TryOpenKeyboardPinContextMenu(source))
+        {
+            e.Handled = true;
+        }
+    }
+
+    internal static bool IsKeyboardContextMenuGesture(Key key, ModifierKeys modifiers) =>
+        key == Key.Apps
+        || (key == Key.F10 && (modifiers & ModifierKeys.Shift) == ModifierKeys.Shift);
+
+    private bool TryOpenKeyboardPinContextMenu(DependencyObject source)
+    {
+        var pinnedItem = FindAncestor<ListBoxItem>(source);
+        if (pinnedItem?.DataContext is PinnedConversationNavigationItem pinnedConversation)
+        {
+            var actions = new List<(string, Func<Task>)>
+            {
+                ("Unpin conversation", () => ViewModel.SetConversationPinnedAsync(pinnedConversation.View, false))
+            };
+            if (pinnedConversation.CanMoveToTop)
+            {
+                actions.Insert(0, ("Move to top", () => ViewModel.MovePinnedConversationToTopAsync(pinnedConversation)));
+            }
+
+            OpenContextMenu(pinnedItem, actions, "PinnedConversationContextMenu", focusFirst: true);
+            return true;
+        }
+
+        var treeItem = FindAncestor<TreeViewItem>(source);
+        if (treeItem?.DataContext is not WorkspaceView view
+            || !ViewModel.Sessions.TryGet(view.NetworkId, out var network)
+            || network is null)
+        {
+            return false;
+        }
+
+        treeItem.IsSelected = true;
+        ViewModel.SelectView(view);
+        var isPinned = ViewModel.Sessions.IsConversationPinned(network, view);
+        var pinActions = new List<(string, Func<Task>)>
+        {
+            (isPinned ? "Unpin conversation" : "Pin conversation",
+                () => ViewModel.SetConversationPinnedAsync(view, !isPinned))
+        };
+        if (view is ChannelView channel)
+        {
+            pinActions.Add(channel.IsJoined
+                ? ("Close view without PART", () => { ViewModel.CloseActiveView(); return Task.CompletedTask; })
+                : ("Reopen view", () => { ViewModel.ReopenConversation(channel); return Task.CompletedTask; }));
+        }
+        else if (view is QueryView)
+        {
+            pinActions.Add(("Close query", () => { ViewModel.CloseActiveView(); return Task.CompletedTask; }));
+        }
+        if (isPinned && ViewModel.Sessions.IsSynchronizedConversationPin(network, view, out _))
+        {
+            pinActions.Insert(0, ("Move to top", () => ViewModel.MovePinnedConversationToTopAsync(view)));
+        }
+
+        OpenContextMenu(treeItem, pinActions, view is ChannelView ? "ChannelContextMenu" : "WorkspaceContextMenu", focusFirst: true);
+        return true;
+    }
+
     private void OnMemberListDoubleClick(object sender, MouseButtonEventArgs e)
     {
         if (sender is not ListBox list
@@ -936,16 +1008,21 @@ public partial class MainWindow : Window
         dialog.ShowDialog();
     }
 
-    private void OpenContextMenu(FrameworkElement target, IEnumerable<(string Header, Func<Task> Action)> actions, string automationId = "WorkspaceContextMenu")
+    private void OpenContextMenu(FrameworkElement target, IEnumerable<(string Header, Func<Task> Action)> actions, string automationId = "WorkspaceContextMenu", bool focusFirst = false)
     {
-        OpenContextMenu(target, actions.Select(action => new ContextMenuAction(action.Header, action.Action)), automationId);
+        OpenContextMenu(target, actions.Select(action => new ContextMenuAction(action.Header, action.Action)), automationId, focusFirst);
     }
 
-    private void OpenContextMenu(FrameworkElement target, IEnumerable<ContextMenuAction> actions, string automationId = "WorkspaceContextMenu")
+    private void OpenContextMenu(FrameworkElement target, IEnumerable<ContextMenuAction> actions, string automationId = "WorkspaceContextMenu", bool focusFirst = false)
     {
         var menu = new ContextMenu { PlacementTarget = target };
         AutomationProperties.SetAutomationId(menu, automationId);
         AutomationProperties.SetName(menu, automationId == "ChannelContextMenu" ? "Channel actions" : "Workspace actions");
+        if (focusFirst)
+        {
+            menu.Opened += (_, _) => menu.Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Input,
+                new Action(() => FocusFirstEnabledMenuItem(menu)));
+        }
         foreach (var action in actions)
         {
             var item = new MenuItem { Header = action.Header, Tag = action.Action, IsEnabled = action.IsEnabled, ToolTip = action.DisabledReason };
@@ -958,6 +1035,12 @@ public partial class MainWindow : Window
         }
 
         menu.IsOpen = true;
+    }
+
+    private static void FocusFirstEnabledMenuItem(ContextMenu menu)
+    {
+        var firstEnabled = menu.Items.OfType<MenuItem>().FirstOrDefault(static item => item.IsEnabled);
+        firstEnabled?.Focus();
     }
 
     private static async void OnGeneratedContextMenuClick(object sender, RoutedEventArgs e)

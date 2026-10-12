@@ -43,6 +43,45 @@ public sealed class Phase54PinnedConversationIdentityTests
         Assert.Null(NetworkSessionManager.SynchronizedPinConversationKey(recycledBob, alpha.Snapshot));
     }
 
+    [Fact]
+    public async Task OrdinaryServerPinFallbackKeepsChannelsNetworkScopedAndNickQueriesLocal()
+    {
+        var factory = new FakeIrcTransportFactory();
+        var alphaTransport = new FakeIrcTransport(new IrcEndpoint("alpha.example", 6697, true));
+        var betaTransport = new FakeIrcTransport(new IrcEndpoint("beta.example", 6697, true));
+        factory.Add(alphaTransport);
+        factory.Add(betaTransport);
+        var configuration = new ConfigurationService(new InMemoryConfigurationStore());
+        await configuration.LoadAsync();
+        await using var manager = new NetworkSessionManager(factory, configuration: configuration);
+        var alpha = manager.Add(Options("AlphaNet", alphaTransport.Endpoint));
+        var beta = manager.Add(Options("BetaNet", betaTransport.Endpoint));
+        var alphaChannel = manager.EnsureChannel(alpha.Id, "#shared");
+        var betaChannel = manager.EnsureChannel(beta.Id, "#shared");
+        var nickOnlyQuery = manager.EnsureQuery(alpha.Id, "SharedNick");
+
+        Assert.False(alpha.Session.SynchronizedPinsAvailable);
+        Assert.False(beta.Session.SynchronizedPinsAvailable);
+        Assert.Null(NetworkSessionManager.SynchronizedPinConversationKey(nickOnlyQuery, alpha.Snapshot));
+        Assert.True(await manager.SetConversationPinnedAsync(alpha, alphaChannel, true));
+        Assert.True(await manager.SetConversationPinnedAsync(beta, betaChannel, true));
+        Assert.True(await manager.SetConversationPinnedAsync(alpha, nickOnlyQuery, true));
+
+        var pins = manager.GetPinnedConversationItems();
+        Assert.Equal(3, pins.Count);
+        Assert.All(pins, static pin => Assert.False(pin.IsSynchronized));
+        Assert.Contains(pins, pin => pin.Network.Id == alpha.Id && ReferenceEquals(pin.View, alphaChannel));
+        Assert.Contains(pins, pin => pin.Network.Id == beta.Id && ReferenceEquals(pin.View, betaChannel));
+        Assert.Contains(pins, pin => pin.Network.Id == alpha.Id && ReferenceEquals(pin.View, nickOnlyQuery));
+
+        Assert.True(await manager.SetConversationPinnedAsync(alpha, alphaChannel, false));
+        pins = manager.GetPinnedConversationItems();
+        Assert.Equal(2, pins.Count);
+        Assert.DoesNotContain(pins, pin => ReferenceEquals(pin.View, alphaChannel));
+        Assert.Contains(pins, pin => pin.Network.Id == beta.Id && ReferenceEquals(pin.View, betaChannel));
+        Assert.Contains(pins, pin => pin.Network.Id == alpha.Id && ReferenceEquals(pin.View, nickOnlyQuery));
+    }
+
     private static NetworkConnectionOptions Options(string name, IrcEndpoint endpoint) => new()
     {
         DisplayName = name,
