@@ -474,7 +474,7 @@
                     </Expander>
                     <TextBlock DockPanel.Dock="Top" Text="NETWORKS &amp; WINDOWS" Style="{StaticResource PaneHeader}" />
                     <TextBlock DockPanel.Dock="Top" Text="Pinned" Margin="10,2,6,2" FontWeight="SemiBold" Foreground="#475569" />
-                    <ListBox DockPanel.Dock="Top" ItemsSource="{Binding PinnedConversations}" MaxHeight="150"
+                    <ListBox x:Name="PinnedConversationsList" DockPanel.Dock="Top" ItemsSource="{Binding PinnedConversations}" MaxHeight="150"
                              AutomationProperties.AutomationId="PinnedConversations" AutomationProperties.Name="Pinned conversations"
                              BorderThickness="0" Background="Transparent"
                              KeyboardNavigation.TabNavigation="Local">

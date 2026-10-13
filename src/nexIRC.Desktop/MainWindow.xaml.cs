@@ -61,6 +61,7 @@ public partial class MainWindow : Window
         ViewModel.Sessions.NavigationChanged += OnConversationNavigationChanged;
         AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(OnPreviewRightClick), true);
         AddHandler(Keyboard.PreviewKeyDownEvent, new System.Windows.Input.KeyEventHandler(OnPreviewKeyboardContextMenu), true);
+        Phase54R3InputProbe.Attach(this);
         Closed += OnClosed;
     }
 
@@ -558,6 +559,12 @@ public partial class MainWindow : Window
         }
 
         var source = e.OriginalSource as DependencyObject;
+        var routedTreeItem = FindAncestor<TreeViewItem>(source)
+            ?? WorkspaceTree.ContainerFromElement(source) as TreeViewItem
+            ?? FindLogicalAncestor<TreeViewItem>(source);
+        var containerTreeItem = WorkspaceTree.ContainerFromElement(source) as TreeViewItem;
+        var treeHitTest = WorkspaceTree.InputHitTest(e.GetPosition(WorkspaceTree));
+        Phase54R3InputProbe.RecordAppEvent($"APP_RIGHT_CLICK_ROUTE source={source?.GetType().Name ?? "none"} treeItem={routedTreeItem?.DataContext?.GetType().Name ?? "none"} container={containerTreeItem?.DataContext?.GetType().Name ?? "none"} treeHit={treeHitTest?.GetType().Name ?? "none"} visual={VisualParentTypeChain(source)} logical={LogicalParentTypeChain(source)} data={VisualDataContextTypeChain(source)}");
 
         var transcriptItem = FindAncestor<ListBoxItem>(source);
         if (transcriptItem?.DataContext is TranscriptEntry transcriptEntry
@@ -599,7 +606,8 @@ public partial class MainWindow : Window
             return;
         }
 
-        var pinnedItem = FindAncestor<ListBoxItem>(source);
+        var pinnedItem = FindAncestor<ListBoxItem>(source)
+            ?? PinnedConversationsList.ContainerFromElement(source) as ListBoxItem;
         if (pinnedItem?.DataContext is PinnedConversationNavigationItem pinnedConversation)
         {
             var pinActions = new List<(string, Func<Task>)>
@@ -613,7 +621,9 @@ public partial class MainWindow : Window
             return;
         }
 
-        var treeItem = FindAncestor<TreeViewItem>(source);
+        var treeItem = routedTreeItem;
+        if (treeItem is not null)
+            Phase54R3InputProbe.RecordAppEvent($"APP_RIGHT_CLICK_TREEITEM data={treeItem.DataContext?.GetType().Name ?? "none"}");
         if (treeItem?.DataContext is NetworkWorkspace network)
         {
             treeItem.IsSelected = true;
@@ -745,7 +755,8 @@ public partial class MainWindow : Window
 
     private bool TryOpenKeyboardPinContextMenu(DependencyObject source)
     {
-        var pinnedItem = FindAncestor<ListBoxItem>(source);
+        var pinnedItem = FindAncestor<ListBoxItem>(source)
+            ?? PinnedConversationsList.ContainerFromElement(source) as ListBoxItem;
         if (pinnedItem?.DataContext is PinnedConversationNavigationItem pinnedConversation)
         {
             var actions = new List<(string, Func<Task>)>
@@ -761,7 +772,8 @@ public partial class MainWindow : Window
             return true;
         }
 
-        var treeItem = FindAncestor<TreeViewItem>(source);
+        var treeItem = FindAncestor<TreeViewItem>(source)
+            ?? WorkspaceTree.ContainerFromElement(source) as TreeViewItem;
         if (treeItem?.DataContext is not WorkspaceView view
             || !ViewModel.Sessions.TryGet(view.NetworkId, out var network)
             || network is null)
@@ -1016,6 +1028,8 @@ public partial class MainWindow : Window
     private void OpenContextMenu(FrameworkElement target, IEnumerable<ContextMenuAction> actions, string automationId = "WorkspaceContextMenu", bool focusFirst = false)
     {
         var menu = new ContextMenu { PlacementTarget = target };
+        menu.Opened += (_, _) => Phase54R3InputProbe.RecordAppEvent($"APP_CONTEXT_MENU_OPENED id={automationId}");
+        menu.Closed += (_, _) => Phase54R3InputProbe.RecordAppEvent($"APP_CONTEXT_MENU_CLOSED id={automationId}");
         AutomationProperties.SetAutomationId(menu, automationId);
         AutomationProperties.SetName(menu, automationId == "ChannelContextMenu" ? "Channel actions" : "Workspace actions");
         if (focusFirst)
@@ -1035,6 +1049,7 @@ public partial class MainWindow : Window
         }
 
         menu.IsOpen = true;
+        Phase54R3InputProbe.RecordAppEvent($"APP_CONTEXT_MENU_REQUEST id={automationId} open={menu.IsOpen.ToString().ToLowerInvariant()} items={menu.Items.Count}");
     }
 
     private static void FocusFirstEnabledMenuItem(ContextMenu menu)
@@ -1047,6 +1062,8 @@ public partial class MainWindow : Window
     {
         if (sender is MenuItem { Tag: Func<Task> action })
         {
+            if (sender is MenuItem item)
+                Phase54R3InputProbe.RecordAppEvent($"APP_CONTEXT_MENU_ACTION id={AutomationProperties.GetAutomationId(item)}");
             await action();
         }
     }
@@ -1115,6 +1132,58 @@ public partial class MainWindow : Window
         }
 
         return null;
+    }
+
+    private static T? FindLogicalAncestor<T>(DependencyObject? source)
+        where T : DependencyObject
+    {
+        var current = source;
+        while (current is not null)
+        {
+            if (current is T match) return match;
+            current = LogicalTreeHelper.GetParent(current)
+                ?? (current as FrameworkElement)?.TemplatedParent;
+        }
+
+        return null;
+    }
+
+    private static string VisualParentTypeChain(DependencyObject? source)
+    {
+        var names = new List<string>();
+        var current = source;
+        while (current is not null && names.Count < 12)
+        {
+            names.Add(current.GetType().Name);
+            current = VisualTreeHelper.GetParent(current);
+        }
+        return string.Join('/', names);
+    }
+
+    private static string LogicalParentTypeChain(DependencyObject? source)
+    {
+        var names = new List<string>();
+        var current = source;
+        while (current is not null && names.Count < 12)
+        {
+            names.Add(current.GetType().Name);
+            current = LogicalTreeHelper.GetParent(current)
+                ?? (current as FrameworkElement)?.TemplatedParent;
+        }
+        return string.Join('/', names);
+    }
+
+    private static string VisualDataContextTypeChain(DependencyObject? source)
+    {
+        var names = new List<string>();
+        var current = source;
+        while (current is not null && names.Count < 12)
+        {
+            if (current is FrameworkElement element)
+                names.Add($"{current.GetType().Name}:{element.DataContext?.GetType().Name ?? "none"}");
+            current = current is Visual ? VisualTreeHelper.GetParent(current) : null;
+        }
+        return string.Join('/', names);
     }
 
     private static T? FindDescendant<T>(DependencyObject source)
