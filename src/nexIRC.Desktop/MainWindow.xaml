@@ -29,6 +29,9 @@
             <Setter Property="Foreground" Value="#334155" />
             <Setter Property="Margin" Value="10,8,10,6" />
         </Style>
+        <Style x:Key="WorkspaceTreeItemStyle" TargetType="TreeViewItem">
+            <Setter Property="AutomationProperties.Name" Value="{Binding DisplayLabel}" />
+        </Style>
         <DataTemplate x:Key="TranscriptEntryTemplate">
             <DockPanel LastChildFill="True" Margin="2,1">
                 <TextBlock DockPanel.Dock="Left" Text="{Binding DisplayTime}" Width="62" Foreground="#94A3B8" />
@@ -140,7 +143,7 @@
                 <Run Text="{Binding DisplayLabel, Mode=OneWay}" />
             </TextBlock>
         </DataTemplate>
-        <HierarchicalDataTemplate DataType="{x:Type app:NetworkWorkspace}" ItemsSource="{Binding SidebarViews}">
+        <HierarchicalDataTemplate DataType="{x:Type app:NetworkWorkspace}" ItemsSource="{Binding SidebarViews}" ItemContainerStyle="{StaticResource WorkspaceTreeItemStyle}">
             <TextBlock Text="{Binding DisplayLabel}" Margin="4,2" FontWeight="SemiBold" />
         </HierarchicalDataTemplate>
         <DataTemplate DataType="{x:Type app:ServerStatusView}" x:Key="StatusContentTemplate">
@@ -493,7 +496,7 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
                     <TextBlock DockPanel.Dock="Top" Text="Other conversations" Margin="10,4,6,2" FontWeight="SemiBold" Foreground="#475569" />
-                    <TreeView x:Name="WorkspaceTree" ItemsSource="{Binding Networks}" SelectedItemChanged="OnTreeSelectionChanged" Margin="5,0,5,8" />
+                    <TreeView x:Name="WorkspaceTree" ItemsSource="{Binding Networks}" SelectedItemChanged="OnTreeSelectionChanged" ItemContainerStyle="{StaticResource WorkspaceTreeItemStyle}" Margin="5,0,5,8" />
                 </DockPanel>
             </Border>
             <GridSplitter Grid.Column="1" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" Background="#CBD5E1" Visibility="{Binding IsNetworkTreeVisible, Converter={StaticResource BooleanToVisibility}}" />

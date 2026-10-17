@@ -23,6 +23,8 @@ public partial class MainWindow : Window
     private readonly IConversationDraftStore? _conversationDraftStore;
     private bool _renderingSubscribed;
     private bool _viewportRestoreQueued;
+    private ContextMenu? _generatedContextMenu;
+    private DateTimeOffset _keyboardContextMenuRequestedAt = DateTimeOffset.MinValue;
     private readonly PresentationTimingProbe _presentationTiming = new();
     private readonly TaskCompletionSource _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly HashSet<ListBox> _historyScrollArmed = [];
@@ -61,6 +63,7 @@ public partial class MainWindow : Window
         ViewModel.Sessions.NavigationChanged += OnConversationNavigationChanged;
         AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(OnPreviewRightClick), true);
         AddHandler(Keyboard.PreviewKeyDownEvent, new System.Windows.Input.KeyEventHandler(OnPreviewKeyboardContextMenu), true);
+        AddHandler(ContextMenuService.ContextMenuOpeningEvent, new ContextMenuEventHandler(OnContextMenuOpening), true);
         Phase54R3InputProbe.Attach(this);
         Closed += OnClosed;
     }
@@ -614,6 +617,8 @@ public partial class MainWindow : Window
             {
                 ("Unpin conversation", () => ViewModel.SetConversationPinnedAsync(pinnedConversation.View, false))
             };
+            if (pinnedConversation.View is ChannelView)
+                pinActions.Add(("Close view without PART", () => { ViewModel.CloseConversationView(pinnedConversation.View); return Task.CompletedTask; }));
             if (pinnedConversation.CanMoveToTop)
                 pinActions.Insert(0, ("Move to top", () => ViewModel.MovePinnedConversationToTopAsync(pinnedConversation)));
             OpenContextMenu(pinnedItem, pinActions, "PinnedConversationContextMenu");
@@ -737,21 +742,52 @@ public partial class MainWindow : Window
 
     private void OnPreviewKeyboardContextMenu(object sender, System.Windows.Input.KeyEventArgs e)
     {
-        if (!IsKeyboardContextMenuGesture(e.Key, Keyboard.Modifiers)
-            || Keyboard.FocusedElement is not DependencyObject source)
+        if (!IsKeyboardContextMenuGesture(e.Key, e.SystemKey, Keyboard.Modifiers))
         {
             return;
         }
 
-        if (TryOpenKeyboardPinContextMenu(source))
+        // Let WPF complete its native keyboard context-menu gesture. The routed
+        // ContextMenuOpening event below opens the custom menu once; opening during
+        // PreviewKeyDown races the later WM_CONTEXTMENU and dismisses the menu.
+        _keyboardContextMenuRequestedAt = DateTimeOffset.UtcNow;
+    }
+
+    private void OnContextMenuOpening(object sender, ContextMenuEventArgs e)
+    {
+        var source = Keyboard.FocusedElement as DependencyObject
+            ?? e.OriginalSource as DependencyObject;
+        if (HandleContextMenuOpening(source))
         {
             e.Handled = true;
         }
     }
 
+    private bool HandleContextMenuOpening(DependencyObject? source)
+    {
+        if (_generatedContextMenu?.IsOpen == true)
+        {
+            return true;
+        }
+
+        var keyboardGesturePending = DateTimeOffset.UtcNow - _keyboardContextMenuRequestedAt < TimeSpan.FromSeconds(1);
+        if (!keyboardGesturePending) return false;
+        _keyboardContextMenuRequestedAt = DateTimeOffset.MinValue;
+
+        return source is not null && TryOpenKeyboardPinContextMenu(source);
+    }
+
+    internal bool SimulateContextMenuOpeningForSmoke(DependencyObject source) => HandleContextMenuOpening(source);
+
     internal static bool IsKeyboardContextMenuGesture(Key key, ModifierKeys modifiers) =>
-        key == Key.Apps
-        || (key == Key.F10 && (modifiers & ModifierKeys.Shift) == ModifierKeys.Shift);
+        IsKeyboardContextMenuGesture(key, Key.None, modifiers);
+
+    internal static bool IsKeyboardContextMenuGesture(Key key, Key systemKey, ModifierKeys modifiers)
+    {
+        var effectiveKey = key == Key.System ? systemKey : key;
+        return effectiveKey == Key.Apps
+            || (effectiveKey == Key.F10 && (modifiers & ModifierKeys.Shift) == ModifierKeys.Shift);
+    }
 
     private bool TryOpenKeyboardPinContextMenu(DependencyObject source)
     {
@@ -763,6 +799,10 @@ public partial class MainWindow : Window
             {
                 ("Unpin conversation", () => ViewModel.SetConversationPinnedAsync(pinnedConversation.View, false))
             };
+            if (pinnedConversation.View is ChannelView)
+            {
+                actions.Add(("Close view without PART", () => { ViewModel.CloseConversationView(pinnedConversation.View); return Task.CompletedTask; }));
+            }
             if (pinnedConversation.CanMoveToTop)
             {
                 actions.Insert(0, ("Move to top", () => ViewModel.MovePinnedConversationToTopAsync(pinnedConversation)));
@@ -1029,7 +1069,11 @@ public partial class MainWindow : Window
     {
         var menu = new ContextMenu { PlacementTarget = target };
         menu.Opened += (_, _) => Phase54R3InputProbe.RecordAppEvent($"APP_CONTEXT_MENU_OPENED id={automationId}");
-        menu.Closed += (_, _) => Phase54R3InputProbe.RecordAppEvent($"APP_CONTEXT_MENU_CLOSED id={automationId}");
+        menu.Closed += (_, _) =>
+        {
+            if (ReferenceEquals(_generatedContextMenu, menu)) _generatedContextMenu = null;
+            Phase54R3InputProbe.RecordAppEvent($"APP_CONTEXT_MENU_CLOSED id={automationId}");
+        };
         AutomationProperties.SetAutomationId(menu, automationId);
         AutomationProperties.SetName(menu, automationId == "ChannelContextMenu" ? "Channel actions" : "Workspace actions");
         if (focusFirst)
@@ -1048,6 +1092,7 @@ public partial class MainWindow : Window
             menu.Items.Add(item);
         }
 
+        _generatedContextMenu = menu;
         menu.IsOpen = true;
         Phase54R3InputProbe.RecordAppEvent($"APP_CONTEXT_MENU_REQUEST id={automationId} open={menu.IsOpen.ToString().ToLowerInvariant()} items={menu.Items.Count}");
     }
@@ -1058,14 +1103,43 @@ public partial class MainWindow : Window
         firstEnabled?.Focus();
     }
 
-    private static async void OnGeneratedContextMenuClick(object sender, RoutedEventArgs e)
+    private async void OnGeneratedContextMenuClick(object sender, RoutedEventArgs e)
     {
         if (sender is MenuItem { Tag: Func<Task> action })
         {
-            if (sender is MenuItem item)
-                Phase54R3InputProbe.RecordAppEvent($"APP_CONTEXT_MENU_ACTION id={AutomationProperties.GetAutomationId(item)}");
-            await action();
+            var item = (MenuItem)sender;
+            var contextMenu = item.Parent as ContextMenu;
+            var target = contextMenu?.PlacementTarget as FrameworkElement;
+            await ExecuteGeneratedContextMenuActionAsync(item, target, action).ConfigureAwait(true);
         }
+    }
+
+    internal async Task ExecuteGeneratedContextMenuActionAsync(MenuItem item, FrameworkElement? target, Func<Task> action)
+    {
+        ArgumentNullException.ThrowIfNull(item);
+        ArgumentNullException.ThrowIfNull(action);
+        var targetView = target?.DataContext switch
+        {
+            WorkspaceView view => view,
+            PinnedConversationNavigationItem pinned => pinned.View,
+            _ => null
+        };
+        var networkName = targetView is null ? null : ViewModel.Sessions.Networks.FirstOrDefault(network => network.Id == targetView.NetworkId)?.DisplayName;
+        var actionId = AutomationProperties.GetAutomationId(item);
+        var preserveActiveSelection = actionId is "ContextAction.Pinconversation"
+            or "ContextAction.Unpinconversation" or "ContextAction.Movetotop";
+        var activeBefore = ViewModel.ActiveView;
+        Phase54R3InputProbe.RecordContextAction(actionId, networkName, targetView?.Title);
+        Phase54R3InputProbe.RecordConversationState("before", targetView, ViewModel.InputText);
+        await action().ConfigureAwait(true);
+        await Task.Delay(200).ConfigureAwait(true);
+        if (preserveActiveSelection && activeBefore is { IsViewOpen: true }
+            && !ReferenceEquals(ViewModel.ActiveView, activeBefore))
+        {
+            ViewModel.SelectView(activeBefore);
+            Phase54R3InputProbe.RecordAppEvent("APP_CONTEXT_MENU_ACTIVE_SELECTION_RESTORED");
+        }
+        Phase54R3InputProbe.RecordConversationState("after", targetView, ViewModel.InputText);
     }
 
     private async Task ExecuteWorkspaceActionAsync(NetworkWorkspace network, WorkspaceActionId action)
@@ -1128,7 +1202,7 @@ public partial class MainWindow : Window
                 return match;
             }
 
-            current = VisualTreeHelper.GetParent(current);
+            current = GetVisualOrContentParent(current);
         }
 
         return null;
@@ -1141,8 +1215,7 @@ public partial class MainWindow : Window
         while (current is not null)
         {
             if (current is T match) return match;
-            current = LogicalTreeHelper.GetParent(current)
-                ?? (current as FrameworkElement)?.TemplatedParent;
+            current = GetVisualOrContentParent(current);
         }
 
         return null;
@@ -1155,7 +1228,7 @@ public partial class MainWindow : Window
         while (current is not null && names.Count < 12)
         {
             names.Add(current.GetType().Name);
-            current = VisualTreeHelper.GetParent(current);
+            current = GetVisualOrContentParent(current);
         }
         return string.Join('/', names);
     }
@@ -1167,8 +1240,7 @@ public partial class MainWindow : Window
         while (current is not null && names.Count < 12)
         {
             names.Add(current.GetType().Name);
-            current = LogicalTreeHelper.GetParent(current)
-                ?? (current as FrameworkElement)?.TemplatedParent;
+            current = GetVisualOrContentParent(current);
         }
         return string.Join('/', names);
     }
@@ -1181,10 +1253,18 @@ public partial class MainWindow : Window
         {
             if (current is FrameworkElement element)
                 names.Add($"{current.GetType().Name}:{element.DataContext?.GetType().Name ?? "none"}");
-            current = current is Visual ? VisualTreeHelper.GetParent(current) : null;
+            current = GetVisualOrContentParent(current);
         }
         return string.Join('/', names);
     }
+
+    private static DependencyObject? GetVisualOrContentParent(DependencyObject element) => element switch
+    {
+        FrameworkElement frameworkElement => VisualTreeHelper.GetParent(frameworkElement) ?? frameworkElement.TemplatedParent,
+        Visual or System.Windows.Media.Media3D.Visual3D => VisualTreeHelper.GetParent(element),
+        ContentElement content => ContentOperations.GetParent(content) ?? (content as FrameworkContentElement)?.Parent,
+        _ => LogicalTreeHelper.GetParent(element)
+    };
 
     private static T? FindDescendant<T>(DependencyObject source)
         where T : DependencyObject

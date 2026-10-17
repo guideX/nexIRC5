@@ -207,6 +207,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         private set => SetProperty(ref _activeView, value);
     }
 
+    internal string GetAcceptanceDraftSnapshot(WorkspaceView view) =>
+        _drafts.TryGetValue((view.NetworkId, view.Id), out var state)
+            ? state.Text
+            : ReferenceEquals(ActiveView, view) ? InputText : string.Empty;
+
     public string InputText
     {
         get => _inputText;
@@ -998,6 +1003,29 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         return closed;
     }
 
+    public bool CloseConversationView(WorkspaceView view)
+    {
+        ArgumentNullException.ThrowIfNull(view);
+        if (view.Kind == WorkspaceViewKind.ServerStatus)
+        {
+            return false;
+        }
+
+        if (ReferenceEquals(ActiveView, view))
+        {
+            return CloseActiveView();
+        }
+
+        var closed = Sessions.CloseView(view.Id);
+        if (closed)
+        {
+            StatusText = $"Closed {view.Title}; the conversation remains available to reopen.";
+            RefreshCommandStates();
+        }
+
+        return closed;
+    }
+
     public async Task<bool> PartAndCloseActiveAsync()
     {
         if (ActiveView is not ChannelView channel)
@@ -1680,10 +1708,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     {
         if (parameter is PinnedConversationNavigationItem pinned)
         {
-            if (!pinned.View.IsViewOpen)
+            var wasOpen = pinned.View.IsViewOpen;
+            if (!wasOpen)
                 ReopenConversation(pinned.View);
             else
                 SelectView(pinned.View);
+            Phase54R3InputProbe.RecordPinnedActivation(pinned, wasOpen);
             return;
         }
         if (parameter is ConversationNavigationItem item
