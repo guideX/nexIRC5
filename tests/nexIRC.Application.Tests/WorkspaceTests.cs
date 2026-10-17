@@ -152,7 +152,9 @@ public sealed class WorkspaceTests
         await WaitForAsync(() => first.ConnectCount == 1);
         Register(first, "srv", "alice");
         first.EnqueueInboundLine(":bob!u@h PRIVMSG alice :before interruption");
-        await WaitForAsync(() => network.ContinuityState == ConnectionContinuityState.Synchronized && network.Queries.Count == 1);
+        await WaitForAsync(() => network.ContinuityState == ConnectionContinuityState.Synchronized
+            && network.Queries.Count == 1
+            && network.Queries[0].EntriesSnapshot.Any(entry => entry.Text == "before interruption"));
         var query = network.Queries.Single();
         Assert.Contains(query.EntriesSnapshot, entry => entry.Text == "before interruption");
 

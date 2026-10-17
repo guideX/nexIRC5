@@ -202,6 +202,8 @@ internal static class UiSmokeHarness
     {
         Require(MainWindow.IsKeyboardContextMenuGesture(Key.Apps, ModifierKeys.None),
             "the application-menu key was not recognized as a context-menu gesture");
+        Require(MainWindow.IsKeyboardContextMenuGesture(Key.System, Key.F10, ModifierKeys.Shift),
+            "Shift+F10 represented as a system key was not recognized as a context-menu gesture");
         Require(MainWindow.IsKeyboardContextMenuGesture(Key.F10, ModifierKeys.Shift),
             "Shift+F10 was not recognized as a context-menu gesture");
         Require(!MainWindow.IsKeyboardContextMenuGesture(Key.F10, ModifierKeys.None),
@@ -227,10 +229,29 @@ internal static class UiSmokeHarness
             RoutedEvent = Keyboard.PreviewKeyDownEvent
         };
         owner.RaiseEvent(keyEvent);
-        Require(keyEvent.Handled, "the application-menu key did not open the focused channel's pin context menu");
+        Require(!keyEvent.Handled, "the application-menu key was handled before WPF routed the native context-menu opening event");
+        Require(owner.SimulateContextMenuOpeningForSmoke(channelItem!),
+            "the routed context-menu opening event did not open the focused channel's pin context menu");
         await owner.Dispatcher.InvokeAsync(static () => { }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
         Require(Keyboard.FocusedElement is System.Windows.Controls.MenuItem { Header: "Pin conversation" },
             "the keyboard-opened channel menu did not focus its Pin conversation action");
+
+        if (Keyboard.FocusedElement is System.Windows.Controls.MenuItem { Parent: System.Windows.Controls.ContextMenu openMenu })
+            openMenu.IsOpen = false;
+        var viewModel = owner.ViewModel;
+        viewModel.SelectView(channel);
+        await viewModel.SetConversationPinnedAsync(channel, false).ConfigureAwait(true);
+        var pinItem = new System.Windows.Controls.MenuItem();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(pinItem, "ContextAction.Pinconversation");
+        await owner.ExecuteGeneratedContextMenuActionAsync(pinItem, channelItem, async () =>
+        {
+            await viewModel.SetConversationPinnedAsync(channel, true).ConfigureAwait(true);
+            viewModel.SelectView(network.StatusView);
+        }).ConfigureAwait(true);
+        Require(ReferenceEquals(viewModel.ActiveView, channel),
+            "a pinned-conversation context action did not preserve its active conversation selection");
+        Require(viewModel.Sessions.IsConversationPinned(network, channel),
+            "the pin context action did not retain its local catalog mutation");
     }
 
     private static async Task ParticipantAsync(MainWindow window, DemoScenario demo, NetworkWorkspace network)

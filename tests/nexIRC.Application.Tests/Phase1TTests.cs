@@ -400,12 +400,13 @@ public sealed class Phase1TTests
                 Assert.NotEmpty(search.Results);
                 if (cycle == 0)
                 {
+                    await logStore.FlushAsync().ConfigureAwait(true);
                     filesAfterFirstSearch = CountFiles(root.FullName);
                 }
             }
 
-            Assert.Equal(filesAfterFirstSearch, CountFiles(root.FullName));
             await logStore.FlushAsync().ConfigureAwait(true);
+            Assert.Equal(filesAfterFirstSearch, CountFiles(root.FullName));
             checkpoints.Add(CaptureCheckpoint("history-search", manager, logStore, allTransports));
 
             await SettleAsync(manager, logStore, allTransports).ConfigureAwait(true);
