@@ -95,4 +95,4 @@ The attached mode does not automate B's remote mutation. It requires the operato
 
 ## Reading reports
 
-Each invocation writes the requested `.json` report and a sibling `.md` summary. Results are `PASS`, `FAIL`, `BLOCKED`, or `NOT RUN`; evidence levels keep native input separate from runtime UIA and synthetic tests. A report with any unverified mandatory desktop gate leaves Phase 54 open. Remove generated reports and attached telemetry before committing.
+Each invocation writes the requested `.json` report and a sibling `.md` summary. Results are `PASS`, `FAIL`, `BLOCKED`, or `NOT RUN`; evidence levels keep native input separate from runtime UIA and synthetic tests. A report with any unverified mandatory desktop gate leaves Phase 54 open. This Phase 54R5 run retains its reviewed, sanitized JSON and Markdown reports under `artifacts/phase54r5-*` as acceptance evidence; remove attached telemetry and any other temporary reports before committing.

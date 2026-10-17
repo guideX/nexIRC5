@@ -1,0 +1,30 @@
+{
+  "SchemaVersion": "1.0",
+  "Mode": "Manual",
+  "StartedAt": "2026-10-17T15:59:22.4774264+00:00",
+  "CompletedAt": "2026-10-17T15:59:23.6569109+00:00",
+  "TargetProcessId": 14396,
+  "TargetExecutable": "nexIRC.Desktop.exe",
+  "TargetWindowTitle": "nexIRC 5",
+  "SessionId": 1,
+  "DesktopName": "Default",
+  "IntegrityRid": 8192,
+  "IsAttached": false,
+  "Steps": [
+    {
+      "ScenarioId": "UI54-MANUAL-START",
+      "ExecutionMode": "manual",
+      "TargetProcessId": 14396,
+      "ControlClassification": "operator checkpoint",
+      "ActionAttempted": "start guided manual acceptance",
+      "InputDeliveryResult": "console input is redirected",
+      "ApplicationStateAssertion": "not evaluated",
+      "UiAssertion": "operator checkpoint unavailable",
+      "ElapsedMilliseconds": 0,
+      "Result": "BLOCKED",
+      "EvidenceLevel": "Level 1 \u2014 Manual witnessed OS input",
+      "Details": ""
+    }
+  ],
+  "Diagnostics": []
+}

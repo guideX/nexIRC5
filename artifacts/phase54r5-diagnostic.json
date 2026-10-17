@@ -1,0 +1,79 @@
+{
+  "SchemaVersion": "1.0",
+  "Mode": "Diagnostic",
+  "StartedAt": "2026-10-17T15:59:14.5235892+00:00",
+  "CompletedAt": "2026-10-17T15:59:19.0951283+00:00",
+  "TargetProcessId": 14268,
+  "TargetExecutable": "nexIRC.Desktop.exe",
+  "TargetWindowTitle": "nexIRC 5",
+  "SessionId": 1,
+  "DesktopName": "Default",
+  "IntegrityRid": 8192,
+  "IsAttached": false,
+  "Steps": [
+    {
+      "ScenarioId": "UI54-NATIVE-ABI",
+      "ExecutionMode": "diagnostic",
+      "TargetProcessId": 14268,
+      "ControlClassification": "native Win32 interop",
+      "ActionAttempted": "validate INPUT/native union/MOUSEINPUT/KEYBDINPUT layout",
+      "InputDeliveryResult": "Marshal.SizeOf matched expected sizes: True",
+      "ApplicationStateAssertion": "structure sizes and union alignment",
+      "UiAssertion": "x86/x64 sizes recorded",
+      "ElapsedMilliseconds": 2,
+      "Result": "PASS",
+      "EvidenceLevel": "Level 1 \u2014 Native OS input",
+      "Details": "Pointer size 8; KEYEVENTF_KEYUP=0x2; KEYEVENTF_EXTENDEDKEY=0x1."
+    },
+    {
+      "ScenarioId": "UI54-KEY-QUALIFICATION",
+      "ExecutionMode": "diagnostic",
+      "TargetProcessId": 14268,
+      "ControlClassification": "focused WPF conversation row",
+      "ActionAttempted": "send harmless F24 key down then key up",
+      "InputDeliveryResult": "SendInput 2/2; WM_KEYDOWN and WM_KEYUP observed=True",
+      "ApplicationStateAssertion": "no command issued",
+      "UiAssertion": "WPF preview key event pair observed=True",
+      "ElapsedMilliseconds": 2165,
+      "Result": "PASS",
+      "EvidenceLevel": "Level 1 \u2014 Native OS input",
+      "Details": "F24 was used to avoid text entry or application commands. Key values are not recorded."
+    },
+    {
+      "ScenarioId": "UI54-MOUSE-QUALIFICATION",
+      "ExecutionMode": "diagnostic",
+      "TargetProcessId": 14268,
+      "ControlClassification": "visible enabled TreeViewItem",
+      "ActionAttempted": "send left mouse down then up at UIA row center",
+      "InputDeliveryResult": "WindowFromPoint owned by target=True; SendInput 2/2; WM_LBUTTONDOWN/UP observed=True",
+      "ApplicationStateAssertion": "conversation selection only",
+      "UiAssertion": "WPF preview mouse down/up observed=True",
+      "ElapsedMilliseconds": 154,
+      "Result": "PASS",
+      "EvidenceLevel": "Level 1 \u2014 Native OS input",
+      "Details": ""
+    },
+    {
+      "ScenarioId": "UI54-UIA-TREE",
+      "ExecutionMode": "diagnostic",
+      "TargetProcessId": 14268,
+      "ControlClassification": "WPF TreeView / TreeViewItem",
+      "ActionAttempted": "inspect populated channel row and runtime ancestry",
+      "InputDeliveryResult": "no synthetic WPF event sent",
+      "ApplicationStateAssertion": "eligible fixture row found; nonempty visible bounds=True",
+      "UiAssertion": "hit class=TreeItem:class; ancestor classes=TreeItem:class \u003E Tree:class \u003E Window:class",
+      "ElapsedMilliseconds": 157,
+      "Result": "PASS",
+      "EvidenceLevel": "Level 2 \u2014 Runtime UI Automation",
+      "Details": "UIA names are represented by short SHA-256 fingerprints; raw names and coordinates are not written to evidence."
+    }
+  ],
+  "Diagnostics": [
+    "Input ABI: architecture=64-bit, INPUT=40/40, MOUSEINPUT=32/32, KEYBDINPUT=24/24; INPUT union offset=8.",
+    "Opt-in WPF probe file present=True; initial bytes=65; records=3.",
+    "UIA target row: class=TreeItem:class focusable=True enabled=True offscreen=False bounds=226x20 nameFingerprint=ce3607029a25.",
+    "WindowFromPoint belongs to target PID: True; UIA FromPoint class=TreeItem:class; UIA ancestry (nearest first): TreeItem:class \u003E Tree:class \u003E Window:class.",
+    "WPF route telemetry: WPF_PREPROCESS kind=QueryCursorEventArgs; WPF_PREPROCESS kind=MouseEventArgs; WPF_PREPROCESS kind=MouseEventArgs; WIN32_MESSAGE id=0x0201; WPF_PREPROCESS kind=MouseButtonEventArgs; WPF_PREVIEW_MOUSE_DOWN; WPF_PREPROCESS kind=MouseButtonEventArgs; WPF_MOUSE_DOWN; WIN32_MESSAGE id=0x0202; WPF_PREPROCESS kind=MouseButtonEventArgs; WPF_PREVIEW_MOUSE_UP; WPF_PREPROCESS kind=MouseButtonEventArgs; WPF_MOUSE_UP; WPF_PREPROCESS kind=QueryCursorEventArgs",
+    "Focused element before inspection fingerprint: 9adc665b3108; target DPI=96."
+  ]
+}
