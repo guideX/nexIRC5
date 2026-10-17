@@ -1,0 +1,30 @@
+{
+  "SchemaVersion": "1.0",
+  "Mode": "Automated",
+  "StartedAt": "2026-10-17T22:31:25.4498974+00:00",
+  "CompletedAt": "2026-10-17T22:31:51.281973+00:00",
+  "TargetProcessId": 0,
+  "TargetExecutable": "unknown",
+  "TargetWindowTitle": "unknown",
+  "SessionId": 0,
+  "DesktopName": "unknown",
+  "IntegrityRid": 0,
+  "IsAttached": false,
+  "Steps": [
+    {
+      "ScenarioId": "UI54-RUNNER",
+      "ExecutionMode": "automated",
+      "TargetProcessId": 0,
+      "ControlClassification": "setup",
+      "ActionAttempted": "bounded startup and target validation",
+      "InputDeliveryResult": "runner error",
+      "ApplicationStateAssertion": "not evaluated",
+      "UiAssertion": "not evaluated",
+      "ElapsedMilliseconds": 0,
+      "Result": "BLOCKED",
+      "EvidenceLevel": "Level 2 \u2014 Runtime UI Automation",
+      "Details": "TimeoutException: The client did not expose a top-level window before the startup deadline."
+    }
+  ],
+  "Diagnostics": []
+}

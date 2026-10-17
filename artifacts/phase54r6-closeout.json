@@ -1,0 +1,145 @@
+{
+  "schemaVersion": "1.0",
+  "phase": "54R6",
+  "executionDate": "2026-10-17",
+  "primaryOutcome": "EXTERNAL_EXECUTION_BLOCKER",
+  "phase54Closed": false,
+  "phase55Eligible": false,
+  "repositories": {
+    "client": {
+      "path": "D:\\dev\\nexIRC\\nexIRC5",
+      "startingHead": "6aa971e01368a9feb772416528b1857ce4a1a491",
+      "startingBranch": "main",
+      "startingWorktreeClean": true,
+      "startingOriginMainAhead": 0,
+      "startingOriginMainBehind": 0,
+      "startingHeadMatchesExpected": true
+    },
+    "server": {
+      "path": "D:\\dev\\nexIRC\\nexIRCServer",
+      "startingHead": "fe4776855a318fecdf1def39ba5a7ded913c3dd7",
+      "startingBranch": "main",
+      "startingWorktreeClean": true,
+      "startingOriginMainAhead": 0,
+      "startingOriginMainBehind": 0,
+      "startingHeadMatchesExpected": true
+    }
+  },
+  "remoteGitOperations": [],
+  "productionSourceChanged": false,
+  "twoClientEnvironment": {
+    "independentClientProcessesAvailable": false,
+    "authenticatedSessionsAvailable": false,
+    "sameAccountAssociationVerified": false,
+    "actualServerConnectivityVerified": false,
+    "capabilityNegotiationVerified": false,
+    "initialPinsConverged": false,
+    "authenticationEvidenceClassification": "none; no authenticated sessions were available to inspect",
+    "credentialsCollected": false
+  },
+  "freshRunnerExecutions": [
+    {
+      "mode": "automated",
+      "target": "runner-owned nexIRC.Desktop.exe disposable demo",
+      "inputSource": "runner native automation requested; no UI action reached",
+      "pid": null,
+      "window": null,
+      "result": "BLOCKED",
+      "scenario": "UI54-RUNNER",
+      "reason": "top-level client window was not exposed before the 20-second startup deadline",
+      "artifact": "artifacts/phase54r6-demo-automated.json"
+    },
+    {
+      "mode": "manual",
+      "target": "runner-owned nexIRC.Desktop.exe disposable demo",
+      "inputSource": "operator checkpoint required",
+      "pid": 12832,
+      "executable": "nexIRC.Desktop.exe",
+      "windowTitle": "nexIRC 5",
+      "sessionId": 1,
+      "desktopName": "Default",
+      "integrityRid": 8192,
+      "result": "BLOCKED",
+      "scenario": "UI54-MANUAL-START",
+      "reason": "console input is redirected; no operator checkpoint could be acknowledged",
+      "artifact": "artifacts/phase54r6-manual.json"
+    },
+    {
+      "mode": "desktop inventory",
+      "result": "BLOCKED",
+      "reason": "computer-use native app inventory returned no apps or attached nexIRC window"
+    }
+  ],
+  "gates": {
+    "authenticatedTwoClientSetup": "BLOCKED",
+    "initialPinConvergence": "NOT RUN",
+    "moveTopServerAcceptance": "NOT RUN",
+    "moveTopRemoteFocusPreservation": "NOT RUN",
+    "unpinServerAcceptance": "NOT RUN",
+    "unpinRemoteFocusPreservation": "NOT RUN",
+    "nonactiveRemoteUnpinWhileComposing": "NOT RUN",
+    "activeDestinationPreservation": "NOT RUN",
+    "selectionIdentityPreservation": "NOT RUN",
+    "composerFocusAndSelectionPreservation": "NOT RUN",
+    "transcriptUnreadAndDraftPreservation": "NOT RUN",
+    "noUnexpectedPartCloseOrNavigation": "NOT RUN",
+    "noDuplicateViewsOrPinnedRows": "NOT RUN",
+    "operatorDesktopJourney": "BLOCKED",
+    "closeViewWithoutPartAndReopenIdentity": "NOT RUN IN R6",
+    "runtimeAccessibilityAndKeyboardNavigation": "NOT RUN IN R6"
+  },
+  "evidenceClassification": {
+    "freshNativeWindowsInput": "none; automated mode stopped before target validation",
+    "freshRuntimeUIAutomation": "none on an authenticated target",
+    "freshAuthenticatedTwoProcessSynchronization": "none",
+    "freshHumanOperatorInput": "none; console input redirected",
+    "freshSyntheticAndProcessRegression": "server Phase54R filter passed 4/4; process test evidence only",
+    "retainedR5NativeInputAndUIA": "historical disposable-demo evidence; not R6 execution",
+    "retainedR5RemoteFocus": "NOT RUN"
+  },
+  "defects": [],
+  "fixes": [],
+  "validation": {
+    "builds": {
+      "clientDebug": { "result": "passed", "warnings": 0, "errors": 0 },
+      "clientRelease": { "result": "passed", "warnings": 0, "errors": 0 },
+      "serverDebug": { "result": "passed on clean serial rerun", "warnings": 0, "errors": 0 },
+      "serverRelease": { "result": "passed", "warnings": 0, "errors": 0 },
+      "acceptanceRunnerDebug": { "result": "passed", "warnings": 0, "errors": 0 },
+      "acceptanceRunnerRelease": { "result": "passed", "warnings": 0, "errors": 0 }
+    },
+    "tests": {
+      "core": { "passed": 147, "skipped": 0, "failed": 0 },
+      "networking": { "passed": 82, "skipped": 0, "failed": 0 },
+      "application": { "passed": 226, "skipped": 1, "failed": 0, "skipReason": "expected benchmark" },
+      "uiAcceptanceRunner": { "passed": 5, "skipped": 0, "failed": 0 },
+      "pinnedConversationIdentityFocused": { "passed": 2, "skipped": 0, "failed": 0 },
+      "serverPhase54RProcessFilter": { "passed": 4, "skipped": 0, "failed": 0 },
+      "serverFullSuite": { "classification": "retained R5 result; not rerun in R6", "passed": 114, "skipped": 0, "failed": 0 }
+    },
+    "serverDebugParallelRetryWarnings": 2,
+    "serverDebugSerialRerunWarnings": 0
+  },
+  "privacyAudit": {
+    "credentialsOrResumeTokensRecorded": false,
+    "privateMessagesOrComposerContentsRecorded": false,
+    "rawKeyValuesOrUnneededCoordinatesRecorded": false,
+    "attachedTelemetryOrScreenshotsCommitted": false,
+    "runnerOwnedProcessesCleanedUp": true
+  },
+  "artifacts": [
+    "artifacts/phase54r6-demo-automated.json",
+    "artifacts/phase54r6-demo-automated.md",
+    "artifacts/phase54r6-manual.json",
+    "artifacts/phase54r6-manual.md",
+    "artifacts/phase54r6-closeout.json",
+    "artifacts/phase54r6-closeout.md",
+    "docs/testing/Phase54-Windows-UI-Acceptance.md#phase-54r6-operator-completion"
+  ],
+  "remainingSteps": [
+    "Provide an unlocked interactive Windows desktop and an interactive console with non-redirected input.",
+    "Start two independent authenticated clients on the actual server and verify same-account association, capability negotiation, and initial pin convergence without recording credentials.",
+    "Run attached manual checks on A while the operator performs real UI MOVE_TOP and UNPIN mutations on B; verify server acceptance, propagation, focus, identity, transcript, unread, draft, and view preservation.",
+    "Complete the full operator mouse, keyboard, close/reopen, and accessibility journey on the authenticated clients and record sanitized checkpoints."
+  ]
+}

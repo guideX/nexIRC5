@@ -96,3 +96,31 @@ The attached mode does not automate B's remote mutation. It requires the operato
 ## Reading reports
 
 Each invocation writes the requested `.json` report and a sibling `.md` summary. Results are `PASS`, `FAIL`, `BLOCKED`, or `NOT RUN`; evidence levels keep native input separate from runtime UIA and synthetic tests. A report with any unverified mandatory desktop gate leaves Phase 54 open. This Phase 54R5 run retains its reviewed, sanitized JSON and Markdown reports under `artifacts/phase54r5-*` as acceptance evidence; remove attached telemetry and any other temporary reports before committing.
+
+## Phase 54R6 operator completion
+
+R6 remains blocked until an operator can run two authenticated nexIRC 5 clients against the same synchronized account on the actual server. Do not use `--demo` as either authenticated client. Use the product's supported setup to obtain two independent processes and authenticated sessions in the same interactive, unlocked Windows logon session. Keep credentials out of command lines, telemetry, reports, and screenshots.
+
+Start client A with the opt-in probe and keep its telemetry file in `artifacts`:
+
+```powershell
+$clientExe = (Resolve-Path .\src\nexIRC.Desktop\bin\Debug\net10.0-windows\nexIRC.Desktop.exe).Path
+$tracePath = Join-Path (Resolve-Path .\artifacts).Path 'phase54r6-client-a-input.jsonl'
+$clientA = Start-Process -FilePath $clientExe -ArgumentList @("--phase54r3-input-probe=$tracePath") -PassThru
+```
+
+Start client B normally in a second process. Sign both clients in through the ordinary product flow to the same account and actual server. Confirm the server connection and synchronized-pin capability in each client and confirm the same initial pins on both. Record sanitized process metadata (PID, executable, HWND, Windows session, desktop, and account association classification); never record account names or credentials. Prepare two stable pinned destinations, a populated open transcript, a distinctive unsent draft, and a known unread state on A.
+
+In an interactive PowerShell console whose input is not redirected, attach the runner to A:
+
+```powershell
+dotnet .\tools\nexIRC.UiAcceptance\bin\Debug\net10.0-windows\nexIRC.UiAcceptance.dll `
+  --mode manual --pid $clientA.Id --client $clientExe --telemetry $tracePath `
+  --timeout 30 --report .\artifacts\phase54r6-attached-manual.json
+```
+
+Attached manual mode validates A and reads its WPF telemetry/UI Automation state; it sends no input and never launches or closes A. It prompts for the focused-row baseline, then waits while the operator uses B's real UI to MOVE_TOP that row. Repeat the guided baseline and remote action for UNPIN. Press Enter only after performing each instructed operator action. The runner checks projection change, focused pinned-row identity, a post-update keyboard event, and accessible rows. Its result is not a server acceptance receipt and does not measure active destination, composer selection/content, transcript, unread state, view identity, or PART activity; independently verify server acceptance/propagation and record those Gate A/B preservation checks before and after each mutation. The attached mode currently reports Gate A/B plus accessibility checks; the operator must also record Gate C's mouse, keyboard, close/reopen, transcript, unread, and draft checkpoints against the same authenticated clients in the accompanying acceptance notes. Do not count checkpoints as runner-verified unless the report contains the relevant evidence.
+
+Complete Gate C on the authenticated clients: use real mouse input for pinned destination activation and pin management, invoke and operate a context menu with the keyboard, move a pin from B and observe A, unpin from B and observe A, close an open pinned view without PART, reopen the same identity, and verify transcript, unread, draft, accessible names, navigation, and focus. For each checkpoint, note the client, process/session, physical operator action, before/after state fingerprints, and verification source. Do not include message or composer text, raw key values, credentials, account identifiers, or screen coordinates. Keep the runner's JSON/Markdown report and a sanitized operator note under `artifacts/phase54r6-*`.
+
+The ordinary `--mode manual` invocation without `--pid` launches a disposable demo client. It is useful for local control checks only and cannot satisfy authenticated two-client acceptance. The R6 run's manual checkpoint was blocked because the console input was redirected; its demo launch is not evidence for Gates A, B, or C.
