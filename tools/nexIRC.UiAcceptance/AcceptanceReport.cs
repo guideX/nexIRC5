@@ -76,7 +76,7 @@ internal sealed class AcceptanceReport(AcceptanceMode mode, DateTimeOffset start
 }
 
 internal sealed record AcceptanceOptions(AcceptanceMode Mode, string? ClientPath, string? ReportPath,
-    string? TelemetryPath, int? ProcessId, int TimeoutSeconds)
+    string? TelemetryPath, int? ProcessId, int TimeoutSeconds, int OperatorCheckpointTimeoutSeconds)
 {
     public static string DefaultClientPath()
     {
@@ -92,6 +92,7 @@ internal sealed record AcceptanceOptions(AcceptanceMode Mode, string? ClientPath
         string? telemetry = null;
         int? pid = null;
         var timeout = 15;
+        var operatorCheckpointTimeout = 900;
         for (var index = 0; index < args.Length; index++)
         {
             string Next() => ++index < args.Length ? args[index] : throw new ArgumentException("Missing option value.");
@@ -103,6 +104,7 @@ internal sealed record AcceptanceOptions(AcceptanceMode Mode, string? ClientPath
                 case "--telemetry": telemetry = Next(); break;
                 case "--pid": pid = int.Parse(Next(), System.Globalization.CultureInfo.InvariantCulture); break;
                 case "--timeout": timeout = int.Parse(Next(), System.Globalization.CultureInfo.InvariantCulture); break;
+                case "--checkpoint-timeout": operatorCheckpointTimeout = int.Parse(Next(), System.Globalization.CultureInfo.InvariantCulture); break;
                 default: throw new ArgumentException($"Unknown option: {args[index]}");
             }
         }
@@ -110,11 +112,13 @@ internal sealed record AcceptanceOptions(AcceptanceMode Mode, string? ClientPath
         if (!Enum.TryParse<AcceptanceMode>(modeText, true, out var mode))
             throw new ArgumentException("--mode must be diagnostic, automated, or manual.");
         if (timeout is < 3 or > 120) throw new ArgumentOutOfRangeException(nameof(timeout), "Timeout must be from 3 to 120 seconds.");
+        if (operatorCheckpointTimeout is < 30 or > 3600)
+            throw new ArgumentOutOfRangeException(nameof(operatorCheckpointTimeout), "Operator checkpoint timeout must be from 30 to 3600 seconds.");
         if (pid is not null && client is null)
             throw new ArgumentException("Explicit PID attach requires --client to validate its executable path.");
         if (pid is not null && string.IsNullOrWhiteSpace(telemetry))
             throw new ArgumentException("Explicit PID attach requires --telemetry from the target's opt-in probe.");
-        return new AcceptanceOptions(mode, client, report, telemetry, pid, timeout);
+        return new AcceptanceOptions(mode, client, report, telemetry, pid, timeout, operatorCheckpointTimeout);
     }
 
     private static string FindRepoRoot()

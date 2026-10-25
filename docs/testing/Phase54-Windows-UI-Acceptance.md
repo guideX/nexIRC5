@@ -1,5 +1,7 @@
 # Phase 54 Windows UI acceptance
 
+For the R9 operator-driven two-client synchronized pins handoff, start with [the Phase 54R9 operator guide](Phase54R9-Operator-Guide.md). It uses the attached runner below and adds operator-reported checkpoints for authentication, server acceptance, preservation, accessibility, and reopen convergence.
+
 This guide runs the `nexIRC.UiAcceptance` executable against a disposable test client. It records JSON and Markdown evidence. It does not close Phase 54 by itself; the mouse, keyboard, remote-focus, and close/reopen gates pass only when the report contains matching WPF and application-state evidence.
 
 ## Requirements

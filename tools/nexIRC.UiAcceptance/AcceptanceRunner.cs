@@ -17,8 +17,11 @@ internal static partial class AcceptanceRunner
     private static readonly Regex PinnedActivationRegex = new("APP_PINNED_ACTIVATION target=(?<target>[a-f0-9]{12}) view=(?<view>[a-f0-9]{12}) active=(?<active>none|[a-f0-9]{12}) wasOpen=(?<wasOpen>true|false) open=(?<open>true|false) entries=(?<entries>\\d+) unread=(?<unread>\\d+) important=(?<important>true|false) composerBytes=(?<composerBytes>\\d+) composer=(?<composer>none|[a-f0-9]{12})", RegexOptions.CultureInvariant);
     private static string _lastClickDiagnostic = "not evaluated";
     private static CancellationToken _cancellationToken;
+    private static int _operatorCheckpointTimeoutSeconds = 900;
 
     public static void SetCancellationToken(CancellationToken cancellationToken) => _cancellationToken = cancellationToken;
+
+    public static void SetOperatorCheckpointTimeoutSeconds(int seconds) => _operatorCheckpointTimeoutSeconds = seconds;
 
     public static async Task RunDiagnosticAsync(AcceptanceTarget target, AcceptanceReport report, int timeoutSeconds)
     {
@@ -1006,7 +1009,7 @@ internal static partial class AcceptanceRunner
         Console.WriteLine("\nUI54-KEYBOARD-NAVIGATION");
         Console.WriteLine("Focus the conversation TreeView, navigate between channel rows using the arrow keys, then press Enter here.");
         var start = ReadTelemetry(target).Length;
-        _ = await Console.In.ReadLineAsync(_cancellationToken).ConfigureAwait(false);
+        await ReadOperatorCheckpointAsync().ConfigureAwait(false);
         var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
         string[] lines;
         do
@@ -1036,7 +1039,7 @@ internal static partial class AcceptanceRunner
         Console.WriteLine("The runner checks the close action, retained pin, reopened view, stable view identity, transcript/unread/important state, composer fingerprint, and duplicate rows.");
         var watch = Stopwatch.StartNew();
         var start = ReadTelemetry(target).Length;
-        _ = await Console.In.ReadLineAsync(_cancellationToken).ConfigureAwait(false);
+        await ReadOperatorCheckpointAsync().ConfigureAwait(false);
         var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
         string[] lines;
         while (true)
@@ -1099,7 +1102,7 @@ internal static partial class AcceptanceRunner
     {
         Console.WriteLine($"\n{scenario} — capture focus baseline");
         Console.WriteLine("In client A, focus the exact pinned row that client B will reorder or remove. Press Enter here to capture its UIA identity and the current order.");
-        _ = await Console.In.ReadLineAsync(_cancellationToken).ConfigureAwait(false);
+        await ReadOperatorCheckpointAsync().ConfigureAwait(false);
         var beforeProjection = ProjectionOrder(target).ToArray();
         var beforeFocus = FocusedAutomationElement();
         var beforeWasPinned = IsCurrentPinnedButton(target, beforeFocus);
@@ -1107,7 +1110,7 @@ internal static partial class AcceptanceRunner
         Console.WriteLine("After the second-client update arrives, use the keyboard once in client A and press Enter here.");
         var watch = Stopwatch.StartNew();
         var beforeLines = ReadTelemetry(target).Length;
-        _ = await Console.In.ReadLineAsync(_cancellationToken).ConfigureAwait(false);
+        await ReadOperatorCheckpointAsync().ConfigureAwait(false);
         var timeout = DateTime.UtcNow.AddSeconds(timeoutSeconds);
         while (DateTime.UtcNow < timeout)
         {
@@ -1137,6 +1140,22 @@ internal static partial class AcceptanceRunner
             passed ? "Remote projection change, client-side WPF focus, and post-update keyboard input were observed. Input source cannot be distinguished from UIA by Windows telemetry." : "No matching remote projection, focused-row transition, or post-update keyboard input was independently established.");
     }
 
+    private static async Task ReadOperatorCheckpointAsync()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(_operatorCheckpointTimeoutSeconds));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken, timeout.Token);
+        try
+        {
+            var response = await Console.In.ReadLineAsync(linked.Token).ConfigureAwait(false);
+            if (response is null)
+                throw new EndOfStreamException("The operator console closed before this checkpoint was acknowledged.");
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested && !_cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"No operator response arrived within {_operatorCheckpointTimeoutSeconds} seconds; the remaining acceptance steps were not run.");
+        }
+    }
+
     private static bool IsCurrentPinnedButton(AcceptanceTarget target, AutomationElement? focused)
     {
         try
@@ -1163,7 +1182,7 @@ internal static partial class AcceptanceRunner
         Console.WriteLine("Perform the action in nexIRC. Press Enter when finished; the runner still requires routed WPF and UIA/state evidence.");
         var watch = Stopwatch.StartNew();
         var start = ReadTelemetry(target).Length;
-        _ = await Console.In.ReadLineAsync(_cancellationToken).ConfigureAwait(false);
+        await ReadOperatorCheckpointAsync().ConfigureAwait(false);
         var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
         string[] lines;
         while (true)

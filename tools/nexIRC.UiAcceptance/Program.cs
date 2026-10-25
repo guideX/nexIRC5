@@ -47,6 +47,7 @@ internal static class Program
         };
         Console.CancelKeyPress += cancelHandler;
         AcceptanceRunner.SetCancellationToken(runCancellation.Token);
+        AcceptanceRunner.SetOperatorCheckpointTimeoutSeconds(options.OperatorCheckpointTimeoutSeconds);
         var cancelled = false;
 
         try
@@ -148,6 +149,8 @@ internal static class Program
         FileNotFoundException => "client executable was not found",
         ArgumentException => "acceptance command line is incomplete or invalid",
         InvalidOperationException => "target process or desktop validation failed",
+        TimeoutException => "the bounded operator checkpoint or target startup timed out",
+        EndOfStreamException => "the operator console closed before the checkpoint completed",
         System.ComponentModel.Win32Exception => "Windows desktop inspection or input delivery was unavailable",
         _ => $"{exception.GetType().Name}: {exception.Message.Replace('\r', ' ').Replace('\n', ' ')}"
     };
@@ -157,6 +160,6 @@ internal static class Program
         Console.WriteLine("nexIRC.UiAcceptance --mode diagnostic|automated|manual [options]");
         Console.WriteLine("  --client <nexIRC.Desktop.exe>  client path for a test-owned demo process");
         Console.WriteLine("  --pid <pid> --client <path> --telemetry <jsonl>  attach to an explicitly selected opt-in client");
-        Console.WriteLine("  --report <path> --timeout <seconds>");
+        Console.WriteLine("  --report <path> --timeout <seconds> --checkpoint-timeout <seconds>");
     }
 }

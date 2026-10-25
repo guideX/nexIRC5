@@ -45,7 +45,20 @@ public sealed class AcceptanceToolTests
         Assert.Equal(AcceptanceMode.Manual, options.Mode);
         Assert.Equal(1234, options.ProcessId);
         Assert.Equal(30, options.TimeoutSeconds);
+        Assert.Equal(900, options.OperatorCheckpointTimeoutSeconds);
         Assert.Equal(@"C:\temp\input.jsonl", options.TelemetryPath);
+    }
+
+    [Fact]
+    public void ManualModeAcceptsBoundedOperatorCheckpointTimeout()
+    {
+        var options = AcceptanceOptions.Parse(
+        [
+            "--mode", "manual", "--pid", "1234", "--client", @"C:\nexIRC\nexIRC.Desktop.exe",
+            "--telemetry", @"C:\temp\input.jsonl", "--checkpoint-timeout", "45"
+        ]);
+
+        Assert.Equal(45, options.OperatorCheckpointTimeoutSeconds);
     }
 
     [Fact]
